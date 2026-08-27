@@ -1,8 +1,10 @@
 /**
- * # client：零依赖 LLM 客户端（ADR-0001 接缝 S1）
+ * # client：纯传输层 LLM 客户端（ADR-0001 接缝 S1，ADRs 修订）
  *
- * 深模块：fetch 调用、SSE 字节解析、tool_calls 分片拼接、usage 探测、
- * 统一错误映射全部收在这里。对外只有 chat(request, signal?)。
+ * 深模块：fetch 传输、SSE 字节解析、tool_calls 分片拼接、usage 探测、
+ * 基础错误映射全部收在这里。对外只有 chat(wire: WireRequest, signal?)——
+ * wire 是 Provider Adapter（ADR-0002）归一的产物：序列化/字段映射/供应商差异
+ * 一律在 adapter，本层不做任何序列化判断，照单发送（含 extra_body 并入 JSON 顶层）。
  *
  * 解析器事实（openai-compatible-api-spec.md §8.A / §8.B）：
  * - 事件以空行分组；data: 多行按 \n 合并后 parse（§8.A.1）；
@@ -18,18 +20,16 @@
  * 多 choice（n>1）各流道的组装互不合并。
  */
 import { LlmError } from '../../shared/llm-types.js';
+import { extractErrorBody, parseRetryAfter, RETRYABLE_STATUS } from './error-parse.js';
+import type { WireRequest } from './provider-adapter.js';
 import type {
   AssembledToolCall,
-  ChatMessage,
-  ChatRequest,
   LlmUsage,
   StreamEvent,
   StreamSnapshot,
 } from '../../shared/llm-types.js';
 
 export interface LlmClientOptions {
-  /** 供应商 base_url（如 https://api.deepseek.com / .../v1），拼接 /chat/completions。 */
-  baseUrl: string;
   /** 留空则不发送 Authorization 头（本地端点）。 */
   apiKey?: string;
   /** 依赖注入：默认真实 fetch；测试注入假 fetch。 */
@@ -37,12 +37,10 @@ export interface LlmClientOptions {
 }
 
 export class LlmClient {
-  private readonly endpoint: string;
   private readonly apiKey: string | undefined;
   private readonly fetchFn: typeof fetch;
 
   constructor(options: LlmClientOptions) {
-    this.endpoint = `${options.baseUrl.replace(/\/+$/, '')}/chat/completions`;
     this.apiKey = options.apiKey;
     this.fetchFn = options.fetch ?? fetch;
   }
@@ -52,17 +50,22 @@ export class LlmClient {
     return { type: 'error', error, snapshot: makeSnapshot() };
   }
 
-  async *chat(request: ChatRequest, signal?: AbortSignal): AsyncIterable<StreamEvent> {
+  async *chat(request: WireRequest, signal?: AbortSignal): AsyncIterable<StreamEvent> {
+    const endpoint = `${request.baseUrl.replace(/\/+$/, '')}/chat/completions`;
+    // base_url 与 body 均由 adapter 归一（ADR-0002）：本层只把 extraBody（Qwen 专属）
+    // 并入 JSON 顶层后原样发送，不做任何字段序列化判断。
+    const wireBody =
+      request.extraBody !== undefined ? { ...request.extraBody, ...request.body } : request.body;
     let response: Response;
     try {
-      response = await this.fetchFn(this.endpoint, {
+      response = await this.fetchFn(endpoint, {
         method: 'POST',
         headers: {
           'content-type': 'application/json',
           accept: 'text/event-stream',
           ...(this.apiKey === undefined ? {} : { authorization: `Bearer ${this.apiKey}` }),
         },
-        body: JSON.stringify(toWireBody(request)),
+        body: JSON.stringify(wireBody),
         ...(signal !== undefined ? { signal } : {}),
       });
     } catch (err) {
@@ -287,9 +290,6 @@ export class LlmClient {
   }
 }
 
-/** §6.3 建议重试集合：{408, 425, 429, 500, 502, 503, 504}。 */
-const RETRYABLE_STATUS = new Set([408, 425, 429, 500, 502, 503, 504]);
-
 /** fetch 拒绝 / 断流 / 中止 的统一定型：AbortError 不可重试（用户主动），其余视为传输层。 */
 function toTransportError(err: unknown): LlmError {
   if (err instanceof Error && err.name === 'AbortError') {
@@ -303,11 +303,10 @@ function toTransportError(err: unknown): LlmError {
   });
 }
 
-const BODY_SNIPPET_LEN = 200;
-
 /**
- * 统一 HTTP 错误：读响应体、按 §6.1 三种形状解析（A/B 有 error 对象 / C 非 JSON
- * 原文抠摘录），取 Retry-After（头存在且可解析才用，§6.3）。
+ * 统一 HTTP 错误：读响应体、按 §6.1 三种形状解析（见共享 error-parse），
+ * 取 Retry-After（头存在且可解析才用，§6.3）。供应商业务码精修在 adapter
+ * （normalizeError/retryableRules）——本层只做状态码打底。
  */
 async function readHttpError(
   response: Response,
@@ -325,63 +324,6 @@ async function readHttpError(
     ...(retryAfter !== undefined ? { retryAfter } : {}),
     ...(bodySnippet !== undefined ? { bodySnippet } : {}),
   });
-}
-
-function extractErrorBody(raw: string): { message: string; code?: string; bodySnippet?: string } {
-  const trimmed = raw.trim();
-  if (trimmed === '') return { message: '(empty response body)' };
-  let parsed: unknown;
-  try {
-    parsed = JSON.parse(trimmed);
-  } catch {
-    // §6.1 形状 C：body 不是 JSON（Kimi 504 HTML、网关页）
-    const snippet = trimmed.slice(0, BODY_SNIPPET_LEN);
-    return { message: snippet, bodySnippet: snippet };
-  }
-  if (typeof parsed === 'object' && parsed !== null) {
-    const err = (parsed as Record<string, unknown>).error;
-    if (typeof err === 'object' && err !== null) {
-      const e = err as Record<string, unknown>;
-      const message = typeof e.message === 'string' && e.message !== '' ? e.message : trimmed;
-      const codeRaw =
-        typeof e.code === 'string' && e.code !== ''
-          ? e.code
-          : typeof e.code === 'number'
-            ? String(e.code)
-            : typeof e.type === 'string' && e.type !== ''
-              ? e.type
-              : undefined;
-      return { message, ...(codeRaw !== undefined ? { code: codeRaw } : {}) };
-    }
-  }
-  // 有 JSON 但无 error 键 / 非对象：按摘录兜底（§6.1 形状 C 备注）
-  const snippet = trimmed.slice(0, BODY_SNIPPET_LEN);
-  return { message: snippet, bodySnippet: snippet };
-}
-
-/** 可采信 Retry-After 上限（秒）；超过视为不可信，忽略并按默认退避（openai-python 的
- * MAX_RETRY_AFTER_DELAY 同款：300。§6.3）。 */
-const MAX_RETRY_AFTER_DELAY = 300;
-
-/** §6.3/官方 SDK 三形式：retry-after-ms（毫秒）→ retry-after（秒/浮点）→ HTTP-date。
- * 三形式共用同一上限：超限一律忽略（返回 undefined，弃用该头）。 */
-function parseRetryAfter(headers: Headers): number | undefined {
-  const msRaw = headers.get('retry-after-ms');
-  if (msRaw !== null) {
-    const ms = Number(msRaw);
-    if (Number.isFinite(ms) && ms > 0 && ms / 1000 <= MAX_RETRY_AFTER_DELAY) return ms / 1000;
-  }
-  const secRaw = headers.get('retry-after');
-  if (secRaw !== null) {
-    const sec = Number(secRaw);
-    if (Number.isFinite(sec) && sec > 0 && sec <= MAX_RETRY_AFTER_DELAY) return sec;
-    const date = Date.parse(secRaw);
-    if (Number.isFinite(date) && date > 0) {
-      const seconds = (date - Date.now()) / 1000;
-      if (seconds > 0 && seconds <= MAX_RETRY_AFTER_DELAY) return seconds;
-    }
-  }
-  return undefined;
 }
 
 // §7.1：prompt/completion/total + cached（OpenAI/Kimi/GLM）+ reasoning + DeepSeek hit/miss
@@ -414,42 +356,6 @@ function normalizeUsage(wire: Record<string, unknown>): LlmUsage {
     usage.promptCacheMissTokens = wire.prompt_cache_miss_tokens;
   }
   return usage;
-}
-
-function toWireBody(request: ChatRequest): Record<string, unknown> {
-  const body: Record<string, unknown> = {
-    model: request.model,
-    messages: request.messages.map(toWireMessage),
-    stream: true,
-  };
-  if (request.tools !== undefined) body.tools = request.tools;
-  if (request.toolChoice !== undefined) body.tool_choice = request.toolChoice;
-  if (request.parallelToolCalls !== undefined) body.parallel_tool_calls = request.parallelToolCalls;
-  if (request.temperature !== undefined) body.temperature = request.temperature;
-  if (request.topP !== undefined) body.top_p = request.topP;
-  if (request.maxTokens !== undefined) body.max_tokens = request.maxTokens;
-  if (request.stop !== undefined) body.stop = request.stop;
-  if (request.streamOptions !== undefined) {
-    body.stream_options = { include_usage: request.streamOptions.includeUsage === true };
-  }
-  return body;
-}
-
-function toWireMessage(message: ChatMessage): Record<string, unknown> {
-  switch (message.role) {
-    case 'system':
-      return { role: 'system', content: message.content };
-    case 'user':
-      return { role: 'user', content: message.content };
-    case 'assistant': {
-      const wire: Record<string, unknown> = { role: 'assistant', content: message.content };
-      if (message.toolCalls !== undefined) wire.tool_calls = message.toolCalls;
-      if (message.reasoningContent !== undefined) wire.reasoning_content = message.reasoningContent;
-      return wire;
-    }
-    case 'tool':
-      return { role: 'tool', content: message.content, tool_call_id: message.toolCallId };
-  }
 }
 
 /** 快照组装缺省项：按「尚无可报」基线（null / null / true / []）处理。 */

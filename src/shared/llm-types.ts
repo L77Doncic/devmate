@@ -1,9 +1,10 @@
 /**
  * # llm-types：LLM 客户端与主循环/UI 之间的共享契约（ADR-0001 接缝 S1）
  *
- * 对外只有 chat(request, signal?): AsyncIterable<StreamEvent>。类型面说明：
- * - ChatRequest：请求侧消息模型（camelCase 领域名；客户端负责把它序列化为
- *   OpenAI 兼容 wire 蛇形字段，见 §1/§3 的字段形状）。
+ * 对外只有 chat(wire: WireRequest, signal?): AsyncIterable<StreamEvent>——wire 是
+ * Provider Adapter（ADR-0002）的归一产物，客户端为纯传输层。类型面说明：
+ * - ChatRequest：请求侧统一口径消息模型（camelCase 领域名；Provider Adapter
+ *   的 buildRequest 把它序列化为 OpenAI 兼容 wire 蛇形字段，见 §1/§3 的字段形状）。
  * - StreamEvent：流式事件流；tool_calls 分片拼接隐藏在客户端内部，
  *   end/error 事件携带拼接好的 StreamSnapshot（§8.B）。
  * - LlmUsage：归一账本（prompt/completion/cached/reasoning 四字段，另保留
@@ -44,8 +45,8 @@ export interface ChatToolCall {
 }
 
 /**
- * 消息模型（角色四种，见 §1.2）。assistant 消息的 reasoningContent 由客户端
- * 原样透传、不做策略处置——「推理内容回传策略」属 S2 adapter（§3.3）。
+ * 消息模型（角色四种，见 §1.2）。assistant 消息的 reasoningContent 在本层
+ * 不做策略处置——「推理内容回传策略」属 S2 adapter 的 buildRequest（§3.3）。
  */
 export type ChatMessage =
   | { role: 'system'; content: string }
@@ -61,7 +62,8 @@ export type ChatMessage =
 export type ToolChoice =
   'none' | 'auto' | 'required' | { type: 'function'; function: { name: string } };
 
-/** 请求参数：客户端负责映射为 wire（snake_case），并固定 stream:true（§1.5）。 */
+/** 请求参数（统一口径）：Provider Adapter 的 buildRequest 映射为 wire（snake_case），
+ * 并固定 stream:true（§1.5）；客户端不感知此形状。 */
 export interface ChatRequest {
   model: string;
   messages: ChatMessage[];

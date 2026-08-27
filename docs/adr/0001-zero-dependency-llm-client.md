@@ -13,6 +13,7 @@ Status: proposed
 
 ## Consequences
 
+- ✍ 修订（2026-08-27）：公共接口 chat 接收供应商归一后的 WireRequest——客户端为纯传输层，序列化/归一在 Provider Adapter（见 0002）。客户端不再持有任何字段映射（toWireBody/toWireMessage 移除），只做 fetch 传输、SSE 解析、usage 探测、tool_calls 聚合与状态码级基础错误映射；错误体解析（extractErrorBody/RETRYABLE_STATUS/parseRetryAfter）与 adapter 共享单一来源 error-parse。
 - 解析器与拼接器不需要「猜」的边界（半行尾 JSON、幽灵空 chunk、`choices==[]`、`\r` 残留、UTF-8 分帧、`[DONE]` 前缀先行）都已有核实结论，直接成为单元测试用例集。
 - ✍ 必须保留五家真实流量的冒烟脚本（§9），解析器的兜底分支覆盖率以 Phase 2 联调实测为准——见依据中的待实测项。
 

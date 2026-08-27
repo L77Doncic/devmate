@@ -1,11 +1,13 @@
 import { describe, expect, it } from 'vitest';
 import { LlmClient, LlmError } from '../../src/core/llm/index.js';
-import type { ChatRequest, StreamEvent } from '../../src/core/llm/index.js';
+import type { StreamEvent, WireRequest } from '../../src/core/llm/index.js';
 
 /**
- * LlmClient 公共接口规格（接缝 S1，ADR-0001）。
- * 只打公共 API chat(request, signal?): AsyncIterable<StreamEvent>；
- * SSE 解析、分片拼接、错误映射均只能经接口观察。
+ * LlmClient 公共接口规格（接缝 S1，ADR-0001 修订：客户端为纯传输层）。
+ * 只打公共 API chat(wire: WireRequest, signal?): AsyncIterable<StreamEvent>；
+ * SSE 解析、分片拼接、错误映射均只能经接口观察。序列化/字段映射断言已迁至
+ * provider-adapter.test.ts（序列化归 S2）——本文件只保留传输层断言：
+ * URL/头/body 照单发送 + 流解析行为不变。
  * SSE chunk 样本为按 openai-compatible-api-spec.md 原文形状手写的逐字片段
  * （§4.2 chunk 骨架、§2.1 tool_calls 值、§6.1 错误体），预期值不复算。
  */
@@ -68,7 +70,7 @@ function fakeResponse(
 
 async function collectEvents(
   client: LlmClient,
-  request: ChatRequest,
+  request: WireRequest,
   signal?: AbortSignal,
 ): Promise<StreamEvent[]> {
   const events: StreamEvent[] = [];
@@ -91,18 +93,25 @@ const CH = {
 
 function makeClient(fetchImpl: typeof fetch, options: Partial<{ apiKey: string }> = {}): LlmClient {
   return new LlmClient({
-    baseUrl: 'https://api.deepseek.com',
     ...options,
     fetch: fetchImpl,
   });
 }
 
-const userHello: ChatRequest = {
-  model: 'deepseek-chat',
-  messages: [{ role: 'user', content: '你好' }],
+/**
+ * adapter 归一的 wire（序列化归 S2；本文件只关心传输与流解析，不再断言字段映射）。
+ * baseUrl 与 body 至少像 deepseek preset 的产物——请求体由 adapter 决定。
+ */
+const helloWire: WireRequest = {
+  baseUrl: 'https://api.deepseek.com',
+  body: {
+    model: 'deepseek-chat',
+    messages: [{ role: 'user', content: '你好' }],
+    stream: true,
+  },
 };
 
-// ---------- slice a：简单文本流 + [DONE] 终止 + wire 请求形状 ----------
+// ---------- slice a：简单文本流 + [DONE] 终止 + 传输层（URL/头/body 照单发送） ----------
 
 describe('LlmClient · a) 简单文本流', () => {
   it('LlmClient 流式返回以 [DONE] 终止：内容分片拼接，end.finishReason=stop', async () => {
@@ -112,7 +121,7 @@ describe('LlmClient · a) 简单文本流', () => {
       ]),
     );
 
-    expect(await collectEvents(client, userHello)).toEqual([
+    expect(await collectEvents(client, helloWire)).toEqual([
       { type: 'text', text: '' }, // role 分片：content:"" 表示「尚未开始」（§8.A.7）
       { type: 'text', text: 'Hello' },
       { type: 'text', text: ' world' },
@@ -128,7 +137,7 @@ describe('LlmClient · a) 简单文本流', () => {
     ]);
   });
 
-  it('请求以 OpenAI 兼容 wire 形状发出：POST 端点、Bearer 头、stream:true 与字段映射', async () => {
+  it('传输层照单发送：URL=baseUrl+path（去尾斜杠）、POST、Bearer 头、body 与 WireRequest 完全一致', async () => {
     let capturedUrl = '';
     let capturedInit: RequestInit | undefined;
     const client = makeClient(
@@ -140,44 +149,19 @@ describe('LlmClient · a) 简单文本流', () => {
       { apiKey: 'sk-abc' },
     );
 
-    await collectEvents(client, {
-      model: 'deepseek-chat',
-      messages: [
-        { role: 'system', content: 'Be helpful.' },
-        { role: 'user', content: '北京天气?' },
-        {
-          role: 'assistant',
-          content: null,
-          toolCalls: [
-            {
-              id: 'call_xxx',
-              type: 'function',
-              function: { name: 'get_weather', arguments: '{"city":"北京"}' },
-            },
-          ],
-        },
-        { role: 'tool', content: '晴，25°C', toolCallId: 'call_xxx' },
-      ],
-      tools: [
-        {
-          type: 'function',
-          function: {
-            name: 'get_weather',
-            description: '查天气',
-            parameters: {
-              type: 'object',
-              properties: { city: { type: 'string' } },
-              required: ['city'],
-            },
-          },
-        },
-      ],
-      toolChoice: 'auto',
-      temperature: 0.2,
-      streamOptions: { includeUsage: true },
-    });
+    // extraBody（Qwen 专属）在序列化时并入 JSON 顶层——传输层唯一动 body 的地方
+    const wire: WireRequest = {
+      baseUrl: 'https://api.moonshot.cn/v1',
+      body: {
+        model: 'kimi-k3',
+        messages: [{ role: 'user', content: '你好' }],
+        stream: true,
+      },
+      extraBody: { enable_thinking: true, thinking_budget: 4000 },
+    };
+    await collectEvents(client, wire);
 
-    expect(capturedUrl).toBe('https://api.deepseek.com/chat/completions');
+    expect(capturedUrl).toBe('https://api.moonshot.cn/v1/chat/completions');
     expect(capturedInit?.method).toBe('POST');
     expect(capturedInit?.headers).toMatchObject({
       authorization: 'Bearer sk-abc',
@@ -187,71 +171,34 @@ describe('LlmClient · a) 简单文本流', () => {
     // signal 未传时不应带出
     expect(capturedInit?.signal).toBeUndefined();
 
-    const body = JSON.parse(String(capturedInit?.body));
-    expect(body).toEqual({
-      model: 'deepseek-chat',
-      messages: [
-        { role: 'system', content: 'Be helpful.' },
-        { role: 'user', content: '北京天气?' },
-        {
-          role: 'assistant',
-          content: null,
-          tool_calls: [
-            {
-              id: 'call_xxx',
-              type: 'function',
-              function: { name: 'get_weather', arguments: '{"city":"北京"}' },
-            },
-          ],
-        },
-        { role: 'tool', content: '晴，25°C', tool_call_id: 'call_xxx' },
-      ],
-      tools: [
-        {
-          type: 'function',
-          function: {
-            name: 'get_weather',
-            description: '查天气',
-            parameters: {
-              type: 'object',
-              properties: { city: { type: 'string' } },
-              required: ['city'],
-            },
-          },
-        },
-      ],
-      tool_choice: 'auto',
-      temperature: 0.2,
+    expect(JSON.parse(String(capturedInit?.body))).toEqual({
+      enable_thinking: true, // extraBody 并入顶层
+      thinking_budget: 4000,
+      model: 'kimi-k3',
+      messages: [{ role: 'user', content: '你好' }],
       stream: true,
-      stream_options: { include_usage: true },
     });
   });
 
-  it('toWireBody：topP/maxTokens/stop/parallelToolCalls 映射为 snake_case wire 字段', async () => {
-    let body: string | undefined;
-    const client = makeClient(async (_url, init) => {
-      body = String(init?.body);
+  it('baseUrl 尾斜杠剔除：/path/v4/ → /path/v4/chat/completions；无 apiKey 不带 Authorization', async () => {
+    let capturedUrl = '';
+    let capturedInit: RequestInit | undefined;
+    const client = makeClient(async (url, init) => {
+      capturedUrl = String(url);
+      capturedInit = init;
       return fakeResponse([`${CH.done}\n`]);
     });
 
     await collectEvents(client, {
-      model: 'deepseek-chat',
-      messages: [{ role: 'user', content: '你好' }],
-      topP: 0.9,
-      maxTokens: 1024,
-      stop: ['[END]'],
-      parallelToolCalls: false,
+      ...helloWire,
+      baseUrl: 'https://open.bigmodel.cn/api/paas/v4/',
+      body: { ...helloWire.body, model: 'glm-5.3' },
     });
 
-    expect(JSON.parse(body as string)).toEqual({
-      model: 'deepseek-chat',
-      messages: [{ role: 'user', content: '你好' }],
-      top_p: 0.9,
-      max_tokens: 1024,
-      stop: ['[END]'],
-      parallel_tool_calls: false,
-      stream: true,
-    });
+    expect(capturedUrl).toBe('https://open.bigmodel.cn/api/paas/v4/chat/completions');
+    expect(
+      (capturedInit?.headers as Record<string, string> | undefined)?.authorization,
+    ).toBeUndefined();
   });
 
   it('SSE 解析：CRLF、注释行与空行分组不产生垃圾事件（§8.A.3）', async () => {
@@ -267,7 +214,7 @@ describe('LlmClient · a) 简单文本流', () => {
     ].join('');
     const client = makeClient(async () => fakeResponse([crlfChunks]));
 
-    expect(await collectEvents(client, userHello)).toEqual([
+    expect(await collectEvents(client, helloWire)).toEqual([
       { type: 'text', text: 'A' },
       { type: 'text', text: 'B' },
       {
@@ -288,7 +235,7 @@ describe('LlmClient · a) 简单文本流', () => {
     const cut = beijingPrefixBytes + 1;
     const client = makeClient(async () => fakeResponse([bytes.slice(0, cut), bytes.slice(cut)]));
 
-    expect(await collectEvents(client, userHello)).toEqual([
+    expect(await collectEvents(client, helloWire)).toEqual([
       { type: 'text', text: '北京' },
       {
         type: 'end',
@@ -306,7 +253,7 @@ describe('LlmClient · a) 简单文本流', () => {
     ].join('');
     const client = makeClient(async () => fakeResponse([multiLineChunks]));
 
-    expect(await collectEvents(client, userHello)).toEqual([
+    expect(await collectEvents(client, helloWire)).toEqual([
       { type: 'text', text: 'multi' },
       {
         type: 'end',
@@ -322,7 +269,7 @@ describe('LlmClient · a) 简单文本流', () => {
       return fakeResponse([`${CH.done}\n`]);
     });
 
-    await collectEvents(client, userHello);
+    await collectEvents(client, helloWire);
     expect(capturedInit?.headers).not.toBeUndefined();
     expect((capturedInit?.headers as Record<string, string>).authorization).toBeUndefined();
   });
@@ -341,7 +288,7 @@ describe('LlmClient · b) usage 采集', () => {
     ].join('');
     const client = makeClient(async () => fakeResponse([chunks]));
 
-    expect(await collectEvents(client, userHello)).toEqual([
+    expect(await collectEvents(client, helloWire)).toEqual([
       { type: 'text', text: '' },
       { type: 'text', text: 'Hello' },
       {
@@ -365,7 +312,7 @@ describe('LlmClient · b) usage 采集', () => {
     ].join('');
     const client = makeClient(async () => fakeResponse([chunks]));
 
-    expect(await collectEvents(client, userHello)).toEqual([
+    expect(await collectEvents(client, helloWire)).toEqual([
       { type: 'text', text: '' },
       { type: 'text', text: 'Hi' },
       {
@@ -394,7 +341,7 @@ describe('LlmClient · b) usage 采集', () => {
     ].join('');
     const client = makeClient(async () => fakeResponse([chunks]));
 
-    expect(await collectEvents(client, userHello)).toEqual([
+    expect(await collectEvents(client, helloWire)).toEqual([
       { type: 'text', text: 'x' },
       {
         type: 'end',
@@ -417,7 +364,7 @@ describe('LlmClient · c) tool_calls 分片拼接', () => {
     ].join('');
     const client = makeClient(async () => fakeResponse([chunks]));
 
-    expect(await collectEvents(client, userHello)).toEqual([
+    expect(await collectEvents(client, helloWire)).toEqual([
       { type: 'text', text: 'Hello' },
       { type: 'text', text: 'Bonjour' },
       {
@@ -448,7 +395,7 @@ describe('LlmClient · c) tool_calls 分片拼接', () => {
 
     // 分片拼接隐藏在客户端内部：公共事件流不暴露 fragment（§8.B 契约），
     // 只有终态快照携带装配结果。
-    expect(await collectEvents(client, userHello)).toEqual([
+    expect(await collectEvents(client, helloWire)).toEqual([
       {
         type: 'end',
         snapshot: {
@@ -472,7 +419,7 @@ describe('LlmClient · c) tool_calls 分片拼接', () => {
     ].join('');
     const client = makeClient(async () => fakeResponse([chunks]));
 
-    expect(await collectEvents(client, userHello)).toEqual([
+    expect(await collectEvents(client, helloWire)).toEqual([
       {
         type: 'end',
         snapshot: {
@@ -503,7 +450,7 @@ describe('LlmClient · c) tool_calls 分片拼接', () => {
     ].join('');
     const client = makeClient(async () => fakeResponse([chunks]));
 
-    const events = await collectEvents(client, userHello);
+    const events = await collectEvents(client, helloWire);
     const end = events[events.length - 1];
     expect(end).toMatchObject({
       type: 'end',
@@ -525,7 +472,7 @@ describe('LlmClient · c) tool_calls 分片拼接', () => {
     ].join('');
     const client = makeClient(async () => fakeResponse([chunks]));
 
-    expect(await collectEvents(client, userHello)).toEqual([
+    expect(await collectEvents(client, helloWire)).toEqual([
       {
         type: 'end',
         snapshot: {
@@ -552,7 +499,7 @@ describe('LlmClient · d) 错误映射', () => {
       ),
     );
 
-    const [event] = await collectEvents(client, userHello);
+    const [event] = await collectEvents(client, helloWire);
     expect(event).toMatchObject({
       type: 'error',
       error: {
@@ -576,7 +523,7 @@ describe('LlmClient · d) 错误映射', () => {
       ),
     );
 
-    const [event] = await collectEvents(client, userHello);
+    const [event] = await collectEvents(client, helloWire);
     expect(event).toMatchObject({
       type: 'error',
       error: {
@@ -601,7 +548,7 @@ describe('LlmClient · d) 错误映射', () => {
       ),
     );
 
-    const [event] = await collectEvents(client, userHello);
+    const [event] = await collectEvents(client, helloWire);
     expect(event).toMatchObject({
       type: 'error',
       error: {
@@ -623,7 +570,7 @@ describe('LlmClient · d) 错误映射', () => {
       ),
     );
 
-    const [event] = await collectEvents(client, userHello);
+    const [event] = await collectEvents(client, helloWire);
     expect(event).toMatchObject({
       type: 'error',
       error: {
@@ -642,7 +589,7 @@ describe('LlmClient · d) 错误映射', () => {
       fakeResponse('<html><body>504 Gateway Timeout</body></html>', { status: 504 }),
     );
 
-    const [event] = await collectEvents(client, userHello);
+    const [event] = await collectEvents(client, helloWire);
     expect(event).toMatchObject({
       type: 'error',
       error: {
@@ -663,7 +610,7 @@ describe('LlmClient · d) 错误映射', () => {
       fakeResponse('{}', { status: 429, headers: { 'retry-after': '86400' } }),
     );
 
-    const [event] = await collectEvents(client, userHello);
+    const [event] = await collectEvents(client, helloWire);
     expect(event).toMatchObject({ type: 'error', error: { status: 429, retryable: true } });
     expect(
       (event as { type: 'error'; error: { retryAfter?: number } }).error.retryAfter,
@@ -675,7 +622,7 @@ describe('LlmClient · d) 错误映射', () => {
       fakeResponse('{}', { status: 429, headers: { 'retry-after-ms': '1500' } }),
     );
 
-    const [event] = await collectEvents(client, userHello);
+    const [event] = await collectEvents(client, helloWire);
     expect(event).toMatchObject({
       type: 'error',
       error: { status: 429, retryable: true, retryAfter: 1.5 },
@@ -687,7 +634,7 @@ describe('LlmClient · d) 错误映射', () => {
     const clientA = makeClient(async () =>
       fakeResponse('{}', { status: 429, headers: { 'retry-after': date } }),
     );
-    const [a] = await collectEvents(clientA, userHello);
+    const [a] = await collectEvents(clientA, helloWire);
     expect(a).toMatchObject({ type: 'error', error: { retryable: true } });
     const retryAfter = (a as { type: 'error'; error: { retryAfter?: number } }).error.retryAfter;
     expect(retryAfter).toBeDefined();
@@ -697,7 +644,7 @@ describe('LlmClient · d) 错误映射', () => {
     const clientB = makeClient(async () =>
       fakeResponse('{}', { status: 429, headers: { 'retry-after': 'not-a-date' } }),
     );
-    const [b] = await collectEvents(clientB, userHello);
+    const [b] = await collectEvents(clientB, helloWire);
     expect(b).toMatchObject({ type: 'error', error: { retryable: true } });
     expect(
       (b as { type: 'error'; error: { retryAfter?: number } }).error.retryAfter,
@@ -707,7 +654,7 @@ describe('LlmClient · d) 错误映射', () => {
   it.each([408, 425, 502, 503])('%d → 归入可重试集合（§6.3）', async (status) => {
     const client = makeClient(async () => fakeResponse('{}', { status }));
 
-    const [event] = await collectEvents(client, userHello);
+    const [event] = await collectEvents(client, helloWire);
     expect(event).toMatchObject({
       type: 'error',
       error: { kind: 'http', status, retryable: true },
@@ -723,7 +670,7 @@ describe('LlmClient · d) 错误映射', () => {
       }),
     );
 
-    const [event] = await collectEvents(client, userHello);
+    const [event] = await collectEvents(client, helloWire);
     expect(event).toMatchObject({
       type: 'error',
       error: { kind: 'http', status: 200, retryable: true },
@@ -737,7 +684,7 @@ describe('LlmClient · d) 错误映射', () => {
   it('SSE 通道出现非 JSON 数据事件 → 协议错误事件（不误判为流结束）', async () => {
     const client = makeClient(async () => fakeResponse(['data: not-json\n\ndata: [DONE]\n\n']));
 
-    const [event] = await collectEvents(client, userHello);
+    const [event] = await collectEvents(client, helloWire);
     expect(event).toMatchObject({
       type: 'error',
       error: { kind: 'protocol', status: 0, retryable: true },
@@ -753,7 +700,7 @@ describe('LlmClient · d) 错误映射', () => {
       ]),
     );
 
-    expect(await collectEvents(client, userHello)).toEqual([
+    expect(await collectEvents(client, helloWire)).toEqual([
       { type: 'text', text: 'A' },
       {
         type: 'error',
@@ -792,7 +739,7 @@ describe('LlmClient · e) 流中断', () => {
         new Response(stream, { status: 200, headers: { 'content-type': 'text/event-stream' } }),
     );
 
-    for await (const event of client.chat(userHello)) {
+    for await (const event of client.chat(helloWire)) {
       expect(event).toMatchObject({ type: 'text', text: 'A' });
       break;
     }
@@ -806,7 +753,7 @@ describe('LlmClient · e) 流中断', () => {
       fakeResponse(chunks, { streamError: new TypeError('network reset') }),
     );
 
-    expect(await collectEvents(client, userHello)).toEqual([
+    expect(await collectEvents(client, helloWire)).toEqual([
       { type: 'text', text: '' },
       { type: 'text', text: 'Hello' },
       {
@@ -833,7 +780,7 @@ describe('LlmClient · e) 流中断', () => {
     ];
     const client = makeClient(async () => fakeResponse(chunks));
 
-    expect(await collectEvents(client, userHello)).toEqual([
+    expect(await collectEvents(client, helloWire)).toEqual([
       {
         type: 'error',
         error: expect.objectContaining({ kind: 'transport', retryable: true }),
@@ -854,7 +801,7 @@ describe('LlmClient · e) 流中断', () => {
       }),
     );
 
-    expect(await collectEvents(client, userHello)).toEqual([
+    expect(await collectEvents(client, helloWire)).toEqual([
       { type: 'text', text: '' },
       { type: 'text', text: 'Hello' },
       {
@@ -873,7 +820,7 @@ describe('LlmClient · e) 流中断', () => {
     });
 
     const controller = new AbortController();
-    const [event] = await collectEvents(client, userHello, controller.signal);
+    const [event] = await collectEvents(client, helloWire, controller.signal);
 
     expect(capturedSignal).toEqual(controller.signal);
     expect(event).toMatchObject({
@@ -898,7 +845,7 @@ describe('LlmClient · f) reasoning_content', () => {
     ].join('');
     const client = makeClient(async () => fakeResponse([chunks]));
 
-    expect(await collectEvents(client, userHello)).toEqual([
+    expect(await collectEvents(client, helloWire)).toEqual([
       { type: 'reasoning', text: '先' },
       { type: 'reasoning', text: '仔细' },
       { type: 'text', text: '答案' },
@@ -909,28 +856,6 @@ describe('LlmClient · f) reasoning_content', () => {
     ]);
   });
 
-  it('S1 不越权处理 reasoning_content：wire 回传原样保留（策略归 S2, §3.3）', async () => {
-    let body: string | undefined;
-    const client = makeClient(async (_url, init) => {
-      body = String(init?.body);
-      return fakeResponse([`${CH.done}\n`]);
-    });
-
-    await collectEvents(client, {
-      model: 'deepseek-chat',
-      messages: [
-        { role: 'assistant', content: null, reasoningContent: 'private chain' },
-        { role: 'user', content: '继续' },
-      ],
-    });
-
-    expect(JSON.parse(body as string)).toEqual({
-      model: 'deepseek-chat',
-      messages: [
-        { role: 'assistant', content: null, reasoning_content: 'private chain' },
-        { role: 'user', content: '继续' },
-      ],
-      stream: true,
-    });
-  });
+  // reasoning_content 的回传序列化属 S2 策略（§3.3）——已在 provider-adapter.test.ts
+  // 的 keep/remove/never-send 三档断言覆盖（迁移项）；本层只保留 delta 事件发布。
 });

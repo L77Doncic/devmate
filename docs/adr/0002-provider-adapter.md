@@ -13,6 +13,7 @@ Status: proposed
 
 ## Consequences
 
+- ✍ 修订（2026-08-27）：WireRequest 是适配层唯一产物（base_url + 蛇形 body + Qwen extra_body），客户端只读它并照单发送、彻底不做字段映射（见 0001 修订）；测试的 wire 形状断言相应迁至适配层。剔除/策略等决策经 WireRequest.meta（strippedParams）记载，落实本 ADR「adapter 的决策必须是白的、可观测」要求；重试语义修正表（retryableRules）随 preset 数据声明，不再有 switch 分支。
 - 未来接新供应商或新协议（见 ADR-0009）＝ 新增一个 adapter，核心循环零改动——扩展与归一化在同一层。
 - adapter 的决策必须是白的：哪些参数被剔除、策略开关取哪一档，均须可观测（随事件 meta 记载），否则行为与成本出问题时无法归因。
 - 归一账本（cached/hit 单列）让成本核算不用关心各家的 usage 形状，是 ADR-0003 成本护栏的输入前提。

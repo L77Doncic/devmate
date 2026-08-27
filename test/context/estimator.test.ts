@@ -1,0 +1,154 @@
+import { describe, expect, it } from 'vitest';
+
+import type { ChatMessage } from '../../src/shared/llm-types.js';
+import { estimateTextTokens, estimateTokens } from '../../src/core/context/estimator.js';
+
+/**
+ * 估算器（切片 a）：L2 分类加权启发式 + Cookbook 结构开销（A-1 体系）。
+ * 全部预期值为手算：字符分类照「CJK 1/字、ASCII 连续段 ceil(len/K)、其余逐字 1」，
+ * 结构开销照 §1.3 的 Cookbook 常数表字面量。
+ */
+describe('估算器：正文文本估算（K=4 散文 / K=3 代码）', () => {
+  it('ASCII 连续段按 ceil(len/K)；空白与标点逐字计 1', () => {
+    expect(estimateTextTokens('abcd', 4)).toBe(1);
+    expect(estimateTextTokens('abcde', 4)).toBe(2);
+    expect(estimateTextTokens('a b', 4)).toBe(3);
+    expect(estimateTextTokens('x=1\n', 3)).toBe(4);
+  });
+
+  it('CJK 每字 1 token（含 CJK 标点与全角区）；之后回段重新计长', () => {
+    expect(estimateTextTokens('你好', 4)).toBe(2);
+    expect(estimateTextTokens('你好ab', 4)).toBe(3); // 2 + ceil(2/4)
+    expect(estimateTextTokens('，。', 4)).toBe(2); // 全角标点
+  });
+
+  it('JSON/代码属 K=3：{"ok": true} 手算 8 + 标点', () => {
+    expect(estimateTextTokens('{"ok": true}', 3)).toBe(9);
+  });
+});
+
+describe('估算器：消息结构开销（每消息 +3、回复 priming +3；A-1）', () => {
+  it('单用户消息：正文 1 + 结构 3+3 = 7', () => {
+    const est = estimateTokens([{ role: 'user', content: 'hi' }]);
+    expect(est.tokens).toBe(7);
+    expect(est.parts.contentTokens).toBe(1);
+    expect(est.parts.messageOverhead).toBe(6);
+    expect(est.parts.toolsOverhead).toBe(0);
+  });
+
+  it('两条消息：正文 2 + 结构 3×2+3 = 11', () => {
+    const messages: ChatMessage[] = [
+      { role: 'user', content: 'hi' },
+      { role: 'assistant', content: 'yo', toolCalls: [] },
+    ];
+    expect(estimateTokens(messages).tokens).toBe(11);
+  });
+
+  it('assistant 工具调用 args 计入正文（K=3）：名字 1 + 参数 2 + 结构 6 = 9', () => {
+    const messages: ChatMessage[] = [
+      {
+        role: 'assistant',
+        content: '',
+        toolCalls: [{ id: 'c1', type: 'function', function: { name: 'ls', arguments: '{}' } }],
+      },
+    ];
+    const est = estimateTokens(messages);
+    expect(est.tokens).toBe(9);
+    expect(est.parts.contentTokens).toBe(3);
+  });
+
+  it('tool 角色消息按 K=3 计正文：{"ok":true} 8 字 + 结构 6 = 14', () => {
+    const messages: ChatMessage[] = [{ role: 'tool', content: '{"ok":true}', toolCallId: 'c1' }];
+    const est = estimateTokens(messages);
+    expect(est.tokens).toBe(14);
+    expect(est.parts.contentTokens).toBe(8);
+  });
+});
+
+describe('估算器：工具定义结构开销（每 function +7、name/description 正文另计、每 property/key +3、enum -3 每项 +3、收尾 +12；§1.3 字面量）', () => {
+  const userOnly: ChatMessage[] = [{ role: 'user', content: 'hi' }];
+
+  it('未传 tools 时不计工具开销；传空数组算收尾 +12', () => {
+    expect(estimateTokens(userOnly).parts.toolsOverhead).toBe(0);
+    expect(estimateTokens(userOnly, []).parts.toolsOverhead).toBe(12);
+    expect(estimateTokens(userOnly, []).tokens).toBe(19); // 1 + 6 + 12
+  });
+
+  it('一个空参数 function：12 + 7 + name(ceil(2/3)=1) = 20 → 总计 27', () => {
+    const tools = [
+      {
+        type: 'function' as const,
+        function: { name: 'ls', parameters: { type: 'object', properties: {} } },
+      },
+    ];
+    const est = estimateTokens(userOnly, tools);
+    expect(est.tokens).toBe(27);
+    expect(est.parts.toolsOverhead).toBe(20);
+  });
+
+  it('一个 string 属性：12 + 7 + 1(name) + 3(属性) + 3(键) = 26 → 总计 33', () => {
+    const tools = [
+      {
+        type: 'function' as const,
+        function: {
+          name: 'ls',
+          parameters: { type: 'object', properties: { x: { type: 'string' } } },
+        },
+      },
+    ];
+    const est = estimateTokens(userOnly, tools);
+    expect(est.parts.toolsOverhead).toBe(26);
+    expect(est.tokens).toBe(33);
+  });
+
+  it('enum 属性：-3 且每枚举项 +3（base 6 → 3+2×3=9）→ 工具段 29', () => {
+    const tools = [
+      {
+        type: 'function' as const,
+        function: {
+          name: 'ls',
+          parameters: {
+            type: 'object',
+            properties: { x: { type: 'string', enum: ['a', 'b'] } },
+          },
+        },
+      },
+    ];
+    const est = estimateTokens(userOnly, tools);
+    expect(est.parts.toolsOverhead).toBe(29); // 12+7+1+6-3+6
+    expect(est.tokens).toBe(36);
+  });
+
+  it('description 计入工具开销：长描述调用面不再低估（§1.3 Cookbook 口径）', () => {
+    const longDesc = 'd'.repeat(4000); // K=4 散文：ceil(4000/4) = 1000
+    const tools = [
+      {
+        type: 'function' as const,
+        function: {
+          name: 'ls',
+          description: longDesc,
+          parameters: { type: 'object', properties: {} },
+        },
+      },
+    ];
+    const est = estimateTokens(userOnly, tools);
+    expect(est.parts.toolsOverhead).toBe(12 + 7 + 1 + 1000); // 1020
+    expect(est.tokens).toBe(1020 + 7); // 1(hi) + 6(消息结构) + 1020
+  });
+});
+
+describe('估算器：估算 ≠ 精确（标注近似，§1.1/§1.2）', () => {
+  it('结果恒带 approximate: true 字面量', () => {
+    const est = estimateTokens([{ role: 'user', content: 'hi' }]);
+    expect(est.approximate).toBe(true);
+    // 字面量类型：赋成 false 在类型上不可能。
+    est.approximate satisfies true;
+  });
+
+  it('消息级 name 附加开销：ChatMessage 无 name 字段，结构开销不依赖 name（tokens_per_name 无消费者，常数已删）', () => {
+    // 说明性断言：结构开销只到消息 +3、无 name 附加项（TOKENS_PER_NAME 为 speculative generality，已删除）。
+    const est = estimateTokens([{ role: 'user', content: 'hi' }]);
+    expect(est.parts.messageOverhead).toBe(6);
+    expect(est.messageCount).toBe(1);
+  });
+});
