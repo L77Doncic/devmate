@@ -1,0 +1,48 @@
+{
+  "name": "devmate-cli",
+  "version": "0.1.0",
+  "description": "DevMate：零框架依赖、运行时零依赖的 TypeScript 编程智能体 CLI。A TypeScript coding agent built from scratch — no frameworks, zero runtime dependencies.",
+  "license": "MIT",
+  "type": "module",
+  "engines": {
+    "node": ">=20"
+  },
+  "bin": {
+    "devmate-cli": "./dist/cli/index.js"
+  },
+  "files": [
+    "dist"
+  ],
+  "dependencies": {},
+  "devDependencies": {
+    "@eslint/js": "^9.39.5",
+    "@types/node": "^20.0.0",
+    "eslint": "^9.0.0",
+    "eslint-config-prettier": "^10.0.0",
+    "prettier": "^3.0.0",
+    "typescript": "^5.8.0",
+    "typescript-eslint": "^8.0.0",
+    "vitest": "^4.0.0"
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "dev": "tsc -w",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "lint": "eslint .",
+    "typecheck": "tsc --noEmit && tsc -p tsconfig.test.json",
+    "format": "prettier --write .",
+    "format:check": "prettier --check .",
+    "prepack": "npm run build",
+    "prepublishOnly": "npm run build"
+  },
+  "keywords": [
+    "coding-agent",
+    "agent",
+    "cli",
+    "llm",
+    "ai",
+    "zero-dependency",
+    "typescript"
+  ]
+}

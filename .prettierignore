@@ -1,0 +1,10 @@
+# 构建产物与依赖
+dist/
+node_modules/
+
+# 锁文件由 npm 生成，不入格式化
+package-lock.json
+
+# 已有文档与裁决：不做任何格式化改写（禁止改动）
+CONTEXT.md
+docs/adr/

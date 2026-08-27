@@ -1,0 +1,20 @@
+---
+Status: proposed
+---
+
+# 会话 = append-only 事件流：resume 追加、fork 复制，写序不变量兜底崩溃
+
+三家成熟实现收敛于同一形态：Claude Code 把每条消息、每次工具调用写入 `~/.claude/projects/*.jsonl`，resume 同 session ID 追加、fork 复制到新 ID（原会话不动）；mini-swe-agent 主循环 `finally: self.save()` 每步必落盘；DeepSeek Harness 明言 system prompts、推理、工具调用与结果、每一次上下文注入全记账，resume/fork/search/replay 全部作用于同一个事件流（context-and-error-handling.md §3.1、open-source-agent-architectures.md §5.2/§F，均逐字核实）。DevMate 决定：会话的物理形态是 append-only JSONL 事件流（每行 `{v,seq,ts,kind,payload,meta?}`），并立写序不变量：assistant 消息先落盘 → 才允许执行任何工具 → 工具结果落盘 → 才允许发起下一次请求；会话恢复＝在既有事件流上追加新事件，会话分叉＝复制到新会话 ID，磁盘上的历史永不改写，压缩永不 rewrite（只追加一条投影变更元数据行，schema 以 spec 定稿为准）。写序不变量把「任意时刻崩溃」压缩成三种可判定形态（干净尾部/悬空工具调用/坏尾行）：悬空调用由「中断占位」结果修补（副作用未知如实告知模型），坏尾行由逐行容错读丢弃——因此崩溃只留下一个「可用占位符修补的缺口」，而不是语义矛盾的历史。
+
+## Considered Options
+
+- **可变数组会话**（messages[] 就地读写）：崩溃点任意，写一半的历史语义矛盾（assistant 已发号施令、结果杳无音讯），且「resume 时把历史改回去」正是被明令禁止的就地修改路径；resume/fork/replay 得各写一套逻辑。
+- **快照式存档**（每个轮次整体覆写一份会话文件）：无法增量记录每一次上下文注入，压缩成了破坏性改写（重放/审计拿不到完整投影链），写放大与事件流不成比例；同行没有一家这么做。
+
+## Consequences
+
+- 压缩、裁剪、摘要只作用于投影，事件流永远不动——检索、审计、回放共享唯一事实源，UI 只是它的一个视图（与 ADR-0007 同源同进程读取）。
+- 检查点（git hash 记入对应事件行）与事件流互补：事件流保「发生过什么」，检查点保「此刻盘面」——二者独立，互不替代。
+- 不变量只推出「缺口形态」，推不出「恢复动作表」：执行中工具（cmd 已启动、结果未落盘）的判定树（重跑/检查点回退/主动探测）与流式中断半成品的重发分支属 spec 补充项（REVIEW.md D2），本 ADR 只锁定存储形态与写序。
+
+依据：context-and-error-handling.md §3.1（Claude Code JSONL 粒度与 resume=append/fork=copy 一手）、§3.2（写序不变量 T1-T3、A/B/C 三形态、中断占位补救）、§3.3（最小 schema）；open-source-agent-architectures.md §5.2（「Every run is traceable」逐字）、§F（append-only 事件流）、§G 第 10 条；REVIEW.md C 表（T1/T2 为必要条件推导，落地前按 §3.3 开评审）。
