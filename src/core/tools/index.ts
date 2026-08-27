@@ -1,10 +1,12 @@
 /**
- * # tools：工具面（占位）
+ * # tools：工具面（ADR-0008）
  *
- * 职责：
- * - 内置 7 个工具：read / write / edit / list / glob / grep / run_command（ADR-0008）。
- * - 动作解析双模：原生工具调用协议优先，「反引号代码块」解析作为回退（ADR-0011）。
- * - 放行策略与隔离：工作区监狱、危险操作审批、许可模式、只读命令白名单
- *   （ADR-0010 常驻 Shell + 哨兵行）。
+ * 内置 7 个工具中六个文件面在此实现（接缝 S7，见 fs.ts）：
+ * read_file / write_file / edit_file / list_dir / glob / grep；
+ * run_command（常驻 Shell + 哨兵行）属 S10，不在本模块。
+ * 注册形态：createFsTools(ctx) 产出 Tool[]（只实现 Tool 接口），
+ * registry 包装由 loop 的 defineRegistry 完成；监狱真判定（checkPath/checkRedirect）
+ * 由 S9 实现（接口单一来源：src/core/jail/index.ts，经 types.ts 转导出）。
  */
-export {};
+export { createFsTools, MAX_COLLECTION_BYTES, collectionElideMarker } from './fs.js';
+export type { FsToolContext, Jail } from './types.js';
