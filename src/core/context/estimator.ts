@@ -9,6 +9,9 @@
  * 精确性声明：Cookbook 自己也称「estimate, not a timeless guarantee」（§1.1），
  * 本估算标记 approximate: true；最终真值是服务端 usage.prompt_tokens（L0 事后校准）。
  * 标定声明：K 与结构常数落地前需 tiktoken 离线标定（REVIEW.md C 表），标定前按偏高估算。
+ * 校准接口（ADR-0012「估算 × EMA 校正系数滑动」）：TokenEstimateCalibrator 维护
+ * estimate/actual 比值的滑动平均系数，估算经 apply() 乘系数（默认 1 = 未校准）；
+ * coefficient 由调用方在拿到真实 usage 后 update()。
  */
 import type { ChatMessage, ChatTool } from '../../shared/llm-types.js';
 import {
@@ -165,4 +168,48 @@ export function estimateTokens(
     messageCount: messages.length,
     parts: { contentTokens, messageOverhead, toolsOverhead },
   };
+}
+
+// ---------------------------------------------------------------------------
+// L0 事后校准（ADR-0012）：估算 × EMA 校正系数
+// ---------------------------------------------------------------------------
+
+export interface TokenEstimateCalibratorOptions {
+  /** ratio 的平滑阻尼（EMA 权重；默认 0.5 = 半衰平滑）。 */
+  damping?: number;
+  /** 初始系数（默认 1 = 未校准）。 */
+  initial?: number;
+}
+
+/**
+ * 校正系数：estimate/actual 比值的滑动平均（L0 事后校准，最终态贴近 0% 误差；§1.2）。
+ * update(estimated, actual) 以 ratio = actual / estimated 做 EMA 更新；
+ * apply(tokens) = round(tokens × coefficient)。默认系数 1（未校准时估算原样）。
+ * 校准建议（ADR-0012 Consequences）：换模型换系数，per-provider/per-model 维护。
+ */
+export class TokenEstimateCalibrator {
+  readonly damping: number;
+  #coefficient: number;
+
+  constructor(options: TokenEstimateCalibratorOptions = {}) {
+    this.damping = options.damping ?? 0.5;
+    this.#coefficient = options.initial ?? 1;
+  }
+
+  /** 当前校正系数（滑动 EMA 结果）。 */
+  get coefficient(): number {
+    return this.#coefficient;
+  }
+
+  /** 校准一次：真实 usage 到位后调用；estimated ≤ 0 的无效输入忽略（不产生噪声）。 */
+  update(estimatedTokens: number, actualTokens: number): void {
+    if (estimatedTokens <= 0 || actualTokens <= 0) return;
+    const ratio = actualTokens / estimatedTokens;
+    this.#coefficient = (1 - this.damping) * this.#coefficient + this.damping * ratio;
+  }
+
+  /** 估算应用校正系数（≥ 0，四舍五入到整数 token）。 */
+  apply(tokens: number): number {
+    return Math.max(0, Math.round(tokens * this.#coefficient));
+  }
 }

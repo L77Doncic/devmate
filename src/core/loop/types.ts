@@ -1,0 +1,212 @@
+/**
+ * # loop/types：主循环公共契约（接缝 S5）
+ *
+ * 术语遵循 CONTEXT.md（轮次/Step/自然结束/保险丝/成本护栏/错误回注/写序不变量/
+ * 悬空工具调用/会话/投影/提交信号/审批）。
+ * 契约边界：
+ * - run() 是唯一入口：查（投影+请求）→ 回（流式）+ 执行（工具/审批）→ 回注（落盘）
+ *   的驱动者；终止条件前置在查询之前；任意路径 finalize（run_result 事件）。
+ * - LlmAdapter 是本循环依赖的 LLM 最小接缝：provider 序列化（S2 buildRequest）与
+ *   传输层重试（S6）由 boot 接线，本层只见统一 ChatRequest/StreamEvent。
+ * - ToolRegistry 接缝：list() 供模型可见定义（含 JSON Schema），execute(call) 执行一次
+ *   调用；本循环负责参数校验、审批、超时与错误回注（挂接 S5 唯一事实来源）。
+ * - Approver 接缝：'allow' 放行；{deny:true, reason} 拒绝并回注拒因（带理由→模型继续）；
+ *   {deny:true} 无理由 → 用户中止本轮（user-interrupted；CONTEXT「危险操作审批」
+ *   「无备注则结束本轮」，与「拒绝停止本轮」语义一致）。
+ */
+import type { ConversationSummarizer } from '../context/index.js';
+import type { SessionStore } from '../session/index.js';
+import type { ChatRequest, StreamEvent } from '../../shared/llm-types.js';
+import type { ToolCall } from '../../shared/session-types.js';
+
+// ---------------------------------------------------------------------------
+// 交互层：run 的输入输出
+// ---------------------------------------------------------------------------
+
+export interface RunInput {
+  sessionId: string;
+  /** 任务描述：只在新会话时落为首个 user 事件；resume 时被忽略（历史不改写）。 */
+  task: string;
+}
+
+/**
+ * 终止原因（CONTEXT「终止条件」）：自然结束 / 保险丝三件（成本、步数、墙钟）/
+ * 熔断（连续格式错误、压缩防抖） / 用户中断 / 致命（传输层重试耗尽或 harness 异常）。
+ * 成本超限同时是熔断与终止（ADR-0003），与"熔断"合并为本状态。
+ */
+export type RunStatus =
+  | 'completed' // 自然结束：本轮无工具调用
+  | 'cost-guard' // 成本护栏（闸门 A/B/C）
+  | 'max-steps'
+  | 'wall-time'
+  | 'circuit-break' // 连续格式错误达阈值（ADR-0006）
+  | 'compaction-debounce' // 压缩防抖：摘要后仍超限达容忍上限（CONTEXT「压缩防抖」/ §8 A-1）
+  | 'user-interrupted' // AbortSignal / 无理由拒绝（随时中断接管；含「拒绝停止本轮」）
+  | 'fatal'; // 传输层重试耗尽 / 协议错误 / harness 异常
+
+/** 归一记账输出（成本护栏累计账本的对外形状）。 */
+export interface UsageSummary {
+  promptTokens: number;
+  completionTokens: number;
+  totalTokens: number;
+  costUsd: number;
+  /** 任何分量由本地估算兜底（usage 缺失 / 流式中断）时为 true。 */
+  estimated: boolean;
+}
+
+export interface RunResult {
+  status: RunStatus;
+  usage: UsageSummary;
+  /** 已进代码的查询次数（每轮一次查询计一步）。 */
+  steps: number;
+  /** 运行耗时（ms；受注入时钟影响）。 */
+  durationMs: number;
+  /** 终止原因回注（fatal / compaction-debounce 带说明；与 run_result 事件载荷同源）。 */
+  error?: string;
+}
+
+// ---------------------------------------------------------------------------
+// LLM 接缝
+// ---------------------------------------------------------------------------
+
+/**
+ * LLM 最小接缝：流式请求，供应商序列化与传输层重试在 boot。
+ * 实现方需保证：error 事件为「重试已耗尽/不可重试」的终极形态；signal 中止
+ * 以 LlmError{kind:'abort'} 或终止流表达。
+ */
+export interface LlmAdapter {
+  chat(request: ChatRequest, signal?: AbortSignal): AsyncIterable<StreamEvent>;
+}
+
+// ---------------------------------------------------------------------------
+// 工具面接缝（本模块定义；真实工具实现属 Phase 3，ADR-0008/0010）
+// ---------------------------------------------------------------------------
+
+/**
+ * JSON Schema 子集（本循环校验所用；Phase 3 可扩充，未知键忽略）。
+ * 仅支持 object/properties/required + 属性级 string/number/integer/boolean/array 与 enum；
+ * items（元素级校验）声明但未实现，先不保留声明（工具面 Phase 3 再定，ADR-0008/0010）。
+ */
+export interface JsonSchema {
+  type?: string;
+  properties?: Record<string, JsonSchema>;
+  required?: string[];
+  enum?: unknown[];
+  description?: string;
+}
+
+/** 模型可见的工具定义（ToolRegistry.list() 的返回形状）。 */
+export interface ToolDef {
+  name: string;
+  description: string;
+  parameters: JsonSchema;
+}
+
+/** 工具执行结果：失败也是一个普通结果（CONTEXT「ToolResult」）。 */
+export interface ToolResult {
+  ok: boolean;
+  content: string;
+  error?: { type: string; message: string };
+}
+
+/** 工具执行上下文（由 defineRegistry 注入：会话 id + 用户中断信号）。 */
+export interface ToolExecutionContext {
+  sessionId: string;
+  signal?: AbortSignal;
+}
+
+/** 一次工具定义：ToolDef + execute。参数已由主循环校验后才调用。 */
+export interface Tool extends ToolDef {
+  execute(call: ToolCall, ctx: ToolExecutionContext): Promise<ToolResult>;
+}
+
+/** 工具注册表接缝：list 暴露模型可见定义；execute 执行一次调用（按 name 分发）。 */
+export interface ToolRegistry {
+  list(): readonly ToolDef[];
+  execute(call: ToolCall): Promise<ToolResult>;
+}
+
+// ---------------------------------------------------------------------------
+// 审批接缝（ADR-0013）
+// ---------------------------------------------------------------------------
+
+/** 'allow' 放行；{deny:true, reason} 拒绝并回注；{deny:true}（无理由）→ 用户中止本轮（user-interrupted）。 */
+export type ApprovalDecision = 'allow' | { deny: boolean; reason?: string };
+export type Approver = (call: ToolCall) => Promise<ApprovalDecision>;
+
+// ---------------------------------------------------------------------------
+// 成本计价（ADR-0003：单价表缺失期以占位价近似）
+// ---------------------------------------------------------------------------
+
+export interface Pricing {
+  /** 未命中输入 token 单价（USD/token）。 */
+  promptPerToken: number;
+  /** 输出 token 单价（USD/token；推理 token 计入输出价，CONTEXT「成本护栏」）。 */
+  completionPerToken: number;
+  /** 缓存命中输入 token 单价（缺省=promptPerToken：无折扣差表）。 */
+  cachedPerToken?: number;
+}
+
+// ---------------------------------------------------------------------------
+// RunOptions：本循环的可配置面
+// ---------------------------------------------------------------------------
+
+export interface RunOptions {
+  /** 会话存储（唯一事实来源；写序由本模块保证）。 */
+  store: SessionStore;
+  tools: ToolRegistry;
+  llm: LlmAdapter;
+  /** 危险动作审批；缺省=全放行。 */
+  approver?: Approver;
+  /** 请求侧模型名。 */
+  model: string;
+  /** 请求侧输出上限（maxTokens）；缺省不发送（闸门 A 输出侧按模型默认预留 DEFAULT_MAX_TOKENS 估价，§8 A-1）。 */
+  maxTokens?: number;
+  /** 成本计价表；缺省=占位价（单价表补齐前，ADR-0003）。 */
+  pricing?: Pricing;
+  /** 成本上限（USD）；缺省 DEFAULT_COST_LIMIT_USD（ADR-0003：默认唯一开启）。 */
+  costLimitUsd?: number;
+  /** 步数上限；缺省禁用（评测/CI 给固定值，§8C）。 */
+  maxSteps?: number;
+  /** 墙钟上限；缺省禁用。 */
+  wallTimeMs?: number;
+  /** 连续格式错误熔断阈值；缺省 3（mini-swe 一手默认，ADR-0006）。 */
+  maxFormatErrors?: number;
+  /** 单工具执行超时；缺省 120s（ADR-0010 单命令默认）。 */
+  toolTimeoutMs?: number;
+  /** 摘要器（透传 S4 project；缺省不摘要）。 */
+  summarizer?: ConversationSummarizer;
+  /** 上下文窗口 token 预算（透传 S4；未知时不触发阈值压缩）。 */
+  windowTokens?: number;
+  /** 持久规则载体（投影系统前缀，压缩永不触碰，ADR-0005）。 */
+  systemPrompt?: string;
+  /** 用户中断信号：任意时刻可中断，立场一致可续。 */
+  signal?: AbortSignal;
+  /** 时钟注入（墙钟测试）。 */
+  now?: () => number;
+}
+
+// ---------------------------------------------------------------------------
+// 默认常量（单一来源：ADRs/research 一手默认）
+// ---------------------------------------------------------------------------
+
+/** 成本上限默认（USD/任务；ADR-0003：评测基线 3.0，默认唯一开启的终止条件）。 */
+export const DEFAULT_COST_LIMIT_USD = 3.0;
+/** 连续格式错误熔断阈值（mini-swe-agent 一手默认 max_consecutive_format_errors=3）。 */
+export const DEFAULT_MAX_FORMAT_ERRORS = 3;
+/** 单工具默认执行超时（ms；ADR-0010 单命令默认 120s）。 */
+export const DEFAULT_TOOL_TIMEOUT_MS = 120_000;
+/**
+ * 输出预留（token；§8 A-1：max_completion_tokens 默认 8192，测试/重构类可提至 16384）。
+ * 闸门 A 输出侧估价在请求未带 maxTokens 时以此作为模型默认预留。
+ */
+export const DEFAULT_MAX_TOKENS = 8192;
+
+/**
+ * 占位单价（USD/token；ADR-0003：单价表缺口（REVIEW D3.1）前闸门 A 只能以
+ * 「本地估算 token × 占位价」近似；真实单价表落地后由 boot/CLI 注入替换）。
+ */
+export const DEFAULT_PRICING: Pricing = Object.freeze({
+  promptPerToken: 1e-6,
+  completionPerToken: 3e-6,
+});

@@ -1,7 +1,11 @@
 import { describe, expect, it } from 'vitest';
 
 import type { ChatMessage } from '../../src/shared/llm-types.js';
-import { estimateTextTokens, estimateTokens } from '../../src/core/context/estimator.js';
+import {
+  estimateTextTokens,
+  estimateTokens,
+  TokenEstimateCalibrator,
+} from '../../src/core/context/estimator.js';
 
 /**
  * 估算器（切片 a）：L2 分类加权启发式 + Cookbook 结构开销（A-1 体系）。
@@ -150,5 +154,37 @@ describe('估算器：估算 ≠ 精确（标注近似，§1.1/§1.2）', () => 
     const est = estimateTokens([{ role: 'user', content: 'hi' }]);
     expect(est.parts.messageOverhead).toBe(6);
     expect(est.messageCount).toBe(1);
+  });
+});
+
+describe('估算器：L0 事后校准系数（估算 × EMA 系数；ADR-0012「滑动更新校正系数」）', () => {
+  it('默认系数 1：apply 原样（未校准 = 原估算）', () => {
+    const c = new TokenEstimateCalibrator();
+    expect(c.coefficient).toBe(1);
+    expect(c.apply(12)).toBe(12);
+  });
+
+  it('update = actual/estimated ratio 的 0.5 平滑（EMA）：单次 update 后系数向 ratio 靠拢', () => {
+    const c = new TokenEstimateCalibrator();
+    c.update(12, 18); // ratio 1.5 → 0.5×1 + 0.5×1.5 = 1.25
+    expect(c.coefficient).toBeCloseTo(1.25, 12);
+    expect(c.apply(16)).toBe(20); // round(16×1.25)
+  });
+
+  it('两轮后偏差缩小：低估 18 vs 12，连续两次 update 后 |actual − est×coef| 变小', () => {
+    const c = new TokenEstimateCalibrator();
+    c.update(12, 18);
+    c.update(12, 18);
+    expect(c.coefficient).toBeCloseTo(1.375, 12); // 0.5×1.25 + 0.5×1.5
+    const est = c.apply(12); // round(12×1.375) = 17
+    expect(Math.abs(18 - est)).toBeLessThan(Math.abs(18 - 12)); // 偏差 1 < 6
+  });
+
+  it('damping 可配置（1 = 直接采用最新 ratio）；estimated ≤ 0 时忽略不更新', () => {
+    const c = new TokenEstimateCalibrator({ damping: 1 });
+    c.update(12, 18);
+    expect(c.coefficient).toBeCloseTo(1.5, 12);
+    c.update(0, 100);
+    expect(c.coefficient).toBeCloseTo(1.5, 12);
   });
 });

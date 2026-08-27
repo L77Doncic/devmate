@@ -35,8 +35,17 @@ export {
   TRUNCATE_TAIL_CHARS,
 } from './constants.js';
 
-export { estimateTextTokens, estimateTokens, estimateToolsOverhead } from './estimator.js';
-export type { TokenEstimate, TokenEstimateParts } from './estimator.js';
+export {
+  estimateTextTokens,
+  estimateTokens,
+  estimateToolsOverhead,
+  TokenEstimateCalibrator,
+} from './estimator.js';
+export type {
+  TokenEstimate,
+  TokenEstimateParts,
+  TokenEstimateCalibratorOptions,
+} from './estimator.js';
 
 export { elideMarker, OUTPUT_TOO_LONG_ADVICE, truncateToolOutput } from './truncate.js';
 export { placeholderForToolResult } from './prune.js';
