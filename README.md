@@ -207,7 +207,7 @@ npm install
 npm run dev            # tsc -w incremental
 npm run typecheck      # main tsconfig + test tsconfig
 npm run lint           # eslint flat config + typescript-eslint + prettier conflict rule
-npm test               # vitest run (90 files, 1231 cases)
+npm test               # vitest run (90 files, 1248 cases; full E2E suite runs on POSIX in CI — the Windows job gates lint + typecheck + build, and the win32 shell path (Git Bash / PowerShell probe) is exercised there by launch smoke, not by the POSIX-authored E2E semantics)
 npm run test:watch
 npm run format:check   # prettier --check . (CONTEXT.md and docs/adr/ are exempt by design)
 npm run build          # tsc + copy static web assets + bundle skills into dist/
