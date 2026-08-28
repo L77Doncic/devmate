@@ -1,9 +1,12 @@
 /**
  * # context/truncate：第 0 层——生成期工具输出截断（报告 §2.3 一手模板）
  *
- * 单条输出长度 >= MAX_OUTPUT_CHARS 即按「头 5000 + 尾 5000 + 显式 elide 标记 + 收窄建议」重写；
+ * 单条输出长度 >= maxChars 即按「头 half + 尾 half + 显式 elide 标记 + 收窄建议」重写；
  * 低于阈值原样返回。头尾保序是关键（文件列表开头与 grep 结果末尾最有信息量）。
  * 为什么客户端做：服务端不截断工具结果，超限请求直接被拒（§2.3 一手原话）。
+ * maxChars 为可选参数（缺省 MAX_OUTPUT_CHARS = 10000，行为不变）；头尾各取 half
+ * （10000 → 5000/5000；子代理报告/技能全文传入 4000 → 2000/2000）——截断面板是
+ * 生成期截断纪律的**单一来源**，子代理报告与技能全文截断都复用本函数，禁止手写头截断。
  * 注：mini-swe-agent 上游模板已于研究后演进为 <output_head>/<elided_chars>/<output_tail> 分节
  * 形式；本实现按研究报告逐字核实的旧模板（"--- N characters elided ---"）落地并固定为常量。
  * 标记串的「§8 A-1 < omitted N chars > vs §2.3 一手模板」冲突已由 CTO 裁定：
@@ -11,7 +14,7 @@
  * 另：内容疑似二进制/不可打印（NUL 字节或不可打印占比过高）时整体替换为占位符标记
  * （二进制内容截断头尾无意义——头尾同样不可读）。
  */
-import { MAX_OUTPUT_CHARS, TRUNCATE_HEAD_CHARS, TRUNCATE_TAIL_CHARS } from './constants.js';
+import { MAX_OUTPUT_CHARS } from './constants.js';
 
 /** 收窄建议行动指引（逐字，报告 §2.3 一手模板前两行）。 */
 export const OUTPUT_TOO_LONG_ADVICE =
@@ -59,24 +62,29 @@ export function isLikelyBinary(content: string): boolean {
 }
 
 /**
- * 截断单条工具输出；疑似二进制内容整体替换为 BINARY_OUTPUT_PLACEHOLDER 占位符标记；
- * 低于阈值（length < MAX_OUTPUT_CHARS）原样返回（与 mini-swe 模板条件一致）。
- * 返回新的字符串，不改动入参。
+ * 截断单条工具输出（生成期截断面板单一来源）；疑似二进制内容整体替换为
+ * BINARY_OUTPUT_PLACEHOLDER 占位符标记；低于阈值（length < maxChars）原样返回
+ * （与 mini-swe 模板条件一致）。头尾各留一半（半额切片），中间为显式 elide 标记 +
+ * 收窄建议。返回新的字符串，不改动入参。
+ *
+ * @param maxChars 截断阈值（字符）；缺省 MAX_OUTPUT_CHARS（10_000，行为不变）。
  */
-export function truncateToolOutput(content: string): string {
+export function truncateToolOutput(content: string, maxChars: number = MAX_OUTPUT_CHARS): string {
   if (isLikelyBinary(content)) {
     return BINARY_OUTPUT_PLACEHOLDER;
   }
-  if (content.length < MAX_OUTPUT_CHARS) {
+  if (content.length < maxChars) {
     return content;
   }
-  const elided = content.length - TRUNCATE_HEAD_CHARS - TRUNCATE_TAIL_CHARS;
+  const headChars = Math.floor(maxChars / 2);
+  const tailChars = maxChars - headChars;
+  const elided = content.length - headChars - tailChars;
   return (
     OUTPUT_TOO_LONG_ADVICE +
-    content.slice(0, TRUNCATE_HEAD_CHARS) +
+    content.slice(0, headChars) +
     '\n\n' +
     elideMarker(elided) +
     '\n\n' +
-    content.slice(-TRUNCATE_TAIL_CHARS)
+    content.slice(-tailChars)
   );
 }

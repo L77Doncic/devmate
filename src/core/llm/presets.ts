@@ -18,6 +18,10 @@ const openai: ProviderPreset = {
   baseUrl: 'https://api.openai.com/v1',
   defaultModel: 'gpt-5.2',
   fixedSamplingParams: [],
+  // C 档思考强度：OpenAI-family 走 reasoning_effort（low/medium/high 逐字；off 不发）
+  reasoningParam: 'reasoning_effort',
+  // 估算（research 未能核实一手数字；「估算，可在设置覆盖」——settings.windowTokens 优先）
+  contextWindowTokens: 128_000,
   // §1.3 表/§5.2 行 6：Chat Completions 缺省即 false（Responses 才会自动严格化）→ 不注入（缺省即 false）
   strictDefault: false,
   allowedToolChoices: ['none', 'auto', 'required', 'named'],
@@ -32,6 +36,10 @@ const deepseek: ProviderPreset = {
   baseUrl: 'https://api.deepseek.com',
   defaultModel: 'deepseek-v4-flash',
   fixedSamplingParams: [],
+  // C 档思考强度：DeepSeek 走 thinking（enabled + budget_tokens 1024/4096/16384；off 显式 disabled）
+  reasoningParam: 'thinking',
+  // 估算（research 标注「未能核实」——给保守可调值：64k；「估算，可在设置覆盖」）
+  contextWindowTokens: 64_000,
   // §1.6：思考模式默认 enabled；temperature/top_p 静默无效 → 思考时剔除。
   // penalties 在 §1.6 同被忽略，但 ChatRequest 无其载体（死数据不入剔除集）
   thinkingEnabled: true,
@@ -54,6 +62,9 @@ const dashscope: ProviderPreset = {
   allowedToolChoices: ['none', 'auto', 'named'],
   // 笔记 §2：历史 reasoning_content 默认忽略、回传计入输入 token → 从不回传
   reasoningPolicy: 'never-send',
+  // C 档：reasoningParam 未核实（无据）→ 保守 off（任何思考强度都不下发）
+  // 估算（Qwen 系列 128k；「估算，可在设置覆盖」——settings.windowTokens 优先）
+  contextWindowTokens: 128_000,
   // §1.3 表/§5.2 行 6：DashScope/Qwen 未提供 strict 字段（strictDefault 缺省即 undefined）
   maxTokensField: 'max_tokens',
   // 笔记 §5：Throttling 系 429 成因不同——频率类退避，配额/鉴权/系统类重试无意义
@@ -80,6 +91,9 @@ const glm: ProviderPreset = {
   baseUrl: 'https://open.bigmodel.cn/api/paas/v4/',
   defaultModel: 'glm-5.3',
   fixedSamplingParams: [],
+  // C 档：reasoningParam 未核实（无据）→ 保守 off（任何思考强度都不下发）
+  // 估算（GLM 128k；「估算，可在设置覆盖」——settings.windowTokens 优先）
+  contextWindowTokens: 128_000,
   // §5.2 行 4：参考文档仅支持 auto；其余值在适配层即抛错，不发不可核实字段
   allowedToolChoices: ['auto'],
   // §3.3：clear_thinking 默认 true=清除历史轮 reasoning_content；Preserved 需显式 false
@@ -113,6 +127,9 @@ const kimi: ProviderPreset = {
   id: 'kimi',
   baseUrl: 'https://api.moonshot.cn/v1',
   defaultModel: 'kimi-k3',
+  // C 档：reasoningParam 未核实（无据）→ 保守 off（任何思考强度都不下发）
+  // 估算（Kimi 128k；「估算，可在设置覆盖」——settings.windowTokens 优先）
+  contextWindowTokens: 128_000,
   // §5.2 行 1/3/11：temperature/top_p/penalties 固定不可改，传其他值报错 → 一律剔除
   fixedSamplingParams: ['temperature', 'top_p', 'presence_penalty', 'frequency_penalty'],
   // §1.3 表/§5.2 行 6：Kimi strict 缺省即 true（与 OpenAI/DeepSeek 相反）→ 注入 true 呈显

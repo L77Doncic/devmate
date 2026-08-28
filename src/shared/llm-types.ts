@@ -62,6 +62,13 @@ export type ChatMessage =
 export type ToolChoice =
   'none' | 'auto' | 'required' | { type: 'function'; function: { name: string } };
 
+/**
+ * 思考强度（C 档设置：/api/settings 的 reasoning，缺省 'medium'）：
+ * provider 侧按 preset.reasoningParam 映射（OpenAI-family → reasoning_effort；
+ * DeepSeek → thinking budget_tokens）；'off' = 不发/显式禁用；无据供应商保守不传。
+ */
+export type ReasoningEffort = 'off' | 'low' | 'medium' | 'high';
+
 /** 请求参数（统一口径）：Provider Adapter 的 buildRequest 映射为 wire（snake_case），
  * 并固定 stream:true（§1.5）；客户端不感知此形状。 */
 export interface ChatRequest {
@@ -75,6 +82,8 @@ export interface ChatRequest {
   maxTokens?: number;
   stop?: string[];
   streamOptions?: { includeUsage?: boolean };
+  /** 思考强度（C 档；缺省未传 = 由 preset 行为决定——不覆盖平台默认）。 */
+  reasoningEffort?: ReasoningEffort;
 }
 
 /**

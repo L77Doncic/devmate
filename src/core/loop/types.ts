@@ -16,7 +16,7 @@
  */
 import type { ConversationSummarizer } from '../context/index.js';
 import type { SessionStore } from '../session/index.js';
-import type { ChatRequest, StreamEvent } from '../../shared/llm-types.js';
+import type { ChatRequest, ReasoningEffort, StreamEvent } from '../../shared/llm-types.js';
 import type { ToolCall } from '../../shared/session-types.js';
 
 // ---------------------------------------------------------------------------
@@ -52,6 +52,9 @@ export interface UsageSummary {
   costUsd: number;
   /** 任何分量由本地估算兜底（usage 缺失 / 流式中断）时为 true。 */
   estimated: boolean;
+  /** 本轮 run 最后一次投影的上下文估算 token（projection.stats.estimatedTokens；
+   *  C 档 usage 帧的 contextEstimateTokens；无投影路径不带键）。 */
+  contextEstimateTokens?: number;
 }
 
 export interface RunResult {
@@ -178,6 +181,8 @@ export interface RunOptions {
   summarizer?: ConversationSummarizer;
   /** 上下文窗口 token 预算（透传 S4；未知时不触发阈值压缩）。 */
   windowTokens?: number;
+  /** 思考强度（C 档：/api/settings 的 reasoning；逐字进入 ChatRequest.reasoningEffort——adapter 按家映射）。 */
+  reasoning?: ReasoningEffort;
   /** 持久规则载体（投影系统前缀，压缩永不触碰，ADR-0005）。 */
   systemPrompt?: string;
   /** 用户中断信号：任意时刻可中断，立场一致可续。 */

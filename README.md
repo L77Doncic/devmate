@@ -56,3 +56,7 @@ npm run build        # tsc 产出 dist/
 ## License
 
 MIT — [DevMate contributors](LICENSE)
+
+UI 设计致谢：Web UI 的视觉（主题色 / 组件几何）复刻自
+[DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness)（MIT License
+© 2026 DeepSeek）；授权声明见 [THIRD-PARTY-NOTICES.md](THIRD-PARTY-NOTICES.md)。

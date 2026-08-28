@@ -1,0 +1,726 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="color-scheme" content="dark" />
+    <meta name="theme-color" content="#0d1117" />
+    <meta name="description" content="DevMate —— 零依赖编程智能体对话窗口" />
+    <title>DevMate · 对话窗口</title>
+    <!-- 兜底 CSP（服务端若已下发 CSP 头则以头为准）：仅允许本文件/本同源资源，
+       connect 仅同源（SSE 拉流）；写死禁止 inline script —— 本页面无任何 inline JS。 -->
+    <meta
+      http-equiv="Content-Security-Policy"
+      content="default-src 'self'; script-src 'self'; connect-src 'self'; style-src 'self'; img-src 'self' data:; object-src 'none'; base-uri 'none'; form-action 'none'"
+    />
+    <link
+      rel="icon"
+      href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='8' fill='%230d1117'/%3E%3Cpath d='M9 9h14v3H9zm0 6h14v3H9zm0 5.5h9v3H9z' fill='%2358a6ff'/%3E%3C/svg%3E"
+    />
+    <link rel="stylesheet" href="./style.css" />
+  </head>
+  <body>
+    <!-- ============ 应用壳（dsh AppFrame：sidebar 列轨道 + 主列；轨道 260px ↔ 56px rail） ============ -->
+    <div class="shell" id="shell">
+      <!-- ============ 侧边栏列轨道（折叠态 56px rail；overflow 剪裁，内容冻结宽度不动） ============ -->
+      <div class="sidebar-track" id="sidebar-track">
+        <!-- 侧边栏（dsh SidebarRoot .root：logoRow + newSession + regionArea + footArea；
+             品牌按钮双击语义 = 新建会话；折叠态 rail = 56px 四控制列） -->
+        <aside class="sidebar" id="sidebar" aria-label="侧边栏">
+          <!-- logo row（dsh logoRow：品牌按钮 flex:1 左 + toggle 右；rail 态仅 36px toggle 左锚） -->
+          <header class="logoRow" id="logo-row">
+            <button
+              class="brand wide"
+              id="btn-brand"
+              type="button"
+              aria-label="新建会话"
+              title="新建会话"
+            >
+              <span class="brandIdentity" aria-hidden="true">
+                <span class="brandMark">
+                  <svg viewBox="0 0 32 32" width="24" height="24" aria-hidden="true">
+                    <rect width="32" height="32" rx="8" fill="var(--accent-dim)" />
+                    <path d="M9 9h14v3H9zm0 6h14v3H9zm0 5.5h9v3H9z" fill="var(--accent)" />
+                  </svg>
+                </span>
+                <span class="brandName">
+                  <span class="localBuildBrand">
+                    <span class="localBuildTitle">DevMate</span>
+                    <span class="buildVersion" id="build-version"></span>
+                  </span>
+                </span>
+              </span>
+            </button>
+            <!-- rail 态先显品牌 mark，悬停换 panel icon（dsh railMark/iconButton 互换） -->
+            <button
+              class="iconButton toggle"
+              id="btn-sidebar-toggle"
+              type="button"
+              aria-expanded="true"
+              title="收起侧边栏"
+            >
+              <span class="railMark" aria-hidden="true">
+                <svg viewBox="0 0 32 32" width="24" height="24" aria-hidden="true">
+                  <rect width="32" height="32" rx="8" fill="var(--accent-dim)" />
+                  <path d="M9 9h14v3H9zm0 6h14v3H9zm0 5.5h9v3H9z" fill="var(--accent)" />
+                </svg>
+              </span>
+              <svg class="panelIcon" viewBox="0 0 16 16" aria-hidden="true">
+                <path
+                  fill="none"
+                  stroke="currentColor"
+                  stroke-width="1.4"
+                  stroke-linecap="round"
+                  stroke-linejoin="round"
+                  d="M3 3.2h10c1 0 1.8.8 1.8 1.8v6c0 1-.8 1.8-1.8 1.8H3c-1 0-1.8-.8-1.8-1.8V5c0-1 .8-1.8 1.8-1.8Zm2.6 0v9.6"
+                />
+              </svg>
+            </button>
+          </header>
+
+          <!-- newSession：38px 横条（icon 14 + label）；rail 态 36px icon-only 圆钮 -->
+          <button
+            class="newSession"
+            id="btn-new-session"
+            type="button"
+            aria-label="新建会话"
+            title="新建会话"
+          >
+            <svg class="newSessionIcon" viewBox="0 0 16 16" aria-hidden="true">
+              <path
+                fill="none"
+                stroke="currentColor"
+                stroke-width="1.6"
+                stroke-linecap="round"
+                d="M8 2.8v10.4M2.8 8h10.4"
+              />
+            </svg>
+            <span class="newSessionLabel wide">新建</span>
+          </button>
+
+          <!-- 浏览区（dsh regionArea：仅「对话」区 —— 会话按项目文件夹分组；
+               工具/MCP/插件区已删（入口在设置）；rail 态为空座位）
+               .list 是唯一滚动区：stable 8px 滚动条 + 底部 24px 渐隐遮罩 -->
+          <div class="regionArea">
+            <div class="treeBody wide" id="tree-body">
+              <div class="list" id="side-list">
+                <!-- 对话：条目实际是**会话（Session）**——点击恢复的是会话
+                     （GET /api/sessions/:id），非「对话」视图（术语见 CONTEXT.md）；
+                     组头（组内渲染）按 workspaceRoot 分作者分组（app.js 装配） -->
+                <section class="groupSection" id="sec-sessions">
+                  <div
+                    class="projectRow"
+                    id="row-sessions"
+                    role="button"
+                    tabindex="0"
+                    aria-expanded="true"
+                    aria-controls="body-sessions"
+                  >
+                    <span class="slot folder folderOpen" aria-hidden="true">
+                      <svg viewBox="0 0 16 16" width="16" height="16" aria-hidden="true">
+                        <path
+                          fill="currentColor"
+                          d="M6.9 2.8h5.6c.9 0 1.6.7 1.6 1.6v1.8H3.2c-.5 0-1 .3-1.2.7l-.3-3.1c-.1-.6.4-1 1-1zm6.9 3.4v2.3c0 .9-.7 1.6-1.6 1.6H3.8c-.9 0-1.6-.7-1.6-1.6V6.6c0-.4.3-.8.7-.9l.3.1h9.3c.3 0 .8-.1 1.3.4z"
+                        />
+                      </svg>
+                    </span>
+                    <span class="slot folder folderClose" aria-hidden="true">
+                      <svg viewBox="0 0 16 16" width="16" height="16" aria-hidden="true">
+                        <path
+                          fill="currentColor"
+                          d="M3.2 2.8h3l1.5 1.5h5c.9 0 1.6.7 1.6 1.6v5.6c0 .9-.7 1.6-1.6 1.6H3.2c-.9 0-1.6-.7-1.6-1.6V4.4c0-.9.7-1.6 1.6-1.6z"
+                        />
+                      </svg>
+                    </span>
+                    <span class="slot chevron" aria-hidden="true">
+                      <svg
+                        class="arrow"
+                        viewBox="0 0 14 14"
+                        width="14"
+                        height="14"
+                        aria-hidden="true"
+                      >
+                        <path fill="currentColor" d="M5.4 3.3l5 4.7-5 4.7z" />
+                      </svg>
+                    </span>
+                    <span class="projectText"><span class="title">对话</span></span>
+                  </div>
+                  <div id="body-sessions">
+                    <ul class="rowList" id="side-session-list">
+                      <!-- 骨架占位：服务端数据未到前的定高条（防侧栏内容跳动；数据/降级
+                           说明到达即被 replaceChildren 替换 —— 侧栏本体永不因此隐藏） -->
+                      <li class="side-skeleton" aria-hidden="true"></li>
+                      <li class="side-skeleton" aria-hidden="true"></li>
+                      <li class="side-skeleton" aria-hidden="true"></li>
+                    </ul>
+                    <div class="empty" id="sessions-empty" hidden>暂无会话，点新建开始</div>
+                    <div class="empty" id="sessions-unavailable" hidden>
+                      会话列表暂不可用。稍后重试或检查服务状态。
+                    </div>
+                  </div>
+                </section>
+              </div>
+              <span class="fade"></span>
+            </div>
+          </div>
+
+          <!-- 底部（dsh footArea）：footerActions 统计行 + settingsArea 设置入口（顶栏已移除设置钮） -->
+          <footer class="footArea">
+            <div class="footerActions">
+              <div class="stats" id="stats-line" role="status" aria-label="运行统计">
+                内存 – · 会话 – · Shell –
+              </div>
+            </div>
+            <div class="settingsArea">
+              <button class="settingsButton" id="btn-settings" type="button">
+                <svg viewBox="0 0 16 16" aria-hidden="true">
+                  <path
+                    fill="currentColor"
+                    d="M9.4 1.5h-2.8l-.4 1.6a1.5 1.5 0 0 1-.8.68L3.7 4.7a1.5 1.5 0 0 1-1.1-.05L.98 5.83 2.4 8l1.5-.36c.33.2.66.47.8.82l.5 1.84 1.2 3.2h3l.6-3.2c.1-.4.35-.65.7-.84l1.5.4L14.2 8l-1.3-2.2c-.4 0-.75-.36-.9-.65-.3-.55-.4-1.2-.6-2z"
+                  />
+                  <circle cx="8" cy="7" r="2.1" fill="var(--bg-elev)" />
+                </svg>
+                <span class="settingsLabel">设置</span>
+              </button>
+            </div>
+          </footer>
+
+          <!-- 行菜单（kebab → dsh Menu 语义本地形态：侧栏内绝对定位浮层；
+               定位计算 = menu.js 纯函数 menuPosition；portal 语义 = 逃出 .list 剪裁 -->
+          <div class="rowMenu" id="row-menu" hidden role="menu" aria-label="会话操作"></div>
+        </aside>
+      </div>
+
+      <!-- ============ 主列 ============ -->
+      <div class="main-col">
+        <header class="topbar" id="topbar">
+          <div class="topbar-left">
+            <button class="session-chip" id="session-chip" type="button" title="当前会话">
+              <span class="session-dot" aria-hidden="true"></span>
+              <span class="session-title" id="session-title">新会话</span>
+              <span class="session-id" id="session-id"></span>
+            </button>
+          </div>
+
+          <div class="topbar-right">
+            <!-- 顶栏只保留：会话名/连接状态 —— 品牌在侧栏（dsh 语义）、
+                 用量统计已移入 composer 输入卡 footer、设置入口已移入侧栏底部、
+                 停止按钮移入 composer 发送钮左侧（34px 红色圆形）。 -->
+            <span class="conn" id="conn" data-state="idle" title="连接状态" role="status">
+              <span class="conn-dot" aria-hidden="true"></span>
+              <span id="conn-label">未连接</span>
+            </span>
+          </div>
+        </header>
+
+        <!-- ============ 消息流 ============ -->
+        <main class="messages" id="messages" aria-label="对话消息">
+          <!-- 空态引导（仅未发过消息时显示） -->
+          <div class="empty" id="empty">
+            <div class="empty-hero">
+              <svg class="empty-logo" viewBox="0 0 32 32" aria-hidden="true">
+                <rect width="32" height="32" rx="8" fill="var(--accent-dim)" />
+                <path d="M9 9h14v3H9zm0 6h14v3H9zm0 5.5h9v3H9z" fill="var(--accent)" />
+              </svg>
+              <h1>用 DevMate 干活</h1>
+              <p class="empty-sub">
+                一个认真讨论后在你机器上执行命令的编程智能体。<br />它做的每一步都看得到、都拦得住、都可追溯。
+              </p>
+            </div>
+            <ol class="steps">
+              <li class="step" id="step-1">
+                <span class="step-no">1</span>
+                <div class="step-body">
+                  <h2>配置你的 API Key</h2>
+                  <p>
+                    打开左侧栏底部「设置」，填 DeepSeek 的密钥（默认 base_url
+                    已就绪）。只保存在你自己的机器上。
+                  </p>
+                </div>
+                <button class="btn btn-primary" id="btn-empty-open-settings" type="button">
+                  去设置
+                </button>
+              </li>
+              <li class="step" id="step-2">
+                <span class="step-no">2</span>
+                <div class="step-body">
+                  <h2>描述你想做什么</h2>
+                  <p>
+                    下面输入框直接打字。例如：「把我的代码改成零依赖」或「帮我看一下这个报错」。Enter
+                    发送、Shift+Enter 换行。
+                  </p>
+                </div>
+              </li>
+              <li class="step" id="step-3">
+                <span class="step-no">3</span>
+                <div class="step-body">
+                  <h2>看它边做边汇报</h2>
+                  <p>
+                    每条回复、每个工具调用都以卡片呈现在这里；需要批准的危险操作会弹窗等你确认。
+                  </p>
+                </div>
+              </li>
+            </ol>
+          </div>
+        </main>
+
+        <!-- ============ 输入区（含停靠式运行状态条：状态属于输入框上下文） ============ -->
+        <footer class="composer" id="composer">
+          <!-- 运行状态条（run-status / run-error；dsh「目标/状态属于输入框上下文」哲学）：
+               运行中 = 细横条（色点脉冲 + 闪烁阶段词 + 实时耗时）；终态 = 单行小字。 -->
+          <div class="run-strip" id="run-strip" hidden role="status" aria-live="polite"></div>
+          <!-- 输入卡上方提示条（dsh InputBar .notice：整卡宽 r8 淡填充小字） -->
+          <p class="composer-hint" id="composer-hint">
+            发送后 DevMate 会自动开始工作；调试中可随时点「停止」。输入 / 可打开命令。
+          </p>
+          <!-- 思考强度分段 pill（composer 输入卡上方右侧；点击即 POST /api/settings
+               {reasoning}，防抖 300ms，失败回滚 toast；选项由 app.js 从 settings.js
+               REASONING_VALUES/LABELS 装配 —— 单一来源防漂移） -->
+          <div class="reasoning-row" id="reasoning-row">
+            <span class="reasoning-label">思考强度</span>
+            <div
+              class="reasoning-seg"
+              id="reasoning-seg"
+              role="radiogroup"
+              aria-label="思考强度"
+            ></div>
+          </div>
+          <!-- dsh InputBar 输入卡：r22 胶囊（textarea + 底部控制行，控制行右置发送钮） -->
+          <div class="composer-box">
+            <textarea
+              class="composer-input"
+              id="input"
+              rows="1"
+              placeholder="告诉 DevMate 你想做什么……（Enter 发送，Shift+Enter 换行，/ 打开命令）"
+              autocomplete="off"
+              autocapitalize="off"
+              spellcheck="false"
+              aria-label="输入内容"
+              disabled
+            ></textarea>
+            <div class="composer-foot">
+              <!-- dsh InputBar .primary 发送钮：34px 圆形蓝钮 + 白色箭头（figma
+                   IconButton 34:10465）—— 纯图标，文字语义放 title；
+                   其左侧为停止钮（runActive 时可见）：同为 34px 圆形（danger 红）。 -->
+              <div class="composer-actions">
+                <button
+                  class="btn-stop-circ"
+                  id="btn-stop"
+                  type="button"
+                  title="停止"
+                  aria-label="停止"
+                  hidden
+                >
+                  <svg viewBox="0 0 16 16" aria-hidden="true">
+                    <rect x="3.5" y="3.5" width="9" height="9" rx="1.5" fill="currentColor" />
+                  </svg>
+                </button>
+                <button
+                  class="btn btn-send"
+                  id="btn-send"
+                  type="button"
+                  title="发送"
+                  aria-label="发送"
+                  disabled
+                >
+                  <svg viewBox="0 0 16 16" aria-hidden="true">
+                    <path
+                      fill="none"
+                      stroke="currentColor"
+                      stroke-width="1.8"
+                      stroke-linecap="round"
+                      stroke-linejoin="round"
+                      d="M8 13.5v-11M3.5 7 8 2.5 12.5 7"
+                    />
+                  </svg>
+                </button>
+              </div>
+            </div>
+            <!-- 命令下拉（输入区首个字符 / 触发、防抖 150ms；纯逻辑 = commands.js，
+                 DOM 装配 = app.js；dsh Menu 表面：浮层、r8、阴影；锚于输入卡上缘） -->
+            <div class="cmd-menu" id="cmd-menu" hidden role="listbox" aria-label="命令菜单"></div>
+            <!-- 命令面板（/help 命令表、/cost 累计成本等结果展示；dsh Modal chrome） -->
+            <section
+              class="cmd-panel"
+              id="cmd-panel"
+              hidden
+              role="dialog"
+              aria-modal="false"
+              aria-label="命令结果"
+            >
+              <header class="cmd-panel-head">
+                <span class="cmd-panel-title" id="cmd-panel-title"></span>
+                <button
+                  class="cmd-panel-close"
+                  id="cmd-panel-close"
+                  type="button"
+                  aria-label="关闭"
+                >
+                  <svg viewBox="0 0 16 16" aria-hidden="true">
+                    <path
+                      fill="none"
+                      stroke="currentColor"
+                      stroke-width="1.6"
+                      d="M4 4l8 8M12 4l-8 8"
+                    />
+                  </svg>
+                </button>
+              </header>
+              <div class="cmd-panel-body" id="cmd-panel-body"></div>
+            </section>
+          </div>
+          <!-- 上下文窗口占用环（dsh ContextMeter：composer 与 stats 行之间；28px 环形 +
+               百分比；数据 = usage.contextEstimateTokens / settings.window；缺窗「—」） -->
+          <div class="meter-row" id="meter-row" hidden>
+            <span class="meter" id="meter" role="img" aria-label="上下文占用">
+              <svg class="meter-ring" viewBox="0 0 28 28" aria-hidden="true">
+                <circle class="meter-track" cx="14" cy="14" r="11" />
+                <circle class="meter-fill" cx="14" cy="14" r="11" />
+              </svg>
+              <span class="meter-text" id="meter-text">–</span>
+            </span>
+          </div>
+          <!-- 用量统计行（输入卡 footer；dsh InputBar footer 哲学——对话统计属于
+               输入框上下文；与 run-strip 共享同一 860px 列）：窄行小字，内容 =
+               步骤数 · 耗时 · 入/出/总 tokens · ≈成本（estimated 标 ≈）。
+               无值（暂停/尚无数据）时整行隐藏。 -->
+          <div class="composer-stats" id="composer-stats" hidden>
+            <span class="composer-stats-text" id="composer-stats-text">–</span>
+          </div>
+        </footer>
+      </div>
+    </div>
+
+    <!-- ============ 审批面板（modal） ============ -->
+    <div class="scrim" id="approval-scrim" hidden></div>
+    <!-- 审批面板（dsh ApprovalPanel chrome：warn 条 + r20 卡 + 右下 ghost/primary Capsule） -->
+    <section
+      class="approval"
+      id="approval"
+      hidden
+      role="alertdialog"
+      aria-modal="true"
+      aria-labelledby="approval-title"
+    >
+      <div class="ap-strip">
+        <span class="ap-dot" aria-hidden="true"></span>
+        <span>工具需要你的批准</span>
+      </div>
+      <div class="ap-body">
+        <h2 class="ap-headline" id="approval-title">等待批准后执行</h2>
+        <p class="ap-sub">执行前请确认下面的命令/参数是正确的，一切由你决定。</p>
+        <span class="ap-command" id="approval-name">bash</span>
+        <pre class="ap-args" id="approval-args" tabindex="0"></pre>
+        <label class="field-row" for="approval-reason">
+          <span class="field-label">附注理由（可选）</span>
+          <input
+            class="input"
+            id="approval-reason"
+            type="text"
+            placeholder="例如：正则正确，放心执行"
+          />
+        </label>
+        <div class="ap-actions">
+          <button class="btn btn-outline ap-reject" id="btn-deny" type="button">拒绝执行</button>
+          <button class="btn btn-primary" id="btn-approve" type="button">允许执行</button>
+        </div>
+      </div>
+    </section>
+
+    <!-- ============ 删除确认面板（复用审批 modal 视觉语言；危险色调） ============ -->
+    <div class="scrim" id="confirm-scrim" hidden></div>
+    <!-- 删除确认 modal（dsh Modal chrome：r24 layer-2 卡 + outline/主色 Capsule 对） -->
+    <section
+      class="confirm"
+      id="confirm"
+      hidden
+      role="alertdialog"
+      aria-modal="true"
+      aria-labelledby="confirm-title"
+    >
+      <h2 id="confirm-title">删除会话</h2>
+      <p id="confirm-text">确认删除？此操作不可恢复。</p>
+      <div class="approval-actions">
+        <button class="btn btn-outline" id="btn-confirm-cancel" type="button">取消</button>
+        <button class="btn btn-danger" id="btn-confirm-ok" type="button">确认删除</button>
+      </div>
+    </section>
+
+    <!-- ============ 设置抽屉 ============ -->
+    <div class="scrim" id="settings-scrim" hidden></div>
+    <aside
+      class="settings-modal"
+      id="settings"
+      hidden
+      role="dialog"
+      aria-modal="true"
+      aria-labelledby="settings-title"
+    >
+      <!-- dsh Settings 页头：标题左、动作右（outline 胶囊同族 + 关闭 X） -->
+      <header class="settings-head">
+        <h2 id="settings-title">设置</h2>
+        <div class="settings-head-actions">
+          <button class="btn btn-icon" id="btn-settings-close" type="button" aria-label="关闭设置">
+            <svg viewBox="0 0 16 16" aria-hidden="true">
+              <path fill="none" stroke="currentColor" stroke-width="1.6" d="M4 4l8 8M12 4l-8 8" />
+            </svg>
+          </button>
+        </div>
+      </header>
+      <div class="settings-body">
+        <!-- 左侧导航（radio + label 纯 CSS 切换，无 JS 参与；默认高亮 Models 同构「模型接口」） -->
+        <input class="nav-radio" type="radio" name="setnav" value="general" id="nav-general" />
+        <input
+          class="nav-radio"
+          type="radio"
+          name="setnav"
+          value="models"
+          id="nav-models"
+          checked
+        />
+        <input class="nav-radio" type="radio" name="setnav" value="skills" id="nav-skills" />
+        <input class="nav-radio" type="radio" name="setnav" value="mcp" id="nav-mcp" />
+        <nav class="settings-nav" aria-label="设置分区">
+          <label class="nav-item" for="nav-general" data-tab="general">
+            <svg viewBox="0 0 16 16" aria-hidden="true">
+              <path
+                fill="currentColor"
+                d="M9.4 1.5h-2.8l-.4 1.6a1.5 1.5 0 0 1-.8.68L3.7 4.7a1.5 1.5 0 0 1-1.1-.05L.98 5.83 2.4 8l1.5-.36c.33.2.66.47.8.82l.5 1.84 1.2 3.2h3l.6-3.2c.1-.4.35-.65.7-.84l1.5.4L14.2 8l-1.3-2.2c-.4 0-.75-.36-.9-.65-.3-.55-.4-1.2-.6-2z"
+              />
+              <circle cx="8" cy="7" r="2.1" fill="var(--bg)" />
+            </svg>
+            <span>常规</span>
+          </label>
+          <label class="nav-item" for="nav-models" data-tab="models">
+            <svg viewBox="0 0 16 16" aria-hidden="true">
+              <path fill="currentColor" d="M2 3.5h12v1.6H2zM4.5 7.2h9v1.6h-9zM7.5 10.9h6v1.6h-6z" />
+            </svg>
+            <span>模型接口</span>
+          </label>
+          <label class="nav-item" for="nav-skills" data-tab="skills">
+            <svg viewBox="0 0 16 16" aria-hidden="true">
+              <path
+                fill="currentColor"
+                d="M3 2.4h10v1.7H3zM3 5.9h10v1.7H3zM3 9.4h10v1.7H3zM3 12.9h6v1.7H3z"
+              />
+            </svg>
+            <span>Skills</span>
+          </label>
+          <label class="nav-item" for="nav-mcp" data-tab="mcp">
+            <svg viewBox="0 0 16 16" aria-hidden="true">
+              <path
+                fill="currentColor"
+                d="M6 1.5h4.6v1.7H6.8v6.6h3.7v-4h1.8v5.8h-2.6a2.4 2.4 0 0 1-1.2.4H6.2a2.4 2.4 0 0 1-2.4-2.4V7h1.7v2.2a.8.8 0 0 0 .8.8v-1.6zM5.1 1.5a1.6 1.6 0 0 1 1.7 1.6A1.6 1.6 0 0 1 5.1 4.7 1.6 1.6 0 0 1 3.5 3.1 1.6 1.6 0 0 1 5.1 1.5z"
+              />
+              <rect x="2.6" y="8.2" width="1.6" height="4.3" rx="0.8" fill="currentColor" />
+            </svg>
+            <span>MCP</span>
+          </label>
+        </nav>
+        <div class="settings-content">
+          <!-- 常规：主题 / 工作区 -->
+          <section class="settings-panel" data-tab="general">
+            <h3 class="panel-title">常规</h3>
+            <p class="panel-desc">界面外观与运行环境；密钥与端点见「模型接口」。</p>
+            <div class="settings-card">
+              <div class="field-group">
+                <span class="field-label">主题</span>
+                <div class="theme-selector" role="radiogroup" aria-label="主题">
+                  <label class="theme-option">
+                    <input type="radio" name="theme" value="system" checked />
+                    跟随系统
+                  </label>
+                  <label class="theme-option">
+                    <input type="radio" name="theme" value="light" />
+                    浅色
+                  </label>
+                  <label class="theme-option">
+                    <input type="radio" name="theme" value="dark" />
+                    深色
+                  </label>
+                </div>
+                <p class="field-help">
+                  「跟随系统」随操作系统深浅色实时切换（浏览器无痕模式不记忆选择）。
+                </p>
+              </div>
+              <div class="field-group">
+                <span class="field-label">工作区目录</span>
+                <code class="workspace-display" id="set-workspace">（服务端未提供）</code>
+                <p class="field-help">仅展示确认；工作目录由 DevMate 启动位置决定。</p>
+              </div>
+            </div>
+            <!-- Subagent 工作流：开关 + 并行数（1-4 步进，禁 0；与 /api/workflow 同步，
+                 服务端不可达时降级 localStorage，旁注由 JS 填充「未同步（仅本地）」） -->
+            <div class="settings-card">
+              <div class="settings-card-head end">
+                <span class="settings-card-title">Subagent 工作流</span>
+                <label class="switch">
+                  <input
+                    type="checkbox"
+                    id="set-subagent-enabled"
+                    checked
+                    data-subagent-field="enabled"
+                  />
+                  <span class="switch-track"></span>
+                </label>
+              </div>
+              <div class="field-group">
+                <label for="set-subagent-parallel">并行数</label>
+                <input
+                  class="input input-num"
+                  id="set-subagent-parallel"
+                  type="number"
+                  min="1"
+                  max="4"
+                  step="1"
+                  value="2"
+                  data-subagent-field="parallel"
+                />
+                <p class="field-help">
+                  启用后 DevMate 可将独立子任务（子代理）并行执行；范围为 1-4，不接受 0。
+                </p>
+                <p class="field-help dim" id="set-subagent-note" hidden></p>
+              </div>
+            </div>
+          </section>
+          <!-- 模型接口：OpenAI 兼容端点三件套（dsh provider 卡同构：gray 面板 + 底部胶囊对） -->
+          <section class="settings-panel" data-tab="models">
+            <h3 class="panel-title">模型接口</h3>
+            <p class="panel-desc">
+              填写 OpenAI 兼容端点的 Base URL、模型与密钥（主默认 DeepSeek）。
+            </p>
+            <div class="settings-card">
+              <div class="settings-card-head">
+                <span class="settings-card-title">DevMate</span>
+                <span class="settings-card-sub">openai-compatible</span>
+              </div>
+              <div class="field-group">
+                <label for="set-baseurl">Base URL</label>
+                <input
+                  class="input mono"
+                  id="set-baseurl"
+                  type="url"
+                  placeholder="https://api.deepseek.com"
+                  autocomplete="off"
+                />
+                <p class="field-help">任意 OpenAI 兼容端点；主默认 DeepSeek。</p>
+              </div>
+              <div class="field-group">
+                <label for="set-model">模型</label>
+                <input
+                  class="input mono"
+                  id="set-model"
+                  type="text"
+                  placeholder="deepseek-v4-flash"
+                  autocomplete="off"
+                />
+              </div>
+              <div class="field-group">
+                <label for="set-key">API Key</label>
+                <input
+                  class="input mono"
+                  id="set-key"
+                  type="password"
+                  placeholder="sk-…"
+                  autocomplete="off"
+                />
+                <p class="field-help key-state" id="key-state">未配置</p>
+                <p class="field-help dim">
+                  密钥只保存在你本机的服务端；保存后输入框立即清空，页面内永久只显示掩码。
+                </p>
+              </div>
+              <hr class="settings-card-divider" />
+              <div class="settings-card-actions">
+                <button class="btn btn-outline" id="btn-settings-cancel" type="button">取消</button>
+                <button class="btn btn-primary" id="btn-save-settings" type="button">
+                  保存设置
+                </button>
+                <span class="drawer-status" id="settings-status" role="status"></span>
+              </div>
+            </div>
+          </section>
+          <!-- Skills：运行时技能清单（GET /api/skills；后端在途，缺失降级「暂无技能」；
+               开关 → POST /api/skills/:id {enabled}） -->
+          <section class="settings-panel" data-tab="skills">
+            <h3 class="panel-title">Skills</h3>
+            <p class="panel-desc">
+              技能是可由 DevMate 按需调用的子工作流；列表由服务端提供，此处只控制启用状态。
+            </p>
+            <div class="settings-card">
+              <div class="settings-card-head">
+                <span class="settings-card-title">技能列表</span>
+              </div>
+              <ul class="set-list" id="skills-list"></ul>
+              <p class="set-note" id="skills-note" hidden></p>
+            </div>
+          </section>
+          <!-- MCP：服务器清单（GET /api/mcp）+ 添加表单（POST /api/mcp）；
+               徽章按 enabled 态渲染（已登记/已停用，契约不依赖 status）；
+               客户端协议已实现：stdio JSON-RPC（见 src/core/mcp） -->
+          <section class="settings-panel" data-tab="mcp">
+            <h3 class="panel-title">MCP</h3>
+            <p class="panel-desc">
+              管理 Model Context Protocol 服务器；客户端协议已实现：stdio JSON-RPC 客户端，服务器经
+              spawn（无 shell）连接，懒连接 + 串行化 + 超时判型。
+            </p>
+            <div class="settings-card">
+              <div class="settings-card-head">
+                <span class="settings-card-title">服务器</span>
+              </div>
+              <ul class="set-list" id="mcp-list"></ul>
+              <p class="set-note" id="mcp-note" hidden></p>
+              <hr class="settings-card-divider" />
+              <div class="field-group">
+                <span class="field-label">添加服务器</span>
+                <div class="set-add-row">
+                  <input
+                    class="input"
+                    id="mcp-add-name"
+                    type="text"
+                    placeholder="名称"
+                    aria-label="服务器名称"
+                  />
+                  <input
+                    class="input mono"
+                    id="mcp-add-command"
+                    type="text"
+                    placeholder="command"
+                    aria-label="启动命令"
+                  />
+                  <input
+                    class="input mono"
+                    id="mcp-add-args"
+                    type="text"
+                    placeholder="args（空格分隔）"
+                    aria-label="参数"
+                  />
+                  <button
+                    class="btn btn-outline btn-sm end-add"
+                    type="button"
+                    data-set-action="mcp-add"
+                  >
+                    添加
+                  </button>
+                </div>
+                <p class="set-note" id="mcp-add-note" hidden></p>
+              </div>
+            </div>
+          </section>
+          <!-- 设置页无「插件」区（2026-08-28：导航项/面板/图标已移除 —— 插件机制未启用；
+     侧栏「插件」空态卡按用户先前要求保留展示，见 #sec-plugins） -->
+        </div>
+      </div>
+    </aside>
+
+    <div class="toast" id="toast" hidden role="status"></div>
+
+    <noscript>
+      <p class="noscript-note">
+        DevMate 对话窗口需要启用 JavaScript（本页面零依赖，无任何外部脚本）。
+      </p>
+    </noscript>
+
+    <!-- 单文件 ES Module 入口（零依赖、零构建；import 全部相对 .js 路径） -->
+    <script type="module" src="./app.js"></script>
+  </body>
+</html>

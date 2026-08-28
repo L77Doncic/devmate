@@ -31,7 +31,13 @@
  */
 import { LlmError } from '../../shared/llm-types.js';
 import { extractErrorBody, RETRYABLE_STATUS } from './error-parse.js';
-import type { ChatMessage, ChatRequest, ChatTool, ToolChoice } from '../../shared/llm-types.js';
+import type {
+  ChatMessage,
+  ChatRequest,
+  ChatTool,
+  ReasoningEffort,
+  ToolChoice,
+} from '../../shared/llm-types.js';
 
 /** 五家供应商 ID（ADR-0002 选型；新供应商接入 = 新增 id + preset）。 */
 export const PROVIDER_IDS = ['openai', 'deepseek', 'dashscope', 'glm', 'kimi'] as const;
@@ -82,6 +88,19 @@ export interface ProviderPreset {
   readonly fixedSamplingParams: readonly string[];
   /** 思考模式下被忽略的采样参数（§1.6 DeepSeek 原文：不报错但无效）；thinkingEnabled 为 true 时生效。 */
   readonly thinkingIgnoredSamplingParams?: readonly string[];
+  /**
+   * 思考强度（reasoningEffort）的 wire 载体（C 档）：
+   * 'reasoning_effort'（OpenAI-family：low/medium/high 逐字下发；off 不发）、
+   * 'thinking'（DeepSeek：thinking {type:'enabled', budget_tokens}；off 显式 {type:'disabled'}）。
+   * undefined = 未核实（无据）→ 保守 off：任何 effort 都不下发（Kimi/GLM/Qwen 当前口径）。
+   */
+  readonly reasoningParam?: 'reasoning_effort' | 'thinking';
+  /**
+   * 请求侧上下文窗口 token 估算（D/C 档；GET /api/settings 的 window 初值）。
+   * 注意：全部为**估算**值（research 未能核实的一手数字；「估算，可在设置覆盖」——
+   * settings 的 windowTokens 覆盖优先于本字段）。
+   */
+  readonly contextWindowTokens: number;
   /**
    * 工具函数 strict 注入值（§1.3）：undefined=不注入、平台缺省生效
    * （各家缺省值见 strictDefault）；仅 Kimi 注入 true 呈显。
@@ -154,8 +173,14 @@ export type NormalizedFinishReason =
 export function buildRequest(unified: ChatRequest, provider: ProviderPreset): WireRequest {
   assertKnownProvider(provider);
 
+  // 思考强度 → 思考态（C 档）：本次请求是否处于「思考开启」——支配
+  // thinkingIgnoredSamplingParams 裁剪（§1.6 思考关闭时 temperature/top_p 不再静默剔除）。
+  const effort = unified.reasoningEffort;
+  const thinkingActive =
+    effort !== undefined ? effort !== 'off' : provider.thinkingEnabled === true;
+
   const excludedKeys = new Set<string>(provider.fixedSamplingParams);
-  if (provider.thinkingEnabled === true) {
+  if (thinkingActive) {
     for (const k of provider.thinkingIgnoredSamplingParams ?? []) excludedKeys.add(k);
   }
   const policy = reasoningPolicyOf(provider);
@@ -187,7 +212,19 @@ export function buildRequest(unified: ChatRequest, provider: ProviderPreset): Wi
   if (unified.streamOptions !== undefined) {
     body.stream_options = { include_usage: unified.streamOptions.includeUsage === true };
   }
-  if (provider.thinkingEnabled !== undefined) {
+  if (effort !== undefined) {
+    // 思考强度语义（C 档）：effort 明确给出时优先于 preset 缺省；'off' = 不传/显式禁用；
+    // reasoningParam 未核实（无据）→ 保守不发任何字段（宁可参数不生效，绝不触发 400）。
+    if (provider.reasoningParam === 'reasoning_effort') {
+      // §5.2 词表：low/medium/high 逐字；off → 不传（无法关闭的平台以缺省为兜底）
+      if (effort !== 'off') body.reasoning_effort = effort;
+    } else if (provider.reasoningParam === 'thinking') {
+      body.thinking =
+        effort === 'off'
+          ? { type: 'disabled' } // DeepSeek §1.6：显式关闭思考（off 不传将保持平台默认 enabled）
+          : { type: 'enabled', budget_tokens: THINKING_BUDGET_TOKENS[effort] };
+    }
+  } else if (provider.thinkingEnabled !== undefined) {
     body.thinking = { type: provider.thinkingEnabled ? 'enabled' : 'disabled' }; // §1.6
   }
   if (provider.clearThinking !== undefined) body.clear_thinking = provider.clearThinking; // §3.3
@@ -246,6 +283,13 @@ export function normalizeError(
     ...(bodySnippet !== undefined ? { bodySnippet } : {}),
   });
 }
+
+/**
+ * DeepSeek thinking budget_tokens 档位（C 档；§1.6 思考模式下对预算的保守档位——
+ * low/medium/high 三档取值；数值为估算，可在 settings 侧换档不可细调）。
+ */
+const THINKING_BUDGET_TOKENS: Readonly<Record<Exclude<ReasoningEffort, 'off'>, number>> =
+  Object.freeze({ low: 1024, medium: 4096, high: 16384 });
 
 // ---------------------------------------------------------------------------
 // 内部实现：纯函数，无状态

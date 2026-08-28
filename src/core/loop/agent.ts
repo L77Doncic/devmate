@@ -19,6 +19,7 @@ import type {
   ChatTool,
   LlmError,
   LlmUsage,
+  ReasoningEffort,
   StreamSnapshot,
 } from '../../shared/llm-types.js';
 import type { SessionEvent, ToolCall } from '../../shared/session-types.js';
@@ -76,6 +77,8 @@ export async function run(input: RunInput, opts: RunOptions): Promise<RunResult>
   const { store } = opts;
 
   const ledger: Ledger = { promptTokens: 0, completionTokens: 0, costUsd: 0, estimated: false };
+  /** 最近一次投影的上下文估算（C 档：usage 的 contextEstimateTokens；无投影路径缺省）。 */
+  let contextEstimate: number | undefined;
   const calibrator = new TokenEstimateCalibrator(); // L0 事后校准（ADR-0012；默认系数 1）
   const debouncer = new CompactionDebouncer(); // 压缩防抖（CONTEXT「压缩防抖」/ §8 A-1）
   let formatErrors = 0;
@@ -160,6 +163,7 @@ export async function run(input: RunInput, opts: RunOptions): Promise<RunResult>
       // 闸门 A：请求前估价（§5.3：est_prompt×prompt 价 + maxTokens×completion 价 + 累计 > 预算 ⇒ 不发请求；
       // 单价表缺口期按「估算 token × 占位价」近似，ADR-0003）。promptEst 经 L0 校正系数（ADR-0012）。
       const rawEst = projection.stats.estimatedTokens;
+      contextEstimate = rawEst; // C 档：透传 usage 的 contextEstimateTokens（最后一次投影）
       const promptEst = calibrator.apply(rawEst);
       if (
         ledger.costUsd +
@@ -185,6 +189,7 @@ export async function run(input: RunInput, opts: RunOptions): Promise<RunResult>
         approver: opts.approver,
         toolTimeoutMs,
         ...(opts.maxTokens !== undefined ? { maxTokens: opts.maxTokens } : {}),
+        ...(opts.reasoning !== undefined ? { reasoning: opts.reasoning } : {}),
         budget: { pricing, costLimit, promptEst, ledger },
         calibrator,
         rawEst,
@@ -220,6 +225,7 @@ export async function run(input: RunInput, opts: RunOptions): Promise<RunResult>
       totalTokens: ledger.promptTokens + ledger.completionTokens,
       costUsd: ledger.costUsd,
       estimated: ledger.estimated,
+      ...(contextEstimate !== undefined ? { contextEstimateTokens: contextEstimate } : {}),
     },
     steps,
     durationMs: now() - startAt,
@@ -259,6 +265,8 @@ interface TurnDeps {
   toolTimeoutMs: number;
   /** 请求侧 maxTokens（opts 提供时随请求发送；缺省不发、闸门 A 用模型默认预留估价）。 */
   maxTokens?: number;
+  /** 思考强度（C 档：RunOptions.reasoning 逐字进 ChatRequest.reasoningEffort）。 */
+  reasoning?: ReasoningEffort;
   /** 成本护栏状态归并（Data Clumps：pricing/costLimit/promptEst/ledger 成组流转）。 */
   budget: BudgetState;
   /** L0 事后校准器（真实 usage 到位后 update；ADR-0012）。 */
@@ -301,6 +309,8 @@ async function runTurn(deps: TurnDeps): Promise<TurnOutcome> {
     messages: deps.messages,
     ...(deps.chatTools.length > 0 ? { tools: deps.chatTools } : {}),
     ...(deps.maxTokens !== undefined ? { maxTokens: deps.maxTokens } : {}),
+    // C 档思考强度：设置侧 reasoning（缺省 medium）逐字透传——adapter 按家映射
+    ...(deps.reasoning !== undefined ? { reasoningEffort: deps.reasoning } : {}),
   };
 
   let content = '';

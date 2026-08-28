@@ -46,6 +46,7 @@ export type {
   LlmErrorInit,
   LlmErrorKind,
   LlmUsage,
+  ReasoningEffort,
   StreamEvent,
   StreamSnapshot,
   ToolChoice,

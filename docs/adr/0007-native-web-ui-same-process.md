@@ -18,3 +18,14 @@ Status: proposed
 - WS 控制信令未闭合（issue 05 未关闭）：若最终裁决退化到纯 SSE（如 OpenCode `/tui/*` 驱动、或 POST 轮询），交互时序随之调整——本 ADR 只锁定「零依赖原生 UI + 同进程直调 + HTTP SSE 推流」主架构。
 
 依据：open-source-agent-architectures.md §3.1（OpenCode server：HTTP、SSE `/event`、会话资源化 API 一手）、§3.2（多前端形态）；REVIEW.md D4（IPC 三选一缺位、「我们的方案」章节缺失）；spec.md §2/§3（UI 零依赖与 F6/F7 验收——决策输入，非研究报告小节）。
+
+## 修订（2026-08-28）
+
+Web UI 的视觉层（主题 token 与组件几何）改为忠实复刻 DeepSeek Harness（dsh）
+Web UI：`style.css` 的 `--dsw-*` theme token（含浅/深双主题）逐值照抄其
+`ui/design-platform.css`，布局壳与组件 chrome（按钮胶囊/输入卡/消息气泡/披露行/
+审批面板/设置页/模态）几何与色值取自其 `ui/` 组件样式；dsh 为 MIT 许可
+（© 2026 DeepSeek），按 MIT 保留声明属性（LICENSE / THIRD-PARTY-NOTICES.md）。
+内容差异不伪造：无 goal/todo/queue/deliverables，composer dock 只放
+run-status 条 + Statistics 行（StatsLine 五元组），侧栏无插件功能列表（空态卡保留）。
+本修订不改动本 ADR 锁定的「零依赖原生 UI + 同进程直调 + HTTP SSE 推流」主架构。

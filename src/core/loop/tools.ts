@@ -10,8 +10,10 @@
  *
  * 回注载荷约定（research §4.4 / ADR-0006）：工具结果 content 恒为合法 JSON，
  * 顶层 {ok:false, error:{type, message, human_hint?, available_tools?, issues?,
- * arguments_head?}}；逐调用 ID 配对（API-SPEC §3.2），绝不出现落单 tool 消息；
- * 未知工具（E10）的唯一构造入口是 unknownToolResult（文案经 unknownToolMessage 单一来源）。
+ * arguments_head?, available_skills?}}；逐调用 ID 配对（API-SPEC §3.2），绝不出现
+ * 落单 tool 消息；未知工具（E10）的唯一构造入口是 unknownToolResult（文案经
+ * unknownToolMessage 单一来源）。errorContentJson 是本载荷的**单一构造实现**——
+ * 各工具的错误回注（含技能 available_skills）一律经它构造，禁止手写形状。
  */
 import type { ToolCall } from '../../shared/session-types.js';
 import type { JsonSchema, ToolDef, ToolResult, ToolRegistry, Tool } from './types.js';
@@ -166,15 +168,18 @@ export interface ReinjectionError {
   issues?: SchemaIssue[];
   /** 原始参数前段（载荷键名照研究 §4.4：snake_case arguments_head）。 */
   arguments_head?: string;
+  /** 可用技能清单（use_skill 错误回注；键名沿用可用 id 清单语义）。 */
+  available_skills?: string[];
 }
 
-/** 错误结果 → 工具消息 content（合法 JSON，顶层 ok/error）。 */
+/** 错误结果 → 工具消息 content（合法 JSON，顶层 ok/error；单一构造实现）。 */
 export function errorContentJson(error: ReinjectionError): string {
   const body: Record<string, unknown> = {};
   if (error.human_hint !== undefined) body.human_hint = error.human_hint;
   if (error.available_tools !== undefined) body.available_tools = [...error.available_tools];
   if (error.issues !== undefined) body.issues = [...error.issues];
   if (error.arguments_head !== undefined) body.arguments_head = error.arguments_head;
+  if (error.available_skills !== undefined) body.available_skills = [...error.available_skills];
   return JSON.stringify({
     ok: false,
     error: { type: error.type, message: error.message, ...body },

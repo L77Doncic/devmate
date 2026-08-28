@@ -1,0 +1,71 @@
+/**
+ * # meter.js — 上下文窗口占用环（dsh ContextMeter 语义）纯逻辑（node 可直接 import）
+ *
+ * 场景：composer 与 stats 行之间的 28px 环形条 —— 占用量 =
+ * 最近一次 usage.contextEstimateTokens / settings.window（无 window → 「—」+
+ * tooltip「模型窗口未配置（估算模式）」）。权重只有三个：ratio / tier / aria，
+ * 全部纯函数；环的几何（SVG dasharray）与配色属 DOM/CSS 层（app.js/style.css）。
+ *
+ * 阈值：> 80% → warn（琥珀）、> 95% → danger（红）；dsh 同族阈值以
+ * ContextMeter.css 与 style.css 的 token 为准（--warn / --danger 单一来源）。
+ */
+
+/** 琥珀阈值（严格大于；dsh 同族：超过 80% 才告警）。 */
+export const METER_WARN_RATIO = 0.8;
+/** 红色阈值（严格大于 95%，红——与 dsh 同类「接近爆窗」语义）。 */
+export const METER_DANGER_RATIO = 0.95;
+
+/** 环的半径（与 style.css .meter-track/.meter-fill r=11 同值：28px 面板直径 - 2px 描边）。 */
+export const METER_RADIUS = 11;
+
+/** 周长（2πr；供 app.js 算 strokeDashoffset —— 单一数值不可在 CSS/JS 两侧漂移）。 */
+export function meterCircumference(radius = METER_RADIUS) {
+  return 2 * Math.PI * radius;
+}
+
+/**
+ * 占用比：contextTokens / window，夹取到 [0, 1]（超窗 → 1 = 满环）。
+ * 任一数据缺失/非法（非 number、null、非有限数、负数、非整数 window）→ null
+ * （「—」= 未知）。**只认 number** —— Number(null)=0 / Number('')=0 会把
+ * 「缺失」误判成「0 占用」（同 messages.js numOr 的反 0 陷阱）。
+ */
+export function meterRatio(contextTokens, windowTokens) {
+  if (typeof contextTokens !== 'number' || typeof windowTokens !== 'number') return null;
+  const c = contextTokens;
+  const w = windowTokens;
+  if (!Number.isFinite(c) || c < 0) return null;
+  if (!Number.isFinite(w) || w < 1 || !Number.isInteger(w)) return null;
+  return Math.min(1, c / w);
+}
+
+/**
+ * 色阶：'normal'（中性）/ 'warn'（琥珀，>80%）/ 'danger'（红，>95%）/
+ * 'unknown'（窗口未配置 → 「—」）。比例越界夹取后再判档。
+ */
+export function meterTier(ratio) {
+  if (ratio === null) return 'unknown';
+  const r = Math.min(1, Math.max(0, Number(ratio)));
+  if (r > METER_DANGER_RATIO) return 'danger';
+  if (r > METER_WARN_RATIO) return 'warn';
+  return 'normal';
+}
+
+/** 环内或旁的百分比文本：有窗 → '38%'；无窗 → '—'（tooltip 区分见 meterTooltip）。 */
+export function meterPercentText(contextTokens, windowTokens) {
+  const ratio = meterRatio(contextTokens, windowTokens);
+  if (ratio === null) return '—';
+  return `${Math.round(ratio * 100)}%`;
+}
+
+/** 悬停 tooltip：有窗 → 数值式；无窗 → 估算模式说明（文案单一来源，防漂移断言）。 */
+export function meterTooltip(contextTokens, windowTokens, formatTokensFn) {
+  const ratio = meterRatio(contextTokens, windowTokens);
+  if (ratio === null) return '模型窗口未配置（估算模式）';
+  const fmt = typeof formatTokensFn === 'function' ? formatTokensFn : (n) => String(n);
+  return `上下文占用 ${Math.round(ratio * 100)}%（${fmt(contextTokens)} / ${fmt(windowTokens)} tokens）`;
+}
+
+/** 无障碍标签（读屏）：与 tooltip 同源文案；无窗态明确「未知」。 */
+export function meterAriaLabel(contextTokens, windowTokens, formatTokensFn) {
+  return meterTooltip(contextTokens, windowTokens, formatTokensFn);
+}

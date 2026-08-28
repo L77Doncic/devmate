@@ -2,7 +2,11 @@
   "extends": "./tsconfig.json",
   "compilerOptions": {
     "noEmit": true,
-    "rootDir": "."
+    "rootDir": ".",
+    // 允许测试直接 import 原生 .js UI 模块（src/ui/web/*.js，零构建 ES Module）。
+    // checkJs 保持关闭：JS 负责运行时行为，测试中的类型标注来自 .test.ts 侧推断。
+    "allowJs": true,
+    "checkJs": false
   },
   "include": ["src", "test", "vitest.config.ts"]
 }
