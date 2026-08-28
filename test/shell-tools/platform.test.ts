@@ -12,7 +12,7 @@
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 
 import { mkdtempSync, symlinkSync } from 'node:fs';
-import { join } from 'node:path';
+import { join, win32 as pathWin32 } from 'node:path';
 import { tmpdir } from 'node:os';
 
 import type { ToolCall } from '../../src/shared/session-types.js';
@@ -21,6 +21,7 @@ import { cleanupShellFixtures, makeShellFixture, run } from './support.js';
 import {
   createPersistentShell,
   normalizeGitBashCwd,
+  rebaseTrackedCwd,
   resolveShellBinary,
   selectWindowsShell,
   spawnFailureType,
@@ -136,6 +137,64 @@ describe('h) normalizeGitBashCwd：git-bash MSYS 形态 → 宿主形态（纯�
   it('根与单段形态', () => {
     expect(normalizeGitBashCwd('/c/')).toBe('C:/');
     expect(normalizeGitBashCwd('/c')).toBe('/c');
+  });
+});
+
+describe('h) rebaseTrackedCwd：git-bash 长名 $PWD → workspaceRoot 字面拼写（win32 重定向误拦修复，纯函数）', () => {
+  // windows CI 实测根因：git-bash 的 $PWD 恒报长名（C:\Users\runneradmin\...），
+  // Node 侧 workspaceRoot 保有 8.3 短名（C:\Users\RUNNER~1\...，镜像 TMP）——
+  // 同一目录两种拼写，相对重定向目标按 trackedCwd 拼绝对后与 jail 边界比对必
+  // 「字面越界」（`> ./out.txt` 界内被误拦）。rebaseTrackedCwd 把 cwd 重拼到
+  // workspaceRoot 字面下，边界拼写归一（本组为纯函数注入测试，跨宿主可跑）。
+  const WS_SHORT = 'C:\\Users\\RUNNER~1\\AppData\\Local\\Temp\\devmate-shell-ws-1';
+  const WS_LONG = 'C:/Users/runneradmin/AppData/Local/Temp/devmate-shell-ws-1';
+
+  it('首个标记（anchor=null）：$PWD 长名 → anchor；cwd 落回 workspaceRoot 字面', () => {
+    const r = rebaseTrackedCwd(WS_LONG, null, WS_SHORT, 'win32');
+    expect(r.anchor).toBe(WS_LONG);
+    expect(r.cwd).toBe(pathWin32.normalize(WS_SHORT));
+  });
+
+  it('后续 cd 子目录：相对部分拼回 workspaceRoot 字面 → 界内相对重定向不再误拦', () => {
+    const r = rebaseTrackedCwd(`${WS_LONG}/sub-keep`, WS_LONG, WS_SHORT, 'win32');
+    expect(r.cwd).toBe(pathWin32.normalize(`${WS_SHORT}\\sub-keep`));
+    // 重定向目标形态：echo hi > ./out.txt 按重拼 cwd 拼绝对 → 落在边界（短名拼写）内
+    const resolved = pathWin32.normalize(pathWin32.join(r.cwd, 'out.txt'));
+    expect(resolved).toBe(pathWin32.normalize(`${WS_SHORT}\\sub-keep\\out.txt`));
+    expect(
+      pathWin32
+        .resolve(resolved)
+        .toLowerCase()
+        .startsWith(pathWin32.resolve(WS_SHORT).toLowerCase()),
+    ).toBe(true);
+  });
+
+  it('cwd 在 anchor 外（cd /tmp）：保留原值不重拼（目标本就界外，保守拦截方向正确）', () => {
+    const r = rebaseTrackedCwd('/tmp', WS_LONG, WS_SHORT, 'win32');
+    expect(r.cwd).toBe('/tmp');
+    expect(r.anchor).toBe(WS_LONG);
+  });
+
+  it('大小写不敏感前缀命中（win32）：盘符/段大小写差异仍重拼（长度一致的分量替换）', () => {
+    const r = rebaseTrackedCwd(
+      'C:/USERS/RUNNERADMIN/AppData/Local/Temp/devmate-shell-ws-1/sub',
+      WS_LONG,
+      WS_SHORT,
+      'win32',
+    );
+    expect(r.cwd.toLowerCase()).toBe(pathWin32.normalize(`${WS_SHORT}\\sub`).toLowerCase());
+  });
+
+  it('workspaceRoot 本身长名（大多数用户机器）：重拼后仍等于长名拼写（幂等不毁形）', () => {
+    const r = rebaseTrackedCwd(`${WS_LONG}/sub`, WS_LONG, WS_LONG, 'win32');
+    expect(r.cwd).toBe(pathWin32.normalize(`${WS_LONG}\\sub`));
+  });
+
+  it('posix：原样返回、不建立 anchor（无拼写别名问题）', () => {
+    expect(rebaseTrackedCwd('/home/u/ws', null, '/home/u/ws', 'posix')).toEqual({
+      cwd: '/home/u/ws',
+      anchor: null,
+    });
   });
 });
 

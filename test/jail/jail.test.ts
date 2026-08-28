@@ -98,8 +98,14 @@ describe('jail 攻击矩阵（接缝 S9）', () => {
     await writeFile(join(ws, 'sub/inner/deep.txt'), 'deep-content');
     await writeFile(join(ws, 'my file.txt'), 'spaced');
     await writeFile(join(ws, "it's.txt"), 'quoted');
-    await writeFile(join(ws, 'C:\\escape'), 'literal-winname');
-    await writeFile(join(ws, '..\\..\\etc\\passwd'), 'literal-backslash-name');
+    // Windows 宿主：文件名不能含 `:`（C:\escape 无法创建——windows CI 实测
+    // beforeAll ENOENT）；`..\..\etc\passwd` 在 win32 语义下是真实穿过 .. 的相对
+    // 路径（会写到 ws 父目录层级之外），不是「含反斜杠的字面名」。这两条是
+    // POSIX 专属的字面名钉住用例（对应测试已 skipIf(win32)），fixture 仅 POSIX 建。
+    if (process.platform !== 'win32') {
+      await writeFile(join(ws, 'C:\\escape'), 'literal-winname');
+      await writeFile(join(ws, '..\\..\\etc\\passwd'), 'literal-backslash-name');
+    }
     await writeFile(join(out, 'outside.txt'), 'outside-secret');
     await writeFile(join(ex, 'dir', 'extra.txt'), 'extra-content');
 
@@ -341,17 +347,25 @@ describe('jail 攻击矩阵（接缝 S9）', () => {
       expect(pathWithin(other, 'C:\\Users\\me', 'win32')).toBe(false);
     });
 
-    it('跨平台标记：Linux 上 C:\\escape 与 ..\\..\\etc\\passwd 是含反斜杠的字面文件名 → 不越狱（放行）', async () => {
-      // 期望依据：posix 中 \ 不是分隔符，整段是一个路径分量；
-      // 同名字面文件已存在于 ws 内（fixture）。在 Windows 宿主上这两条
-      // 由 e) 组 win32 语义覆盖（分处盘符/UNC 边界判定），行为按平台分支变化。
-      expectAllow(await jail.checkPath('C:\\escape', 'read'));
-      expectAllow(await jail.checkPath('..\\..\\etc\\passwd', 'read'));
-    });
+    it.skipIf(process.platform === 'win32')(
+      '跨平台标记：Linux 上 C:\\escape 与 ..\\..\\etc\\passwd 是含反斜杠的字面文件名 → 不越狱（放行）',
+      async () => {
+        // 期望依据：posix 中 \ 不是分隔符，整段是一个路径分量；
+        // 同名字面文件已存在于 ws 内（fixture）。在 Windows 宿主上这两条
+        // 由 e) 组 win32 语义覆盖（分处盘符/UNC 边界判定——C:\escape 是盘符绝对、
+        // ..\..\ 是真穿过路径，行为按平台分支变化，期望不同），故 skipIf(win32)。
+        expectAllow(await jail.checkPath('C:\\escape', 'read'));
+        expectAllow(await jail.checkPath('..\\..\\etc\\passwd', 'read'));
+      },
+    );
 
-    it('跨平台标记：同一条注入字符串写入（新建）也按字面落在界内 → 放行', async () => {
-      expectAllow(await jail.checkPath('..\\..\\etc\\passwd-new', 'write'));
-    });
+    it.skipIf(process.platform === 'win32')(
+      '跨平台标记：同一条注入字符串写入（新建）也按字面落在界内 → 放行',
+      async () => {
+        // 同左：win32 下 ..\..\ 是真抬升路径（非字面名），期望分支不同 → skipIf(win32)。
+        expectAllow(await jail.checkPath('..\\..\\etc\\passwd-new', 'write'));
+      },
+    );
   });
 
   describe('f) extraRoots：显式登记才放行', () => {
@@ -459,9 +473,16 @@ describe('jail 攻击矩阵（接缝 S9）', () => {
       );
     });
 
-    it('win32 平台在非 Windows 宿主构造 → createJail 拒绝（fail-closed，不启用未验证分支）', async () => {
-      await expect(createJail({ workspaceRoot: ws, platform: 'win32' })).rejects.toThrow(/win32/i);
-    });
+    it.skipIf(process.platform === 'win32')(
+      'win32 平台在非 Windows 宿主构造 → createJail 拒绝（fail-closed，不启用未验证分支）',
+      async () => {
+        // 该拒绝是「非平台宿主防误用」措施：在 win32 宿主上 platform='win32' 本就
+        // 合法（不抛），故仅非 win32 宿主断言（windows CI 实测若不 skip 即误报）。
+        await expect(createJail({ workspaceRoot: ws, platform: 'win32' })).rejects.toThrow(
+          /win32/i,
+        );
+      },
+    );
   });
 
   describe('i) TOCTOU 局限与构造期契约', () => {

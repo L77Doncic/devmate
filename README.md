@@ -34,7 +34,7 @@ DevMate is the "harness" part of an agent: given a task, it drives an LLM throug
 - **Prompt engineering** ([`src/ui/server/deps.ts`](src/ui/server/deps.ts)) — a budget-aware system prompt (`devmate-cli` anchors: 界内动 / 小步闭环 / 失败是普通消息), skills index section, subagent section, and the persona is split per provider rather than copy-pasted into a monolith.
 - **Native web UI** ([`src/ui/web`](src/ui/web)) — zero-framework HTML/CSS/ES Modules with no build step; dual themes (Light GitHub / Dark GitHub token sets), workspace-grouped sidebar, 12 `/` commands, reasoning-strength pill (off/low/medium/high), context-meter ring, run-status strip, `compaction` disclosure notes.
 - **Context engineering** ([`src/core/context`](src/core/context)) — projection-only context management: tool-output truncation (head/tail + elide marker), tool-result pruning with placeholders, conversation summarization with debounce, token-budget estimate + server-usage calibration.
-- **Safety baseline** — workspace jail (symlink-aware boundary), dangerous-op approval with re-injection on denial, secret redaction before re-injection, memory guard, config files written `0600`.
+- **Safety baseline** — workspace jail (symlink-aware boundary), dangerous-op approval with re-injection on denial, secret redaction before re-injection, memory guard, config files written `0600` (POSIX semantics; Windows has no POSIX `chmod` — the mode claim applies on POSIX, hygiene on Windows is the adjacent `0700` directory plus Node's best-effort read-only mapping).
 
 ## Screenshots
 
@@ -155,7 +155,7 @@ $env:DEV_MATE_API_KEY = "sk-xxxxxxxxxxxxxxxxxxxx"
 npx devmate-cli web
 ```
 
-Any OpenAI-compatible endpoint works (bearer auth + `messages/tools/SSE`), so switching providers never means switching harness. In the UI, Settings → 模型接口 accepts the same three values and writes them to `~/.devmate/config.json` (`0600`, directory `0700` — keys never enter the repository).
+Any OpenAI-compatible endpoint works (bearer auth + `messages/tools/SSE`), so switching providers never means switching harness. In the UI, Settings → 模型接口 accepts the same three values and writes them to `~/.devmate/config.json` (`0600`, directory `0700` — keys never enter the repository; both modes are POSIX semantics — Windows has no POSIX `chmod`, see the safety-baseline note).
 
 CLI surface:
 
@@ -198,7 +198,7 @@ Always-on guards:
 - **Secret redaction** — every tool result is masked before re-injection (`securedRegistry`), including error messages.
 - **Cost guard** — the only default-on fuse; `$3` per run, checked before every query and streamed-down mid-response with live usage calibration.
 - **Memory guard** — idle shells are disposed past the RSS threshold, and `GET /api/stats` reports `memoryGuard` state.
-- **Key hygiene** — `~/.devmate/config.json` is written `0600` (`0700` dir); the API endpoint only ever returns a mask; the web UI never renders with `innerHTML` and enforces a `safeHref` whitelist + CSP.
+- **Key hygiene** — `~/.devmate/config.json` is written `0600` (`0700` dir; both POSIX semantics — Windows has no POSIX `chmod`, so the 0600/0700 mode claims apply on POSIX only); the API endpoint only ever returns a mask; the web UI never renders with `innerHTML` and enforces a `safeHref` whitelist + CSP.
 
 ## Development
 

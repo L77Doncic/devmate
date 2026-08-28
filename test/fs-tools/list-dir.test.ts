@@ -11,7 +11,10 @@ import {
   runTool,
 } from './support.js';
 
-afterEach(() => cleanupWorkspaces());
+// 20000 条目用例在 NTFS 上创建/删除 20001 个文件远超默认 hook 超时（10s）：
+// windows CI 实测创建 ~28s、清理在 afterEach 带内（默认 hookTimeout 10000ms 触顶
+// 报 Hook timed out）→ 该文件 hook 超时放宽到与用例 300s 同档。
+afterEach(() => cleanupWorkspaces(), 300_000);
 
 describe('list_dir（切片 d）', () => {
   it('目录与文件分列：各自归位、目录带斜杠后缀、条目排序', async () => {

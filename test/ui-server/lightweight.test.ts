@@ -25,7 +25,7 @@ import { BROKER_MAX_BYTES, BROKER_MAX_FRAMES, SessionBroker } from '../../src/ui
 import type { SseEventData } from '../../src/ui/server/emit.js';
 import type { DevmateServer, DevmateServerDeps, TickHandle } from '../../src/ui/server/index.js';
 import { echoTool, FakeLlm } from '../loop/support.js';
-import { pidEventuallyGone } from '../shell-tools/support.js';
+import { canonicalTmpBase, pidEventuallyGone } from '../shell-tools/support.js';
 import { postJson, SseClient, startServer } from './support.js';
 
 const sleep = (ms: number): Promise<void> => new Promise((resolve) => setTimeout(resolve, ms));
@@ -181,7 +181,10 @@ describe('ui/server：shell 空闲释放（deps 工厂）', () => {
 
   afterEach(async () => {
     vi.useRealTimers();
-    for (const dir of tempDirs.splice(0)) await rm(dir, { recursive: true, force: true });
+    for (const dir of tempDirs.splice(0)) {
+      // win32：残留 shell 进程挂住目录/cwd → EBUSY（windows CI 实测）→ 重试屈从
+      await rm(dir, { recursive: true, force: true, maxRetries: 10, retryDelay: 250 });
+    }
   });
 
   // 注意：工厂构造不再预建 __fallback__ 壳（懒构建：首次访问 tools 才建；见 i5）——
@@ -386,7 +389,10 @@ describe('ui/server：TTL 与活跃 run（真实 shell 集成）', () => {
 
   afterEach(async () => {
     for (const server of servers.splice(0)) await server.close();
-    for (const dir of tempDirs.splice(0)) await rm(dir, { recursive: true, force: true });
+    for (const dir of tempDirs.splice(0)) {
+      // win32：残留 shell 进程挂住目录/cwd → EBUSY（windows CI 实测）→ 重试屈从
+      await rm(dir, { recursive: true, force: true, maxRetries: 10, retryDelay: 250 });
+    }
   });
 
   /** 进程是否存活（kill 0 探测；ESRCH = 已死）。 */
@@ -414,7 +420,8 @@ describe('ui/server：TTL 与活跃 run（真实 shell 集成）', () => {
   }
 
   it('i8) 活跃 run 期间 tick 不误杀（shell pid 存活）；run 结束空闲超时 dispose 后 pid 消失', async () => {
-    const dir = await mkdtemp(join(tmpdir(), 'devmate-idle-live-'));
+    // canonicalTmpBase：bash 长名拼写基址（win32 短/长名一致性；见该函数头注）
+    const dir = await mkdtemp(join(canonicalTmpBase(), 'devmate-idle-live-'));
     tempDirs.push(dir);
     const jail = await createJail({ workspaceRoot: dir });
     // shellPlatform 'posix'：真实 createPersistentShell 走 bash 契约（win32 宿主经
@@ -438,7 +445,11 @@ describe('ui/server：TTL 与活跃 run（真实 shell 集成）', () => {
             {
               id: 'call-1',
               name: 'run_command',
-              arguments: JSON.stringify({ command: 'echo SHELL_PID=$$; sleep 0.5' }),
+              // winpid：git-bash 的 $$ 是 MSYS 阴影 pid，Node process.kill 不可见；
+              // /proc/$$/winpid 才是真实 Windows pid（posix 回落 $$）
+              arguments: JSON.stringify({
+                command: 'echo SHELL_PID=$(cat /proc/$$/winpid 2>/dev/null || echo $$); sleep 0.5',
+              }),
             },
           ],
         },

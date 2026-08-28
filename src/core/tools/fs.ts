@@ -507,7 +507,7 @@ function segmentMatches(pat: string, name: string): boolean {
 }
 
 /** 全模式匹配：按 `/` 分段，`**` 段匹配零或多层目录（跨段 DP）。 */
-function patternMatches(pattern: string, relPath: string): boolean {
+export function patternMatches(pattern: string, relPath: string): boolean {
   const parts = pattern.split('/').filter((seg) => seg !== '' && seg !== '.');
   const relParts = relPath.split('/');
   const memo = new Map<string, boolean>();

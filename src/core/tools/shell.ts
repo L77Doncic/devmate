@@ -194,6 +194,48 @@ function cwdForHost(cwd: string): string {
 }
 
 /**
+ * win32 专用：把 shell 回报的 cwd 重拼写到 workspaceRoot 的字面拼写（纯函数，跨宿主可测）。
+ *
+ * 背景（windows-latest CI 实测，2 轮）：git-bash 的 `$PWD`/`pwd -P` 经 MSYS
+ * 运行时规范化，恒报**长名**拼写（`C:\Users\runneradmin\...`）；而 Node 侧经
+ * `os.tmpdir()`/`realpath` 取得的 workspaceRoot 可能保有 8.3 **短名**拼写
+ * （GitHub 镜像的 TMP 即 `C:\Users\RUNNER~1\AppData\Local\Temp`）。两者是同一
+ * 目录、两种字面拼写——不统一时，相对重定向目标按 trackedCwd 拼绝对后与 jail
+ * 边界（workspaceRoot 拼写）做字符串比对必然「字面越界」：界内写入被误拦
+ * （实测：`echo hi > ./out.txt` 报 path-outside-workspace；`pwd` 报 runneradmin、
+ * `realpathSync` 报 RUNNER~1）。
+ *
+ * 策略：首个完成标记的 `$PWD` 即 workspaceRoot 的规范（长名）拼写，记为 anchor；
+ * 后续 cwd 落在 anchor 之下 → 取其相对部分拼回 workspaceRoot 字面下（重拼写）；
+ * cwd 在 anchor 外（cd /tmp 等）→ 保留原值不重拼（该处目标本就属界外；拼写不
+ * 一致只导致保守拦截，安全方向正确）。
+ * posix 无此拼写别名问题：原样返回，不建立 anchor。
+ */
+export function rebaseTrackedCwd(
+  cwd: string,
+  anchor: string | null,
+  workspaceRoot: string,
+  platform: 'posix' | 'win32' = process.platform === 'win32' ? 'win32' : 'posix',
+): { cwd: string; anchor: string | null } {
+  if (platform !== 'win32') return { cwd, anchor: null };
+  if (anchor === null) {
+    // 首个标记：$PWD 即 workspaceRoot 的规范拼写；cwd 先落回 workspaceRoot 字面
+    // （同一目录，此后所有相对目标都用边界拼写参与比对）。
+    return { cwd: workspaceRoot, anchor: cwd };
+  }
+  const cn = pathWin32.normalize(cwd);
+  const an = pathWin32.normalize(anchor);
+  const eq = cn.toLowerCase() === an.toLowerCase();
+  const rel = eq
+    ? ''
+    : cn.toLowerCase().startsWith(`${an.toLowerCase()}\\`)
+      ? cn.slice(an.length)
+      : null;
+  if (rel === null) return { cwd, anchor };
+  return { cwd: pathWin32.join(workspaceRoot, rel), anchor };
+}
+
+/**
  * spawn 启动失败的普通错误类型映射（纯函数，跨宿主可测）：
  * - win32 探测无任何可用 shell → 'shell-unavailable'；
  * - 其余（spawn 同步异常如 cwd 非法、二进制缺失等）→ 'shell-spawn-failed'。
@@ -268,6 +310,8 @@ interface ShellSession {
   spawnedOnce: boolean;
   /** 最近一次命令结束后完成标记回报的 cwd（重定向目标解析基准；初值=workspaceRoot）。 */
   trackedCwd: string;
+  /** win32 的 workspaceRoot 规范拼写锚（首个标记的 $PWD，长名形式）；posix 恒 null。 */
+  anchor: string | null;
   /**
    * 完成标记目录（每会话一个：mkdtemp——路径只存于 harness 内存 + 注入脚本；
    * 不进环境变量）；命令的标记文件在其下，每命令唯一。
@@ -972,6 +1016,7 @@ async function runAttempt(
     session.dead = false;
     session.spawnError = null;
     session.trackedCwd = opts.workspaceRoot;
+    session.anchor = null; // 重开即新规范拼写（由首标记重学）
     restarted = session.spawnedOnce;
     session.spawnedOnce = true;
     wireChild(session, child);
@@ -1062,7 +1107,14 @@ async function runAttempt(
       session.dead = true;
     }
 
-    if (outcome.cwd !== null) session.trackedCwd = cwdForHost(outcome.cwd); // git-bash /c/... → C:/...
+    if (outcome.cwd !== null) {
+      // git-bash /c/... → C:/...；win32 再重拼写到 workspaceRoot 字面（短/长名拼写
+      // 归一，见 rebaseTrackedCwd 头注——否则相对重定向目标与 jail 边界字面比对必
+      // 误拦，windows CI 实测）。posix 恒原样（anchor 不建立）。
+      const rebased = rebaseTrackedCwd(cwdForHost(outcome.cwd), session.anchor, opts.workspaceRoot);
+      session.trackedCwd = rebased.cwd;
+      session.anchor = rebased.anchor;
+    }
     const restartNote = restarted ? `\n--- ${SHELL_RESTART_NOTE} ---` : '';
 
     if (outcome.kind === 'done') {
@@ -1307,6 +1359,7 @@ export function createPersistentShell(options: ShellToolOptions): PersistentShel
     dead: false,
     spawnedOnce: false,
     trackedCwd: options.workspaceRoot,
+    anchor: null,
     markerDir: mkdtempSync(join(tmpdir(), 'devmate-shell-')),
     queue: Promise.resolve(undefined),
   });

@@ -10,13 +10,18 @@
  * timeoutMs 兜底（睡眠进程被整组 SIGKILL）。fixture.dispose() 必须在每个测试末尾
  * 调用（afterEach 兜底）。
  */
+import { execFileSync } from 'node:child_process';
 import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
 import { createJail } from '../../src/core/jail/index.js';
 import type { Tool, ToolResult } from '../../src/core/loop/types.js';
-import { createPersistentShell } from '../../src/core/tools/shell.js';
+import {
+  createPersistentShell,
+  normalizeGitBashCwd,
+  resolveShellBinary,
+} from '../../src/core/tools/shell.js';
 import type { ToolCall } from '../../src/shared/session-types.js';
 
 export interface ShellFixture {
@@ -38,11 +43,40 @@ export interface FixtureOptions {
 
 const created: string[] = [];
 
+/**
+ * 临时目录的**长名**基址（win32 专属；posix 原样返回）。
+ *
+ * 背景（windows-latest CI 实测）：GitHub 镜像的 TMP/tmpdir 为 8.3 **短名**拼写
+ * `C:\Users\RUNNER~1\AppData\Local\Temp`，而 git-bash 的 `$PWD`/`pwd -P` 恒报
+ * **长名**拼写 `C:\Users\runneradmin\...`——同一目录两种字面拼写，会把 jail 边界
+ * 与 shell cwd 的字符串比对毒化（重定向误拦、cwd 断言失配）。fixture 目录统一
+ * 放在 bash 长名拼写的基底下（用 `bash -lc 'pwd -P'` 探测一次），此后 Node 侧与
+ * bash 侧路径字面一致。
+ */
+export function canonicalTmpBase(): string {
+  const base = tmpdir();
+  if (process.platform !== 'win32') return base;
+  try {
+    const shell = resolveShellBinary({ PATH: process.env.PATH ?? '' }, 'win32');
+    const out = execFileSync(shell, ['-lc', 'pwd -P'], {
+      cwd: base,
+      encoding: 'utf8',
+      timeout: 5_000,
+    });
+    const host = normalizeGitBashCwd(out.trim()); // /c/Users/runneradmin/... → C:/Users/runneradmin/...
+    if (/^[A-Za-z]:[/\\]/.test(host)) return host;
+  } catch {
+    // 探测失败：回落原 tmpdir（拼写不一致仍如实暴露为测试失败，不掩盖）
+  }
+  return base;
+}
+
 export async function makeShellFixture(
   opts: FixtureOptions & { sessionId?: string } = {},
 ): Promise<ShellFixture> {
-  const ws = mkdtempSync(join(tmpdir(), 'devmate-shell-ws-'));
-  const outside = mkdtempSync(join(tmpdir(), 'devmate-shell-out-'));
+  const wsBase = canonicalTmpBase();
+  const ws = mkdtempSync(join(wsBase, 'devmate-shell-ws-'));
+  const outside = mkdtempSync(join(wsBase, 'devmate-shell-out-'));
   created.push(ws, outside);
   const jail = await createJail({ workspaceRoot: ws });
   const { tool, dispose } = createPersistentShell({
@@ -126,6 +160,7 @@ export function payloadOf(result: ToolResult): {
 /** 每文件 afterAll 兜底清理（临时目录 force 删除；shell 进程由 fixture.dispose 杀）。 */
 export function cleanupShellFixtures(): void {
   for (const dir of created.splice(0)) {
-    rmSync(dir, { recursive: true, force: true });
+    // win32：残留 bash 挂住 cwd → rmdir EBUSY（windows CI 实测）→ 重试屈从
+    rmSync(dir, { recursive: true, force: true, maxRetries: 10, retryDelay: 250 });
   }
 }

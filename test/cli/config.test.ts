@@ -38,6 +38,19 @@ afterEach(() => {
   rmSync(tmpHome, { recursive: true, force: true });
 });
 
+/**
+ * 0600 断言（POSIX 限定）：Windows 没有 POSIX chmod——Node 在 win32 上把 chmod
+ * 映射为只读位（读回 stat.mode & 0o777 = 0o666），0600 语义仅在 POSIX 有效
+ * （windows CI 实测：expected 384(0o600) received 438(0o666)，产品对此无可修）。
+ * README 已注明该平台限定；此处 win32 只断言文件存在（可读可写的写盘语义不变）。
+ */
+function expectConfigMode(configPath: string): void {
+  if (process.platform === 'win32') {
+    return;
+  }
+  expect(statSync(configPath).mode & 0o777).toBe(0o600);
+}
+
 describe('configFilePath：主目录 → 配置文件绝对路径', () => {
   it('<home>/.devmate/config.json', () => {
     expect(configFilePath('/home/user')).toBe(join('/home/user', '.devmate', 'config.json'));
@@ -136,7 +149,7 @@ describe('saveConfig：0600 落盘 + 目录自建', () => {
     saveConfig(configPath, { model: 'm1', apiKey: 'sk-roundtrip' });
 
     expect(existsSync(join(tmpHome, '.devmate'))).toBe(true);
-    expect(statSync(configPath).mode & 0o777).toBe(0o600);
+    expectConfigMode(configPath);
     expect(JSON.parse(readFileSync(configPath, 'utf8'))).toEqual({
       model: 'm1',
       apiKey: 'sk-roundtrip',
@@ -181,7 +194,7 @@ describe('mergeConfig / mergeStored：单点合并写（三节 + settings 共用
     mergeConfig(configPath, { skills: { tdd: false } });
     expect(readJson(configPath)).toEqual({ skills: { tdd: false } });
     expect(existsSync(join(tmpHome, '.devmate'))).toBe(true);
-    expect(statSync(configPath).mode & 0o777).toBe(0o600);
+    expectConfigMode(configPath);
   });
 
   it('skill 节深合：既有键保留、冲突键 patch 优先', () => {

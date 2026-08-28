@@ -2,6 +2,7 @@ import { symlinkSync } from 'node:fs';
 import { join } from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
 
+import { patternMatches } from '../../src/core/tools/fs.js';
 import { cleanupWorkspaces, makeWorkspace, payloadOf, putFile, runTool } from './support.js';
 
 afterEach(() => cleanupWorkspaces());
@@ -27,7 +28,12 @@ describe('glob（切片 e）', () => {
     expect(r.content).toBe('src/c.ts\nsrc/x/y/c.ts');
   });
 
-  it('大小写敏感：foo.ts 与 Foo.ts 分属两个模式', async () => {
+  // Windows：NTFS 默认大小写不敏感——putFile 两个「同名不同大小写」的路径只会
+  // 创建**一个**文件，readdir 也只有一个条目，「Foo.ts 模式不命中 foo.ts」的观察
+  // 无法通过真实文件系统成立（实测 windows CI：upper 得 no matches、断言失配）。
+  // 匹配语义本身是字符串大小写敏感（segmentMatches 字符等值比较，不触 FS）——
+  // 由下方纯函数单测钉住，win32 也有覆盖。
+  it.skipIf(process.platform === 'win32')('大小写敏感：foo.ts 与 Foo.ts 分属两个模式', async () => {
     const ws = makeWorkspace();
     putFile(join(ws.root, 'foo.ts'), 'x');
     putFile(join(ws.root, 'Foo.ts'), 'x');
@@ -36,6 +42,19 @@ describe('glob（切片 e）', () => {
     expect(lower.content).toBe('foo.ts');
     const upper = await runTool(ws, 'glob', { pattern: 'Foo.ts', path: ws.root });
     expect(upper.content).toBe('Foo.ts');
+  });
+
+  it('纯函数：大小写敏感由模式匹配实现保证（不触文件系统；win32 亦有覆盖）', () => {
+    // 同一大小写：命中
+    expect(patternMatches('foo.ts', 'foo.ts')).toBe(true);
+    expect(patternMatches('src/inner.ts', 'src/inner.ts')).toBe(true);
+    // 仅大小写不同：不命中（文件系统大小写不敏感不影响字符串语义）
+    expect(patternMatches('Foo.ts', 'foo.ts')).toBe(false);
+    expect(patternMatches('foo.ts', 'Foo.ts')).toBe(false);
+    // 大小写混合段与跨段模式同样敏感
+    expect(patternMatches('src/**/C.TS', 'src/a/c.ts')).toBe(false);
+    expect(patternMatches('src/**/C.TS', 'src/a/C.TS')).toBe(true);
+    expect(patternMatches('*.TS', 'a.ts')).toBe(false);
   });
 
   it('单段 * 不跨越路径分隔符：*.ts 只命中根内', async () => {

@@ -101,7 +101,9 @@ export function makeWorkspace(blocked?: (root: string) => string[]): FsWorkspace
 
 export function cleanupWorkspaces(): void {
   for (const dir of created.splice(0)) {
-    rmSync(dir, { recursive: true, force: true });
+    // win32：文件句柄/杀进程时序造成的 EBUSY（windows CI 实测：20000 条目清理
+    // hook 超时的次要成因）→ 重试屈从
+    rmSync(dir, { recursive: true, force: true, maxRetries: 10, retryDelay: 250 });
   }
 }
 

@@ -32,7 +32,7 @@ DevMate 是智能体（Agent）的「壳体」（harness）：给定一个任务
 - **提示词工程**（[`src/ui/server/deps.ts`](src/ui/server/deps.ts)）——预算感知的系统提示合成（锚定词：界内动 / 小步闭环 / 失败是普通消息）+ 技能清单节 + 子代理节，按供应商分离处理而不是堆进一段长文。
 - **原生 Web UI**（[`src/ui/web`](src/ui/web)）——零框架 HTML/CSS/ES Modules、无构建步骤；双主题（浅色 GitHub / 深色 GitHub token 体系）、按工作区分组侧栏、12 条 `/` 命令、思考强度 pill（关闭/低/中/高）、上下文占用环、运行状态条、压缩披露小记。
 - **上下文工程**（[`src/core/context`](src/core/context)）——只作用于投影的上下文管理：工具输出截断（保头尾 + 省略标记）、工具结果裁剪 + 占位符、对话摘要 + 防抖、token 预算估算 + 服务端 usage 校准。
-- **安全基线**——工作区监狱（符号链接两端同检）、危险操作审批（拒绝原因回注）、回注前机密脱敏、内存警戒线、配置文件 `0600`。
+- **安全基线**——工作区监狱（符号链接两端同检）、危险操作审批（拒绝原因回注）、回注前机密脱敏、内存警戒线、配置文件 `0600`（POSIX 语义；Windows 无 POSIX `chmod`——该权限主张仅 POSIX 有效，Windows 上的卫生由相邻 `0700` 目录与 Node 的只读位尽力映射承担）。
 
 ## 截图
 
@@ -151,7 +151,7 @@ $env:DEV_MATE_API_KEY = "sk-xxxxxxxxxxxxxxxxxxxx"
 npx devmate-cli web
 ```
 
-任意 OpenAI 兼容端点都可用（Bearer 认证 + `messages/tools/SSE` 公共主干），换供应商无需换 harness。UI 中「设置 → 模型接口」接受同样的三项，写入 `~/.devmate/config.json`（`0600`，目录 `0700`——密钥永不进仓库）。
+任意 OpenAI 兼容端点都可用（Bearer 认证 + `messages/tools/SSE` 公共主干），换供应商无需换 harness。UI 中「设置 → 模型接口」接受同样的三项，写入 `~/.devmate/config.json`（`0600`，目录 `0700`——密钥永不进仓库；两权限皆 POSIX 语义——Windows 无 POSIX `chmod`，见「安全基线」注记）。
 
 CLI 一览：
 
@@ -194,7 +194,7 @@ UI 的所有动作都走这些端点（`src/ui/server/index.ts`）：
 - **机密脱敏**——工具结果回注前统一掩码（`securedRegistry`），错误信息同样打码。
 - **成本护栏**——唯一默认开启的保险丝：`$3`/任务，每次查询前预检、流式中超阈值即中止，带真实 usage 校准账本。
 - **内存警戒线**——超过 RSS 阈值释放空闲 Shell，`GET /api/stats` 上报 `memoryGuard` 状态。
-- **密钥卫生**——`~/.devmate/config.json` 以 `0600` 写入（目录 `0700`）；端点只回掩码；Web UI 全文禁止 `innerHTML`、强制 `safeHref` 白名单 + CSP。
+- **密钥卫生**——`~/.devmate/config.json` 以 `0600` 写入（目录 `0700`；两者皆 POSIX 语义——Windows 无 POSIX `chmod`，0600/0700 主张仅 POSIX 有效）；端点只回掩码；Web UI 全文禁止 `innerHTML`、强制 `safeHref` 白名单 + CSP。
 
 ## 开发
 

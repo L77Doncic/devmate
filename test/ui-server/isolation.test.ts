@@ -6,7 +6,6 @@
  * （常驻 shell 每会话独立实例 —— createSessionToolsFactory 契约）。
  */
 import { mkdtemp, rm } from 'node:fs/promises';
-import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
 import { createJail } from '../../src/core/jail/index.js';
@@ -17,7 +16,7 @@ import { MemorySessionAdapter } from '../../src/core/session/index.js';
 import type { ChatRequest, StreamEvent } from '../../src/shared/llm-types.js';
 import { createSessionToolsFactory } from '../../src/ui/server/deps.js';
 import { echoTool, FakeLlm } from '../loop/support.js';
-import { shellCwdForm } from '../shell-tools/support.js';
+import { canonicalTmpBase, shellCwdForm } from '../shell-tools/support.js';
 import { postJson, SseClient, startServer, waitForFrames } from './support.js';
 
 /** 按「首个 user 消息（=任务文本）」路由到不同 FakeLlm：两 run 并行互不共享脚本序。 */
@@ -46,7 +45,10 @@ describe('ui/server：会话隔离', () => {
   afterEach(async () => {
     for (const client of clients.splice(0)) client.close();
     for (const server of servers.splice(0)) await server.close();
-    for (const dir of tempDirs.splice(0)) await rm(dir, { recursive: true, force: true });
+    for (const dir of tempDirs.splice(0)) {
+      // win32：残留 bash 挂住目录/cwd → rmdir EBUSY（windows CI 实测）→ 重试屈从
+      await rm(dir, { recursive: true, force: true, maxRetries: 10, retryDelay: 250 });
+    }
   });
 
   it('d1) 两会话并行 run：事件流互不渗透，审批互不串扰', async () => {
@@ -129,7 +131,8 @@ describe('ui/server：会话隔离', () => {
   });
 
   it('d2) E2E：两会话 run_command 的 cd/cwd 互不影响（常驻 shell 每会话独立实例）', async () => {
-    const dir = await mkdtemp(join(tmpdir(), 'devmate-isolation-'));
+    // canonicalTmpBase：bash 长名拼写基址（win32 短/长名一致性；见该函数头注）
+    const dir = await mkdtemp(join(canonicalTmpBase(), 'devmate-isolation-'));
     tempDirs.push(dir);
     const jail = await createJail({ workspaceRoot: dir });
     // 真实工具面：fs 共享一组 + shell 按会话懒建（S10 契约真正发生）。

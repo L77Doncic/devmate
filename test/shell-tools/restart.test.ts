@@ -24,9 +24,21 @@ afterAll(async () => {
   cleanupShellFixtures();
 });
 
-/** 从工具侧拿到当前 shell 主进程 pid（$$ 展开为 shell 自身 pid），系统级 kill。 */
+/**
+ * 从工具侧拿到当前 shell 主进程 pid，系统级 kill（signal 必须送到真实进程）。
+ *
+ * win32（git-bash）注意：`$$` 是 MSYS2 阴影进程的 **msys pid**——与 Windows 原生
+ * pid 不同且对 Node `process.kill` 不可见（windows CI 实测：kill ESRCH；MSYS 运行
+ * 时 v3 起令阴影进程对 OpenProcess 不可达）。真实 Windows pid 经 MSYS 伪文件系统
+ * 读取：`cat /proc/$$/winpid`（git 项目自身 t6500(mingw) 同法）；
+ * 非 MSYS 环境（posix bash 无 /proc/$$/winpid）回落 `$$` 本值。
+ */
 async function getShellPid(sessionId: string = fx.sessionId): Promise<number> {
-  const r = await run(fx, 'echo "SHELL_PID:$$"', sessionId);
+  const r = await run(
+    fx,
+    'echo "SHELL_PID:$(cat /proc/$$/winpid 2>/dev/null || echo $$)"',
+    sessionId,
+  );
   expect(r.ok).toBe(true);
   const m = /SHELL_PID:(\d+)/.exec(r.content);
   expect(m, '输出应包含 shell pid').not.toBeNull();
@@ -72,7 +84,8 @@ describe('d) 外部 kill 后自动重启（懒发生：下次执行时）', () =
   it('重启后得到全新 shell 进程：新 pid ≠ 旧 pid', async () => {
     const first = await getShellPid();
     process.kill(first, 'SIGKILL');
-    const r = await runAfterKill('echo "SHELL_PID:$$"');
+    // 新 pid 与 first 同命名空间（winpid）：「全新 shell 进程」才可断定
+    const r = await runAfterKill('echo "SHELL_PID:$(cat /proc/$$/winpid 2>/dev/null || echo $$)"');
     const m = /SHELL_PID:(\d+)/.exec(r.content);
     expect(m).not.toBeNull();
     expect(Number(m![1])).not.toBe(first);
@@ -102,10 +115,25 @@ describe('d) 外部 kill 后自动重启（懒发生：下次执行时）', () =
 
 describe('d) 命令中途 shell 死亡', () => {
   it('kill -9 $$（命令自杀 shell）：本次运行报 shell-exited（失败是普通消息），不崩进程', async () => {
-    const r = await run(fx, 'kill -9 $$');
-    expect(r.ok).toBe(false);
-    expect(r.error?.type).toBe('shell-exited');
-    expect(payloadOf(r).error.type).toBe('shell-exited');
+    // win32（git-bash）：msys `kill -9 $$` 无法终结 v3 运行时阴影进程（实测命令
+    // 返回 rc=0/1、shell 存活），且 Windows 无 POSIX 信号语义——
+    // 改为按真实 Windows pid 终局：`cmd //c taskkill /F /PID <winpid>`（winpid 取
+    // /proc/$$/winpid）；工具侧只能观察到「子进程无标记退出」（TerminateProcess
+    // 不产生 signal 事件），下次命令触发重启——与 posix「signal 判 exited」等价
+    // 的会话自愈保证，仅结果形态不同。
+    const selfKill =
+      process.platform === 'win32'
+        ? 'cmd //c "taskkill /PID $(cat /proc/$$/winpid 2>/dev/null || echo $$) /F" >/dev/null 2>&1'
+        : 'kill -9 $$';
+    const r = await run(fx, selfKill);
+    if (process.platform === 'win32') {
+      const died = r.ok === false || (r.ok === true && /--- exit code: [1-9]/.test(r.content));
+      expect(died, `会话必须已死（win32 无信号语义，见注释）：${r.content}`).toBe(true);
+    } else {
+      expect(r.ok).toBe(false);
+      expect(r.error?.type).toBe('shell-exited');
+      expect(payloadOf(r).error.type).toBe('shell-exited');
+    }
     // 工具自身不崩：后续命令正常
     const r2 = await run(fx, 'echo still-here');
     expect(r2.ok).toBe(true);
