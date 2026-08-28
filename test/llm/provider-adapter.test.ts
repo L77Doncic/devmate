@@ -705,3 +705,84 @@ describe('未知供应商（切片 g）', () => {
     expect(Object.keys(PROVIDER_PRESETS).sort()).toEqual([...PROVIDER_IDS].sort());
   });
 });
+
+// ---------- 切片 C：思考强度 reasoningEffort 映射（reasoningParam 按家；无据保守 off） ----------
+
+describe('buildRequest：reasoningEffort 映射（C 档切片）', () => {
+  it('OpenAI-family（reasoningParam=reasoning_effort）：low/medium/high → body.reasoning_effort 逐字；off → 不传', () => {
+    for (const [effort, value] of [
+      ['low', 'low'],
+      ['medium', 'medium'],
+      ['high', 'high'],
+    ] as const) {
+      const req = buildRequest(unified({ reasoningEffort: effort }), PROVIDER_PRESETS.openai);
+      expect(req.body.reasoning_effort).toBe(value);
+      expect('thinking' in req.body).toBe(false);
+    }
+    const off = buildRequest(unified({ reasoningEffort: 'off' }), PROVIDER_PRESETS.openai);
+    expect('reasoning_effort' in off.body).toBe(false);
+    expect('thinking' in off.body).toBe(false);
+  });
+
+  it('DeepSeek（reasoningParam=thinking）：low/medium/high → thinking enabled + budget_tokens 1024/4096/16384；off → 显式 disabled', () => {
+    expect(
+      buildRequest(unified({ reasoningEffort: 'low' }), PROVIDER_PRESETS.deepseek).body.thinking,
+    ).toEqual({ type: 'enabled', budget_tokens: 1024 });
+    expect(
+      buildRequest(unified({ reasoningEffort: 'medium' }), PROVIDER_PRESETS.deepseek).body.thinking,
+    ).toEqual({ type: 'enabled', budget_tokens: 4096 });
+    expect(
+      buildRequest(unified({ reasoningEffort: 'high' }), PROVIDER_PRESETS.deepseek).body.thinking,
+    ).toEqual({ type: 'enabled', budget_tokens: 16384 });
+    expect(
+      buildRequest(unified({ reasoningEffort: 'off' }), PROVIDER_PRESETS.deepseek).body.thinking,
+    ).toEqual({ type: 'disabled' });
+    // off = 思考显式禁用：temperature/top_p 不再被静默剔除（与 §1.6 思考关闭口径一致）
+    expect(
+      buildRequest(
+        unified({ reasoningEffort: 'off', temperature: 0.3, topP: 0.8 }),
+        PROVIDER_PRESETS.deepseek,
+      ).body.temperature,
+    ).toBe(0.3);
+    // 思考开启（low）：temperature/top_p 剔除
+    const low = buildRequest(
+      unified({ reasoningEffort: 'low', temperature: 0.3, topP: 0.8 }),
+      PROVIDER_PRESETS.deepseek,
+    );
+    expect('temperature' in low.body).toBe(false);
+    expect('top_p' in low.body).toBe(false);
+  });
+
+  it('未提供 reasoningEffort → 掉落 preset 行为（DeepSeek 仍 thinking enabled；OpenAI 无 reasoning_effort）', () => {
+    expect(buildRequest(unified(), PROVIDER_PRESETS.deepseek).body.thinking).toEqual({
+      type: 'enabled',
+    });
+    expect('reasoning_effort' in buildRequest(unified(), PROVIDER_PRESETS.openai).body).toBe(false);
+  });
+
+  it('reasoningParam 未核实（Kimi/GLM/Qwen）：即使给 high 也保守不发任何字段（无据 off）', () => {
+    for (const id of ['kimi', 'glm', 'dashscope'] as const) {
+      const req = buildRequest(unified({ reasoningEffort: 'high' }), PROVIDER_PRESETS[id]);
+      expect('reasoning_effort' in req.body).toBe(false);
+      expect('thinking' in req.body).toBe(false);
+    }
+  });
+
+  it('reasoningParam 值域常量：OpenAI=reasoning_effort、DeepSeek=thinking、其余未定义', () => {
+    expect(PROVIDER_PRESETS.openai.reasoningParam).toBe('reasoning_effort');
+    expect(PROVIDER_PRESETS.deepseek.reasoningParam).toBe('thinking');
+    expect(PROVIDER_PRESETS.kimi.reasoningParam).toBeUndefined();
+    expect(PROVIDER_PRESETS.glm.reasoningParam).toBeUndefined();
+    expect(PROVIDER_PRESETS.dashscope.reasoningParam).toBeUndefined();
+  });
+});
+
+describe('presets：contextWindowTokens（估算，可在设置覆盖）', () => {
+  it('五家预设窗口值：deepseek 64000；qwen/glm/kimi/openai 128000', () => {
+    expect(PROVIDER_PRESETS.deepseek.contextWindowTokens).toBe(64000);
+    expect(PROVIDER_PRESETS.dashscope.contextWindowTokens).toBe(128000);
+    expect(PROVIDER_PRESETS.glm.contextWindowTokens).toBe(128000);
+    expect(PROVIDER_PRESETS.kimi.contextWindowTokens).toBe(128000);
+    expect(PROVIDER_PRESETS.openai.contextWindowTokens).toBe(128000);
+  });
+});

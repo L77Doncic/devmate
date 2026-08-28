@@ -63,6 +63,35 @@ describe('截断：阈值边界与格式', () => {
     const got = truncateToolOutput(raw);
     expect(got).toContain('\n\n--- 5000 characters elided ---\n\n');
   });
+
+  it('参数化 maxChars=4000：头尾按半额 2000/2000 切片，elide/建议照旧（默认可选参数不改变既有单参调用）', () => {
+    const raw = 'a'.repeat(5000);
+    const got = truncateToolOutput(raw, 4000);
+    expect(got).toBe(
+      ADVICE +
+        raw.slice(0, 2000) +
+        '\n\n' +
+        ELIDE_TEMPLATE.replace('{n}', '1000') +
+        '\n\n' +
+        raw.slice(-2000),
+    );
+    expect(got.startsWith(ADVICE)).toBe(true);
+    expect(got).toContain('\n\n--- 1000 characters elided ---\n\n');
+    expect(got.slice(ADVICE.length, ADVICE.length + 2000)).toBe(raw.slice(0, 2000));
+    expect(got.slice(-2000)).toBe(raw.slice(-2000));
+  });
+
+  it('参数化 maxChars=4000：阈值内（3999）原样返回；恰 4000 按 0 elided 面板重写', () => {
+    expect(truncateToolOutput('a'.repeat(3999), 4000)).toBe('a'.repeat(3999));
+    expect(truncateToolOutput('b'.repeat(4000), 4000)).toBe(
+      ADVICE +
+        'b'.repeat(2000) +
+        '\n\n' +
+        ELIDE_TEMPLATE.replace('{n}', '0') +
+        '\n\n' +
+        'b'.repeat(2000),
+    );
+  });
 });
 
 describe('二进制/非文本检测（NUL 全量扫描 + 不可打印占比）', () => {
