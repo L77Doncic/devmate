@@ -12,7 +12,7 @@
   },
   "files": [
     "dist",
-    "dist/assets"
+    "THIRD-PARTY-NOTICES.md"
   ],
   "dependencies": {},
   "devDependencies": {

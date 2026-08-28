@@ -26,3 +26,6 @@ Thumbs.db
 .idea/
 .vscode/*
 !.vscode/extensions.json
+
+# --- npm 打包产物（npm pack 输出，不入库）---
+*.tgz
