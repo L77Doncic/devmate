@@ -17,6 +17,7 @@ import { MemorySessionAdapter } from '../../src/core/session/index.js';
 import type { ChatRequest, StreamEvent } from '../../src/shared/llm-types.js';
 import { createSessionToolsFactory } from '../../src/ui/server/deps.js';
 import { echoTool, FakeLlm } from '../loop/support.js';
+import { shellCwdForm } from '../shell-tools/support.js';
 import { postJson, SseClient, startServer, waitForFrames } from './support.js';
 
 /** 按「首个 user 消息（=任务文本）」路由到不同 FakeLlm：两 run 并行互不共享脚本序。 */
@@ -131,8 +132,10 @@ describe('ui/server：会话隔离', () => {
     const dir = await mkdtemp(join(tmpdir(), 'devmate-isolation-'));
     tempDirs.push(dir);
     const jail = await createJail({ workspaceRoot: dir });
-    // 真实工具面：fs 共享一组 + shell 按会话懒建（S10 契约真正发生）
-    const factory = createSessionToolsFactory({ workspaceRoot: dir, jail });
+    // 真实工具面：fs 共享一组 + shell 按会话懒建（S10 契约真正发生）。
+    // shellPlatform 'posix'：bash 语义固定——win32 宿主经 PATH 解析 Git Bash 的
+    // bash.exe 真跑 git-bash（用例为 bash 语法；宿主缺省 win32→powershell 走不通）。
+    const factory = createSessionToolsFactory({ workspaceRoot: dir, jail, shellPlatform: 'posix' });
 
     const CALL_A = {
       id: 'shell-a1',
@@ -182,8 +185,11 @@ describe('ui/server：会话隔离', () => {
     );
     expect(aResult).toBeDefined();
     expect(bResult).toBeDefined();
-    // A 确实 cd 进了子目录；B 的 shell cwd 仍是 workspaceRoot —— 两会话 shell 互不渗透
-    expect((bResult as { data: { content: string } }).data.content).toContain(dir);
-    expect((bResult as { data: { content: string } }).data.content).not.toContain(join(dir, 'sub'));
+    // A 确实 cd 进了子目录；B 的 shell cwd 仍是 workspaceRoot —— 两会话 shell 互不渗透。
+    // git-bash（win32）下 pwd 输出 MSYS 形态 /c/... —— 与宿主路径同一形态再比（shellCwdForm）。
+    expect((bResult as { data: { content: string } }).data.content).toContain(shellCwdForm(dir));
+    expect((bResult as { data: { content: string } }).data.content).not.toContain(
+      shellCwdForm(join(dir, 'sub')),
+    );
   });
 });

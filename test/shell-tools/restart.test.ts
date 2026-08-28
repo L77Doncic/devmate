@@ -10,7 +10,7 @@ import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import { realpathSync } from 'node:fs';
 
 import type { ShellFixture } from './support.js';
-import { cleanupShellFixtures, makeShellFixture, payloadOf, run } from './support.js';
+import { cleanupShellFixtures, makeShellFixture, payloadOf, run, shellCwdForm } from './support.js';
 import type { ToolResult } from '../../src/core/loop/types.js';
 
 let fx: ShellFixture;
@@ -65,7 +65,8 @@ describe('d) 外部 kill 后自动重启（懒发生：下次执行时）', () =
     process.kill(pid, 'SIGKILL');
     const r = await runAfterKill('pwd -P');
     expect(r.content).toContain('shell restarted');
-    expect(r.content).toContain(realpathSync(fx.ws));
+    // git-bash（win32）下 pwd -P 输出 MSYS 形态 /c/... —— shellCwdForm 化再比
+    expect(r.content).toContain(shellCwdForm(realpathSync(fx.ws)));
   });
 
   it('重启后得到全新 shell 进程：新 pid ≠ 旧 pid', async () => {
@@ -83,7 +84,7 @@ describe('d) 外部 kill 后自动重启（懒发生：下次执行时）', () =
     const pid = await getShellPid();
     process.kill(pid, 'SIGKILL');
     const r = await runAfterKill('pwd -P');
-    expect(r.content).toContain(realpathSync(fx.ws));
+    expect(r.content).toContain(shellCwdForm(realpathSync(fx.ws)));
   });
 
   it('重启只影响本 session：parallel session 的 shell 进程未被波及', async () => {

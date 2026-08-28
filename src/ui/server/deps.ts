@@ -129,6 +129,12 @@ export function createSessionToolsFactory(options: {
   toolTimeoutMs?: number;
   /** 空闲 shell TTL（ms；缺省 DEFAULT_IDLE_SHELL_TTL_MS）。 */
   idleShellTtlMs?: number;
+  /**
+   * 会话 shell 平台透传（真实装配不传 = createPersistentShell 宿主默认；
+   * win32 宿主导航经 powershell→cmd→git-bash 探测）。posix = bash 契约，
+   * win32 宿主上经 PATH 解析 Git Bash 的 bash.exe 真跑（同 test/shell-tools 口径）。
+   */
+  shellPlatform?: 'posix' | 'win32';
   /** 测试注入：与 createPersistentShell 同契约的替换工厂（真实装配不传）。 */
   createShell?: (sessionId: string) => PersistentShell;
   /** 技能索引读取器（晚绑定：服务端 attach 回填前为 null → use_skill 执行期报 skill-index-unavailable）。 */
@@ -155,6 +161,7 @@ export function createSessionToolsFactory(options: {
           workspaceRoot: options.workspaceRoot,
           jail: options.jail,
           ...(options.toolTimeoutMs !== undefined ? { timeoutMs: options.toolTimeoutMs } : {}),
+          ...(options.shellPlatform !== undefined ? { platform: options.shellPlatform } : {}),
         });
 
   const forId = (sessionId: string): ToolRegistry => {

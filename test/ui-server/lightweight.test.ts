@@ -417,7 +417,14 @@ describe('ui/server：TTL 与活跃 run（真实 shell 集成）', () => {
     const dir = await mkdtemp(join(tmpdir(), 'devmate-idle-live-'));
     tempDirs.push(dir);
     const jail = await createJail({ workspaceRoot: dir });
-    const factory = createSessionToolsFactory({ workspaceRoot: dir, jail, idleShellTtlMs: 50 });
+    // shellPlatform 'posix'：真实 createPersistentShell 走 bash 契约（win32 宿主经
+    // PATH 解析 Git Bash bash.exe）；宿主缺省 win32→powershell 跑不了 $$/bash 语法。
+    const factory = createSessionToolsFactory({
+      workspaceRoot: dir,
+      jail,
+      idleShellTtlMs: 50,
+      shellPlatform: 'posix',
+    });
     let tick: (() => void) | null = null;
 
     const deps = depsFor({

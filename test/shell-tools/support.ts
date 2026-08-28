@@ -4,9 +4,11 @@
  * 安全口径（接缝 S8）：本模块的 jail 判定用**真实实现**（src/core/jail/index.js），
  * 安全测试是行为级验证：`cmd > 界外路径` 必须整命令被拒且不产生文件。
  *
- * 真进程策略：每个 fixture 起一个真实 bash；测试用时短命令；耗时命令
- * （sleep/yes）一律以 fixture 的短 timeoutMs 兜底（睡眠进程被整组 SIGKILL）。
- * fixture.dispose() 必须在每个测试末尾调用（afterEach 兜底）。
+ * 真进程策略：每个 fixture 起一个真实 bash（契约固定 bash 语义：platform 'posix'——
+ * win32 宿主经 PATH 解析到 Git Bash 的 bash.exe 真跑 git-bash，见 src shell.ts
+ * resolveShellBinary）；测试用时短命令；耗时命令（sleep/yes）一律以 fixture 的短
+ * timeoutMs 兜底（睡眠进程被整组 SIGKILL）。fixture.dispose() 必须在每个测试末尾
+ * 调用（afterEach 兜底）。
  */
 import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
@@ -30,6 +32,8 @@ export interface ShellFixture {
 export interface FixtureOptions {
   timeoutMs?: number;
   maxOutputBytes?: number;
+  /** 平台语义显式覆盖（缺省 'posix'：bash 契约，win32 宿主走 git-bash bash.exe）。 */
+  platform?: 'posix' | 'win32';
 }
 
 const created: string[] = [];
@@ -45,6 +49,9 @@ export async function makeShellFixture(
     workspaceRoot: ws,
     jail,
     timeoutMs: opts.timeoutMs ?? 5_000,
+    // 契约固定 bash 语义：win32 宿主经 PATH 解析 Git Bash bash.exe（git-bash 真跑）；
+    // 宿主缺省（win32→powershell 探测链）由 platform.test.ts 的 win32 smoke 覆盖。
+    platform: opts.platform ?? 'posix',
     ...(opts.maxOutputBytes !== undefined ? { maxOutputBytes: opts.maxOutputBytes } : {}),
   });
   return {
@@ -54,6 +61,26 @@ export async function makeShellFixture(
     sessionId: opts.sessionId ?? 'test-session',
     dispose,
   };
+}
+
+/**
+ * 命令文本内嵌绝对路径的 shell 安全形态：win32 反斜杠→正斜杠（bash 词法里未引用
+ * 的 `\` 是转义符，`C:\Users\...` 会把路径吃残；`C:/Users/...` 双平台一致）。
+ * posix 路径原样（无反斜杠）。
+ */
+export function shellPath(p: string): string {
+  return p.replace(/\\/g, '/');
+}
+
+/**
+ * shell 侧 `pwd`/`$PWD` 输出在宿主上的形态：win32（git-bash，MSYS 语义）为
+ * /c/Users/...（盘符小写 + 正斜杠）；posix 原样。用于内容断言与 realpathSync 比对。
+ */
+export function shellCwdForm(p: string): string {
+  if (process.platform !== 'win32') return p;
+  const m = /^([A-Za-z]):[\\/](.*)$/.exec(p);
+  if (m === null) return p;
+  return `/${m[1]!.toLowerCase()}/${m[2]!.replace(/\\/g, '/')}`;
 }
 
 /** 执行一次 run_command（loop 契约形状：call + ctx.sessionId；timeoutMs 走模型可申请参数）。 */

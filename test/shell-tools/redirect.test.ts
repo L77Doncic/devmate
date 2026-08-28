@@ -10,7 +10,7 @@ import { existsSync, mkdirSync, readFileSync } from 'node:fs';
 import { join } from 'node:path';
 
 import type { ShellFixture } from './support.js';
-import { cleanupShellFixtures, makeShellFixture, payloadOf, run } from './support.js';
+import { cleanupShellFixtures, makeShellFixture, payloadOf, run, shellPath } from './support.js';
 import { parseRedirectTargets } from '../../src/core/tools/shell.js';
 
 let fx: ShellFixture;
@@ -26,30 +26,30 @@ afterAll(async () => {
 
 describe('e) 重定向越界拒绝（> / >> / 2> / &>）', () => {
   it('> 到界外绝对路径：deny（type=path-outside-workspace），且文件未被创建', async () => {
-    const outsideFile = join(fx.outside, 'out.txt');
-    const r = await run(fx, `echo hi > ${outsideFile}`);
+    const outsideFile = shellPath(join(fx.outside, 'out.txt')); // win32 反斜杠→正斜杠：bash 词法 + 重定向解析双端一致
+    const r = await run(fx, `echo hi > "${outsideFile}"`);
     expect(r.ok).toBe(false);
     expect(r.error?.type).toBe('path-outside-workspace');
     expect(payloadOf(r).error.type).toBe('path-outside-workspace');
-    expect(existsSync(outsideFile)).toBe(false);
+    expect(existsSync(join(fx.outside, 'out.txt'))).toBe(false);
   });
 
   it('>> 到界外：deny', async () => {
-    const outsideFile = join(fx.outside, 'append.txt');
-    const r = await run(fx, `echo hi >> ${outsideFile}`);
+    const outsideFile = shellPath(join(fx.outside, 'append.txt'));
+    const r = await run(fx, `echo hi >> "${outsideFile}"`);
     expect(r.error?.type).toBe('path-outside-workspace');
-    expect(existsSync(outsideFile)).toBe(false);
+    expect(existsSync(join(fx.outside, 'append.txt'))).toBe(false);
   });
 
   it('2> 到界外：deny（stderr 重定向目标同样按写入检）', async () => {
-    const outsideFile = join(fx.outside, 'err.txt');
-    const r = await run(fx, `ls /nowhere 2> ${outsideFile}`);
+    const outsideFile = shellPath(join(fx.outside, 'err.txt'));
+    const r = await run(fx, `ls /nowhere 2> "${outsideFile}"`);
     expect(r.error?.type).toBe('path-outside-workspace');
   });
 
   it('&> 到界外：deny', async () => {
-    const outsideFile = join(fx.outside, 'both.txt');
-    const r = await run(fx, `echo hi &> ${outsideFile}`);
+    const outsideFile = shellPath(join(fx.outside, 'both.txt'));
+    const r = await run(fx, `echo hi &> "${outsideFile}"`);
     expect(r.error?.type).toBe('path-outside-workspace');
   });
 
@@ -59,15 +59,15 @@ describe('e) 重定向越界拒绝（> / >> / 2> / &>）', () => {
   });
 
   it('heredoc 重定向到界外：deny 且命令不执行', async () => {
-    const outsideFile = join(fx.outside, 'heredoc.txt');
-    const r = await run(fx, `cat <<'EOF' > ${outsideFile}\ncontent\nEOF`);
+    const outsideFile = shellPath(join(fx.outside, 'heredoc.txt'));
+    const r = await run(fx, `cat <<'EOF' > "${outsideFile}"\ncontent\nEOF`);
     expect(r.error?.type).toBe('path-outside-workspace');
-    expect(existsSync(outsideFile)).toBe(false);
+    expect(existsSync(join(fx.outside, 'heredoc.txt'))).toBe(false);
     expect(r.content).not.toContain('[out] content');
   });
 
   it('该次命令的其它输出不产生（整命令在写入前被拒）：界内 echo 但界外写 → 无输出', async () => {
-    const r = await run(fx, `echo visible-but-denied > ${join(fx.outside, 'x.txt')}`);
+    const r = await run(fx, `echo visible-but-denied > "${shellPath(join(fx.outside, 'x.txt'))}"`);
     expect(r.error?.type).toBe('path-outside-workspace');
     expect(JSON.stringify(r)).not.toContain('visible-but-denied');
   });
@@ -216,28 +216,28 @@ describe('f) 重定向词法：操作符识别 + 解析异常 fail-closed', () =
 
 describe('f) E2E：<<< / >| 越界写入必须被拦且不产生文件', () => {
   it('echo hi <<< hello > 界外：deny（type=path-outside-workspace）且文件未被创建', async () => {
-    const outsideFile = join(fx.outside, 'herestring-escape.txt');
-    const r = await run(fx, `echo hi <<< hello > ${outsideFile}`);
+    const outsideFile = shellPath(join(fx.outside, 'herestring-escape.txt'));
+    const r = await run(fx, `echo hi <<< hello > "${outsideFile}"`);
     expect(r.ok).toBe(false);
     expect(r.error?.type).toBe('path-outside-workspace');
-    expect(existsSync(outsideFile)).toBe(false);
+    expect(existsSync(join(fx.outside, 'herestring-escape.txt'))).toBe(false);
   });
 
   it('echo hi >| 界外（clobber）：deny 且文件未被创建', async () => {
-    const outsideFile = join(fx.outside, 'clobber-escape.txt');
-    const r = await run(fx, `echo hi >| ${outsideFile}`);
+    const outsideFile = shellPath(join(fx.outside, 'clobber-escape.txt'));
+    const r = await run(fx, `echo hi >| "${outsideFile}"`);
     expect(r.ok).toBe(false);
     expect(r.error?.type).toBe('path-outside-workspace');
-    expect(existsSync(outsideFile)).toBe(false);
+    expect(existsSync(join(fx.outside, 'clobber-escape.txt'))).toBe(false);
   });
 
   it('echo hi >| 界内：allow 且文件写入成功', async () => {
     // 共享 fixture 的 cwd 受前序测试影响：用绝对界内路径钉住
-    const inFile = join(fx.ws, 'in-clobber.txt');
-    const r = await run(fx, `echo hi >| ${inFile}`);
+    const inFile = shellPath(join(fx.ws, 'in-clobber.txt'));
+    const r = await run(fx, `echo hi >| "${inFile}"`);
     expect(r.ok).toBe(true);
-    expect(existsSync(inFile)).toBe(true);
-    expect(readFileSync(inFile, 'utf8')).toBe('hi\n');
+    expect(existsSync(join(fx.ws, 'in-clobber.txt'))).toBe(true);
+    expect(readFileSync(join(fx.ws, 'in-clobber.txt'), 'utf8')).toBe('hi\n');
   });
 
   it('echo hi > "unclosed（重定向词解析异常）→ redirect-parse-failed，命令不执行', async () => {

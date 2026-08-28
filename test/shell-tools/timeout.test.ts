@@ -14,6 +14,7 @@ import {
   payloadOf,
   pidEventuallyGone,
   run,
+  shellCwdForm,
 } from './support.js';
 
 let fx: ShellFixture;
@@ -51,7 +52,8 @@ describe('c) 超时：杀进程树 + partial 回注 + 自动恢复', () => {
     const r = await run(fx, 'pwd -P');
     expect(r.ok).toBe(true);
     expect(r.content).toContain('shell restarted');
-    expect(r.content).toContain(realpathSync(fx.ws));
+    // git-bash（win32）下 pwd -P 输出 MSYS 形态 /c/... —— shellCwdForm 化再比
+    expect(r.content).toContain(shellCwdForm(realpathSync(fx.ws)));
   });
 });
 

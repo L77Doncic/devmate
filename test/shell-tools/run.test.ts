@@ -10,7 +10,14 @@ import { mkdirSync, realpathSync } from 'node:fs';
 import { join } from 'node:path';
 
 import type { ShellFixture } from './support.js';
-import { cleanupShellFixtures, makeShellFixture, pidEventuallyGone, run } from './support.js';
+import {
+  cleanupShellFixtures,
+  makeShellFixture,
+  pidEventuallyGone,
+  run,
+  shellCwdForm,
+  shellPath,
+} from './support.js';
 
 let fx: ShellFixture;
 
@@ -63,9 +70,11 @@ describe('b) cwd 与 env 常驻保持', () => {
   it('cwd 保持：cd 到子目录后，下一条命令 pwd 不变', async () => {
     const sub = join(fx.ws, 'sub-keep');
     mkdirSync(sub, { recursive: true });
-    await run(fx, `cd ${sub}`);
+    // shellPath：win32（git-bash）下反斜杠路径会被 bash 词法吃残 → 用正斜杠形态
+    await run(fx, `cd "${shellPath(sub)}"`);
     const r = await run(fx, 'pwd -P');
-    expect(r.content).toContain(realpathSync(sub));
+    // git-bash 的 pwd -P 输出 MSYS 形态（/c/...）——shellCwdForm 化同一形态再比
+    expect(r.content).toContain(shellCwdForm(realpathSync(sub)));
   });
 
   it('env 保持：export 变量在命令间保持', async () => {
@@ -77,7 +86,7 @@ describe('b) cwd 与 env 常驻保持', () => {
   it('初值 cwd = workspaceRoot', async () => {
     const fx2 = await makeShellFixture({ sessionId: 'cwd-init' });
     const r = await run(fx2, 'pwd -P', fx2.sessionId);
-    expect(r.content).toContain(realpathSync(fx2.ws));
+    expect(r.content).toContain(shellCwdForm(realpathSync(fx2.ws)));
     await fx2.dispose();
   });
 
@@ -150,9 +159,9 @@ describe('会话隔离（ctx.sessionId → 每会话一个 shell）', () => {
   it('两个 session 的 shell 实例互不影响：A cd 后，B 仍在 workspaceRoot', async () => {
     const sub = join(fx.ws, 'sub-isolated');
     mkdirSync(sub, { recursive: true });
-    await run(fx, `cd ${sub}`, 'session-a');
+    await run(fx, `cd "${shellPath(sub)}"`, 'session-a');
     const rb = await run(fx, 'pwd -P', 'session-b');
-    expect(rb.content).toContain(realpathSync(fx.ws));
+    expect(rb.content).toContain(shellCwdForm(realpathSync(fx.ws)));
   });
 });
 

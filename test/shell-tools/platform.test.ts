@@ -11,11 +11,17 @@
  */
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 
+import { mkdtempSync, symlinkSync } from 'node:fs';
+import { join } from 'node:path';
+import { tmpdir } from 'node:os';
+
 import type { ToolCall } from '../../src/shared/session-types.js';
 import type { ShellFixture } from './support.js';
 import { cleanupShellFixtures, makeShellFixture, run } from './support.js';
 import {
   createPersistentShell,
+  normalizeGitBashCwd,
+  resolveShellBinary,
   selectWindowsShell,
   spawnFailureType,
 } from '../../src/core/tools/shell.js';
@@ -58,16 +64,96 @@ describe('h) Windows shell 探测顺序（纯函数）', () => {
   });
 });
 
-describe('h) 平台注入强制（与 S9 同法）', () => {
-  it('win32 平台在非 Windows 宿主构造 → 抛错（不启用未验证分支）', async () => {
-    const jail = {
-      checkPath: () => Promise.resolve(true),
-      checkRedirect: () => Promise.resolve(true),
-    } as unknown as Jail;
-    expect(() =>
-      createPersistentShell({ workspaceRoot: fx.ws, jail, platform: 'win32' }),
-    ).toThrow();
+describe('h) resolveShellBinary：PATH 逐段解析 bash（windows CI 修复核心，纯函数）', () => {
+  /** 目录簿注入：真机 Windows 路径在 Linux 宿主上不存在——由注入谓词替代 FS 探测。 */
+  function catalogOf(paths: string[]): (candidate: string) => boolean {
+    const set = new Set(paths);
+    return (candidate) => set.has(candidate);
+  }
+
+  it('posix PATH 命中 /usr/bin/bash（逐段扫，不硬编码 /bin/bash）', () => {
+    expect(
+      resolveShellBinary({ PATH: '/usr/bin:/bin' }, 'posix', catalogOf(['/usr/bin/bash'])),
+    ).toBe('/usr/bin/bash');
   });
+
+  it('win32 PATH 命中 Git Bash 的 bash.exe（bash.exe 优先于裸名 bash）', () => {
+    expect(
+      resolveShellBinary(
+        { PATH: 'C:\\Windows\\system32;C:\\Program Files\\Git\\usr\\bin' },
+        'win32',
+        catalogOf(['C:\\Program Files\\Git\\usr\\bin\\bash.exe']),
+      ),
+    ).toBe('C:\\Program Files\\Git\\usr\\bin\\bash.exe');
+  });
+
+  it('win32：目录里只有裸名 bash 也命中（无 .exe 后缀场景）', () => {
+    expect(
+      resolveShellBinary(
+        { PATH: 'C:\\opt\\msys;C:\\Windows' },
+        'win32',
+        catalogOf(['C:\\Windows\\bash']),
+      ),
+    ).toBe('C:\\Windows\\bash');
+  });
+
+  it('未命中回退：posix → /bin/bash（原字面量语义）；win32 → git-bash（原 spawn 名）', () => {
+    expect(resolveShellBinary({ PATH: '/usr/local/bin:/opt/bin' }, 'posix', catalogOf([]))).toBe(
+      '/bin/bash',
+    );
+    expect(resolveShellBinary({ PATH: 'C:\\Windows' }, 'win32', catalogOf([]))).toBe('git-bash');
+  });
+
+  it('PATH 逐段：靠前段有名字但非文件 → 继续扫后段；引号段剥除', () => {
+    expect(
+      resolveShellBinary(
+        { PATH: '"C:\\no-such-bash";C:\\real\\usr\\bin' },
+        'win32',
+        catalogOf(['C:\\real\\usr\\bin\\bash.exe']),
+      ),
+    ).toBe('C:\\real\\usr\\bin\\bash.exe');
+  });
+
+  it('PATH 缺失/空 → 回退', () => {
+    expect(resolveShellBinary({}, 'posix', catalogOf([]))).toBe('/bin/bash');
+    expect(resolveShellBinary({ PATH: '' }, 'win32', catalogOf([]))).toBe('git-bash');
+  });
+});
+
+describe('h) normalizeGitBashCwd：git-bash MSYS 形态 → 宿主形态（纯函数）', () => {
+  it('/c/Users/x → C:/Users/x（盘符大写 + 正斜杠）', () => {
+    expect(normalizeGitBashCwd('/c/Users/x')).toBe('C:/Users/x');
+    expect(normalizeGitBashCwd('/d/prog/test')).toBe('D:/prog/test');
+  });
+
+  it('非 MSYS 形态原样：win32 反斜杠 / 正斜杠盘符 / 纯 posix 路径', () => {
+    expect(normalizeGitBashCwd('C:\\Users\\x')).toBe('C:\\Users\\x');
+    expect(normalizeGitBashCwd('C:/Users/x')).toBe('C:/Users/x');
+    expect(normalizeGitBashCwd('/tmp/foo')).toBe('/tmp/foo');
+    expect(normalizeGitBashCwd('/c:/x')).toBe('/c:/x'); // '/C:' 不是盘符前缀形态（无 / 紧跟）
+  });
+
+  it('根与单段形态', () => {
+    expect(normalizeGitBashCwd('/c/')).toBe('C:/');
+    expect(normalizeGitBashCwd('/c')).toBe('/c');
+  });
+});
+
+describe('h) 平台注入强制（与 S9 同法）', () => {
+  // Windows 宿主上 win32 平台构造是合法路径（不抛）——约束只在非 win32 宿主触发；
+  // 若在 Windows 宿主上跑本用例会误红（toThrow 期望落空），按宿主跳过。
+  it.skipIf(process.platform === 'win32')(
+    'win32 平台在非 Windows 宿主构造 → 抛错（不启用未验证分支）',
+    async () => {
+      const jail = {
+        checkPath: () => Promise.resolve(true),
+        checkRedirect: () => Promise.resolve(true),
+      } as unknown as Jail;
+      expect(() =>
+        createPersistentShell({ workspaceRoot: fx.ws, jail, platform: 'win32' }),
+      ).toThrow();
+    },
+  );
 
   it('posix 平台显式声明：Linux 宿主可构造', async () => {
     const jail = {
@@ -122,9 +208,46 @@ describe('h) 进程启动失败路径：一律普通 ToolResult，不击穿队�
   });
 });
 
+// 复现 windows CI 崩溃路径的宿主验证（Linux 可跑）：把 bash 以一个非标准 PATH 段
+// 里的名字放上 PATH（模拟 Git Bash 只把 usr/bin 挂进 PATH 的场景），platform 'posix'
+// 下持久 shell 必须经 PATH 解析成功拉起并执行（旧实现硬编码 /bin/bash 起不来）。
+// win32 专用名字顺序（bash.exe 优先）由上方注入谓词的纯函数用例覆盖；真机 Git Bash
+// 的 bash.exe 解析由 windows-latest CI 实测。
+describe.skipIf(process.platform === 'win32')(
+  'h) PATH 解析复现验证：bash 在 PATH 前缀目录 → resolve → spawn 可达',
+  () => {
+    it('resolveShellBinary 命中 PATH 段绝对路径；经其拉起的持久 shell 正常执行命令', async () => {
+      const binDir = mkdtempSync(join(tmpdir(), 'devmate-bashpath-'));
+      symlinkSync('/bin/bash', join(binDir, 'bash')); // 非标准 PATH 段里的 bash
+      const jail = {
+        checkPath: () => Promise.resolve({ allowed: true }),
+        checkRedirect: () => Promise.resolve({ allowed: true }),
+      } as unknown as Jail;
+      expect(resolveShellBinary({ PATH: binDir }, 'posix')).toBe(join(binDir, 'bash'));
+      const api = createPersistentShell({
+        workspaceRoot: fx.ws,
+        jail,
+        platform: 'posix',
+        env: { PATH: binDir }, // PATH 覆盖：只此一段，必须命中 PATH 解析才能起
+      });
+      const r = await api.tool.execute(
+        {
+          id: 'call_bashpath',
+          name: 'run_command',
+          arguments: JSON.stringify({ command: 'echo hi-from-bashpath' }),
+        },
+        { sessionId: 'bashpath' },
+      );
+      expect(r.ok).toBe(true);
+      expect(r.content).toContain('[out] hi-from-bashpath');
+      await api.dispose();
+    });
+  },
+);
+
 // Windows 宿主上的最小 smoke（当前 Linux CI 不执行——分支实现未在 Windows 验证，如实记录）
 describe.skipIf(process.platform !== 'win32')('h) Windows 端到端（仅在 Windows 宿主启用）', () => {
-  it('powershell 分支下 echo 正常回传', async () => {
+  it('git-bash 分支下 echo 正常回传（fixture 固定 posix 契约 → PATH 解析 bash.exe）', async () => {
     const r = await run(fx, 'echo hi-from-win');
     expect(r.ok).toBe(true);
     expect(r.content).toContain('hi-from-win');

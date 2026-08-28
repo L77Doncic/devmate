@@ -60,11 +60,18 @@
  *   直至超时——符合「非交互会话」（§6.1；PAGER/MANPAGER=cat 兜底，挂了也速死）。
  *
  * 平台（§6.3；h 组覆盖策略见 test/shell-tools/platform.test.ts 头注，如实记录）：
- * - posix：/bin/bash --noprofile --norc（detached:true = 进程组组长），杀树负 PID
- *   SIGKILL；win32：powershell.exe → cmd.exe → git-bash 探测（selectWindowsShell
+ * - posix：bash --noprofile --norc（detached:true = 进程组组长），杀树负 PID
+ *   SIGKILL；bash 可执行文件不硬编码 /bin/bash，而是按 PATH 解析
+ *   （resolveShellBinary：Linux 得 /usr/bin/bash，Windows 的 Git Bash 有 bash.exe
+ *   在 PATH——GitHub windows 镜像标准自带——仍未命中才回 /bin/bash）。
+ *   win32：powershell.exe → cmd.exe → git-bash 探测（selectWindowsShell
  *   纯函数跨宿主可测），杀树 taskkill /PID /T /F；编码 UTF-8（win32 -Command/
  *   chcp 65001）。win32 全部子进程路径只在 Windows 宿主启用（构造器强制，同 S9）；
  *   该分支在 Linux 上经 typecheck 与纯函数测试，端到端未经 Windows 实测（如实声明）。
+ *   git-bash 分支实际 spawn 的也是 PATH 解析出的 bash.exe（Git Bash 真身，不是
+ *   mintty 包装器 git-bash.exe——包装器起图形窗口、管道不通）。
+ * - git-bash 语义差异：$PWD/pwd 为 MSYS 形态（/c/Users/...）——回注 cwd 经
+ *   normalizeGitBashCwd 归一为宿主形态（C:/Users/...）再进 join/jail 判定。
  * - 行标准化 CRLF→LF；每行前缀 [out]/[err]（保持可解析的交错顺序）。
  *
  * 输出采集（§6.2/§8B 字节硬上限（采集阶段），与投影层 10k 字符截断是两个闸门）：
@@ -74,9 +81,9 @@
  */
 import { spawn, spawnSync, type ChildProcess } from 'node:child_process';
 import { randomBytes } from 'node:crypto';
-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { isAbsolute, join, normalize } from 'node:path';
+import { isAbsolute, join, normalize, posix as pathPosix, win32 as pathWin32 } from 'node:path';
 
 import type { ToolCall } from '../../shared/session-types.js';
 import { errorContentJson } from '../loop/tools.js';
@@ -116,6 +123,76 @@ export function selectWindowsShell(available: (candidate: string) => boolean): s
   return null;
 }
 
+/** 各平台下 resolveShellBinary 搜索的二进制名（win32 优先 bash.exe——Git for Windows 的真身）。 */
+const BASH_BINARY_NAMES: Readonly<Record<'posix' | 'win32', readonly string[]>> = Object.freeze({
+  posix: ['bash'],
+  win32: ['bash.exe', 'bash'],
+});
+
+/** 真实文件系统可用性判定（可注入谓词——纯函数测试跨宿主不依赖真实 win32 路径）。 */
+function isFile(p: string): boolean {
+  try {
+    return statSync(p).isFile();
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * 从 PATH 逐段解析 bash 可执行文件（纯函数：注入 env + 平台分类，跨宿主可测）。
+ *
+ * 背景（windows-latest CI 证据）：posix 分支硬编码 `/bin/bash`——Windows 上
+ * 该路径不存在，持久 shell 起不来（spawn /bin/bash ENOENT）。GitHub windows
+ * 镜像标准自带 Git Bash，其 bash.exe 在 PATH（C:\Program Files\Git\usr\bin），
+ * 逐段解析即可在 Windows 上拿到真 bash（printf/$PWD/信号语义与原 posix 流程一致）。
+ *
+ * 规则：
+ * - win32 优先 bash.exe（MSYS 真身），次选裸名 bash；posix 只找 bash
+ *   （Linux /usr/bin/bash、/bin/bash）。
+ * - PATH 段引号剥除、空段跳过；命中返回段内绝对路径。
+ * - 未命中回退保持原语义：posix → '/bin/bash'（历史字面量）；
+ *   win32 → 'git-bash'（历史 spawn 名——bash.exe 未上 PATH 的机器保持旧行为，
+ *   不引入新失败面）。
+ * - isAvailable 为注入判定（缺省真实 statSync 文件检查）：纯函数测试传目录簿
+ *   即可跨宿主断言 win32 路径解析次序（真机 Windows 路径在 Linux 宿主上不存在）。
+ */
+export function resolveShellBinary(
+  env: { PATH?: string },
+  kind: 'posix' | 'win32' = process.platform === 'win32' ? 'win32' : 'posix',
+  isAvailable: (candidate: string) => boolean = isFile,
+): string {
+  const impl = kind === 'win32' ? pathWin32 : pathPosix;
+  const sep = kind === 'win32' ? ';' : ':';
+  for (const raw of (env.PATH ?? '').split(sep)) {
+    const entry = raw.trim().replace(/^"|"$/g, '');
+    if (entry === '') continue;
+    for (const name of BASH_BINARY_NAMES[kind]) {
+      const candidate = impl.join(entry, name);
+      if (isAvailable(candidate)) return candidate;
+    }
+  }
+  return kind === 'win32' ? 'git-bash' : '/bin/bash';
+}
+
+/**
+ * git-bash/MSYS 形态的 cwd（/c/Users/...）→ 宿主形态（C:/Users/...）；纯函数。
+ *
+ * git-bash 下 $PWD 与 pwd 一律输出 MSYS 形态（/c/），而回注 cwd 要用于 win32 的
+ * join/normalize/jail 判定——path.win32.isAbsolute('/c/Users/x') 为 true 但
+ * normalize 成 \c\Users\x（盘符相对），会毒化路径比对与监狱边界。
+ * 非 MSYS 形态（C:\...、C:/...、纯 posix /tmp/...）原样返回。
+ */
+export function normalizeGitBashCwd(cwd: string): string {
+  const m = /^\/([A-Za-z])(\/.*)$/.exec(cwd);
+  if (m === null) return cwd;
+  return `${m[1]!.toUpperCase()}:${m[2]!}`;
+}
+
+/** 回注 cwd 化宿主形态：win32 宿主（git-bash 场景）归一 MSYS /c/...；其余原样。 */
+function cwdForHost(cwd: string): string {
+  return process.platform === 'win32' ? normalizeGitBashCwd(cwd) : cwd;
+}
+
 /**
  * spawn 启动失败的普通错误类型映射（纯函数，跨宿主可测）：
  * - win32 探测无任何可用 shell → 'shell-unavailable'；
@@ -150,7 +227,7 @@ export interface ShellToolOptions {
   platform?: 'posix' | 'win32';
   /** 追加到环境兜底之后的额外环境变量（覆盖继承值与兜底）。 */
   env?: Record<string, string>;
-  /** posix shell 可执行文件覆写（缺省 /bin/bash；git-bash 场景亦可覆写）。 */
+  /** posix shell 可执行文件覆写（缺省按 PATH 解析 bash：resolveShellBinary）。 */
   shellPath?: string;
 }
 
@@ -637,7 +714,9 @@ function buildEnv(opts: ShellToolOptions): NodeJS.ProcessEnv {
 }
 
 function posixSpawn(opts: ShellToolOptions): ChildProcess {
-  const shell = opts.shellPath ?? '/bin/bash';
+  // bash 按 PATH 解析（Linux /usr/bin/bash；Windows 上经 PATH 命中 Git Bash 的
+  // bash.exe——GitHub windows 镜像标准自带；仍未命中才回 /bin/bash，保持原语义）。
+  const shell = opts.shellPath ?? resolveShellBinary(buildEnv(opts));
   return spawn(shell, ['--noprofile', '--norc'], {
     cwd: opts.workspaceRoot,
     env: buildEnv(opts),
@@ -673,7 +752,10 @@ function win32Spawn(opts: ShellToolOptions): ChildProcess {
       { cwd: opts.workspaceRoot, env, stdio: ['pipe', 'pipe', 'pipe'] },
     );
   }
-  const shell = opts.shellPath ?? 'git-bash';
+  // git-bash 候选的实际 spawn 目标：PATH 解析出的 bash.exe（Git Bash 真身）。
+  // 直接 spawn 'git-bash'（mintty 图形包装器）会开窗口、stdio 管道不通——
+  // 常驻协议根本无法工作；bash.exe 未上 PATH 时才退回 'git-bash'（旧行为）。
+  const shell = opts.shellPath ?? resolveShellBinary(env);
   return spawn(shell, ['--noprofile', '--norc'], {
     cwd: opts.workspaceRoot,
     env,
@@ -915,11 +997,18 @@ async function runAttempt(
   // 命令文本与标记脚本整个包进复合组 { ... }——bash 解析完整体才执行，
   // 读 stdin 的命令（cat 等）拿到的是 EOF，偷不到也伪造不了标记行。
   const token = `${SENTINEL_BASE}${randomBytes(12).toString('hex')}__`;
-  const markerPath = join(session.markerDir, `marker-${randomBytes(8).toString('hex')}.tmp`);
+  // 正斜杠统一：win32 下 mkdtemp 回反斜杠路径，而 bash 词法未引用的 \ 是转义、
+  // 单引号注入的路径也必须与 bash 解析一致——统一切成 /分隔（node fs 双形态通用，
+  // Git Bash 的 MSYS 运行时同样接受 C:/...）。
+  const markerPath = join(
+    session.markerDir,
+    `marker-${randomBytes(8).toString('hex')}.tmp`,
+  ).replace(/\\/g, '/');
   let markerPrepared = false;
   try {
-    // 标记路径只含 alnum/-/.，单引号注入安全（mkdtemp 前缀亦仅路径字母）
-    if (!/^[A-Za-z0-9/._-]+$/.test(markerPath)) {
+    // 标记路径只含 alnum/-/.（另含 win32 盘符 ':' 与 GH 镜像 %TEMP% 的 '~' 短名），
+    // 单引号注入安全（mkdtemp 前缀亦仅路径字母）
+    if (!/^[A-Za-z0-9/._~:-]+$/.test(markerPath)) {
       return failShellResult(
         'tool-error',
         'cannot create a completion marker file (unsafe temp path)',
@@ -973,7 +1062,7 @@ async function runAttempt(
       session.dead = true;
     }
 
-    if (outcome.cwd !== null) session.trackedCwd = outcome.cwd;
+    if (outcome.cwd !== null) session.trackedCwd = cwdForHost(outcome.cwd); // git-bash /c/... → C:/...
     const restartNote = restarted ? `\n--- ${SHELL_RESTART_NOTE} ---` : '';
 
     if (outcome.kind === 'done') {
