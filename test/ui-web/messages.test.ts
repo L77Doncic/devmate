@@ -3,7 +3,7 @@
  * 事件形状与 sse.js 输出、S12 协议一一对应。
  */
 import { describe, expect, it } from 'vitest';
-import { createMessageStore, msgKind } from '../../src/ui/web/messages.js';
+import { createMessageStore, createReplayGuard, msgKind } from '../../src/ui/web/messages.js';
 import { TERMINAL_STATUSES } from '../../src/ui/web/format.js';
 
 const ev = (event: string, data: unknown) => ({ event, data });
@@ -877,13 +877,16 @@ describe('评审哨兵系统样式消息（R2-S2：system:true 帧 → 独立 sy
     expect(store.snapshot().systemUser).toBe(1);
   });
 
-  it('非 system 帧行为零变化：不产生 sys 项；边界重置照旧（去重/新回合）', () => {
+  it('非 system 帧行为零变化：不产生 sys 项；边界重置照旧（新回合）', () => {
     const store = createMessageStore();
     store.dispatch(ev('session-user', { text: '第一问' }));
     store.dispatch(ev('assistant-delta', { text: '答1' }));
     store.dispatch(ev('assistant-done', { content: '答1', toolCalls: [] }));
-    store.dispatch(ev('session-user', { text: '第一问' })); // 同句回放：去重
-    expect(store.snapshot().items.filter((i) => i.kind === 'user')).toHaveLength(1);
+    // 同文本的第二帧 = 第二回合（同为合法事务 —— 重放重复已被放弃的「尾文本去重」
+    // 改为 createReplayGuard 在 app.js 上游统一丢弃，此处状态机照实渲染）
+    store.dispatch(ev('session-user', { text: '第一问' }));
+    expect(store.snapshot().items.filter((i) => i.kind === 'user')).toHaveLength(2);
+    expect(store.snapshot().methodLine).toBeNull(); // 边界重置照旧（每帧都重置回合边界）
     // system 缺省（undefined）与显式 false 都不触发 sys 分支
     store.dispatch(ev('session-user', { text: '【评审哨兵】…', system: false }));
     expect(store.snapshot().systemUser).toBe(0);
@@ -949,5 +952,147 @@ describe('评审哨兵去重（R2-S2：重连重放同文本哨兵帧 → 不重
     snap = store.snapshot();
     expect(snap.items.filter((i) => i.kind === 'sys')).toHaveLength(2);
     expect(snap.systemUser).toBe(2);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// 发送竞态收口（CS-001「先两条同样、随后一条」）：一条消息恰渲染一条用户气泡。
+// 两种到达顺序都要收敛（长活流直投：SSE session-user 帧可与 POST /api/chat 响应竞速）；
+// 兼容「连续两条同文本的合法用户消息」（不得当回放误吞）。
+// ---------------------------------------------------------------------------
+describe('发送竞态收口（单一事实渲染）', () => {
+  const userItems = (snap: ReturnType<ReturnType<typeof createMessageStore>['snapshot']>) =>
+    snap.items.filter((i) => i.kind === 'user');
+
+  it('长活流直投竞态：SSE 回声先到、POST 响应后到 → 恰 1 条用户气泡', () => {
+    const store = createMessageStore();
+    store.startStream();
+    // session-user 帧已在 POST 响应前经长活流直投落地（服务端 append 先于响应返回）
+    store.dispatch(ev('session-user', { text: '竞态消息' }));
+    // POST /api/chat 响应返回 → 乐观渲染 addUser —— 不得再追加第二份
+    store.addUser('竞态消息');
+    const users = userItems(store.snapshot());
+    expect(users).toHaveLength(1);
+    expect(users[0]!.text).toBe('竞态消息');
+    expect(store.snapshot().title).toBe('竞态消息');
+  });
+
+  it('POST 先回、回声后到（乐观先行）：addUser 后 dispatch 同文本 → 恰 1 条且 id 稳定（原地合并）', () => {
+    const store = createMessageStore();
+    store.addUser('先回了');
+    const idBefore = userItems(store.snapshot())[0]!.id;
+    store.dispatch(ev('session-user', { text: '先回了' }));
+    const users = userItems(store.snapshot());
+    expect(users).toHaveLength(1);
+    expect(users[0]!.id).toBe(idBefore); // 原地合并：渲染层按键 id，行不重建不闪动
+  });
+
+  it('连续两条同文本用户消息（合法重复）→ 各占一行，不被竞态收口吞掉', () => {
+    const store = createMessageStore();
+    store.startStream();
+    // 第一条（回声先到竞态）
+    store.dispatch(ev('session-user', { text: '再说一次' }));
+    store.addUser('再说一次');
+    // 第二条：同文本再来一遍（用户真的复述）
+    store.dispatch(ev('session-user', { text: '再说一次' }));
+    store.addUser('再说一次');
+    expect(userItems(store.snapshot())).toHaveLength(2);
+  });
+
+  it('startStream 清空竞态标记：恢复 GET 回放残留不误吞下一次发送', () => {
+    const store = createMessageStore();
+    // 历史回放（GET /api/sessions/:id 逐帧 dispatch —— 无乐观 addUser）
+    store.dispatch(ev('session-user', { text: '往日一问' }));
+    store.dispatch(ev('assistant-done', { content: '答', toolCalls: [] }));
+    store.dispatch(ev('session-user', { text: '往日二问' }));
+    // 新发送：先 startStream（清楚旧标记）→ 回声先到 → addUser
+    store.startStream();
+    store.dispatch(ev('session-user', { text: '往日二问' })); // 回声（直投快速路径）
+    store.addUser('往日二问'); // 新消息与上一轮同文本 —— 必须渲染为新一行
+    const users = userItems(store.snapshot());
+    expect(users).toHaveLength(3);
+    expect(users.map((u) => u.text)).toEqual(['往日一问', '往日二问', '往日二问']);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// 恢复历史回放去重（重放守卫）：GET 回放 + 长活流重放窗并存 → 同序帧段只渲染一次。
+// ---------------------------------------------------------------------------
+describe('恢复历史回放去重（createReplayGuard）', () => {
+  it('GET 回放后接入流重放窗：覆盖回合段全部丢弃，实时帧放行', () => {
+    const store = createMessageStore();
+    const guard = createReplayGuard();
+    // 1) GET /api/sessions/:id → 协议形状事件（服务端合成：仅 done 帧）逐帧 dispatch
+    const getEvents = [
+      ev('session-user', { text: '一问' }),
+      ev('assistant-done', { content: '答一', toolCalls: [] }),
+      ev('session-user', { text: '二问' }),
+      ev('assistant-done', { content: '答二', toolCalls: [] }),
+    ];
+    for (const e of getEvents) store.dispatch(e);
+    // 2) 流接入：broker 重放窗（含直播合成 delta 帧 —— 与 GET 形状不同）
+    guard.arm(['一问', '二问'], 2);
+    const replay = [
+      ev('session-user', { text: '一问' }),
+      ev('assistant-delta', { text: '答' }),
+      ev('assistant-done', { content: '答一', toolCalls: [] }),
+      ev('session-user', { text: '二问' }),
+      ev('assistant-delta', { text: '答' }),
+      ev('assistant-done', { content: '答二', toolCalls: [] }),
+    ];
+    for (const e of replay) if (!guard.consume(e)) store.dispatch(e);
+    let snap = store.snapshot();
+    expect(snap.items.filter((i) => i.kind === 'user')).toHaveLength(2);
+    expect(snap.items.filter((i) => i.kind === 'assistant')).toHaveLength(2);
+    expect(snap.items.map((i) => i.text)).toEqual(['一问', '答一', '二问', '答二']);
+    expect(guard.isActive()).toBe(false); // 覆盖段耗尽 → 解防
+    // 3) 解防后实时流照常流入
+    store.dispatch(ev('session-user', { text: '三问' }));
+    store.dispatch(ev('assistant-delta', { text: '答三' }));
+    store.dispatch(ev('assistant-done', { content: '答三', toolCalls: [] }));
+    snap = store.snapshot();
+    expect(snap.items.filter((i) => i.kind === 'user')).toHaveLength(3);
+    expect(snap.items.filter((i) => i.kind === 'assistant')).toHaveLength(3);
+  });
+
+  it('新一轮实时帧（顺序不匹配期望序列）→ 解防并放行该帧', () => {
+    const guard = createReplayGuard();
+    guard.arm(['一问', '二问'], 2);
+    expect(guard.consume(ev('session-user', { text: '一问' }))).toBe(true);
+    expect(guard.consume(ev('assistant-delta', { text: '答' }))).toBe(true);
+    expect(guard.consume(ev('assistant-done', { content: '答一', toolCalls: [] }))).toBe(true);
+    // 新用户消息（序外）：必须是实时帧
+    expect(guard.consume(ev('session-user', { text: '新问' }))).toBe(false);
+    expect(guard.isActive()).toBe(false);
+    expect(guard.consume(ev('assistant-delta', { text: '实答' }))).toBe(false); // 之后全部放行
+  });
+
+  it('哨兵帧（system:true 的 session-user）不参与序匹配也不触发解防', () => {
+    const guard = createReplayGuard();
+    guard.arm(['一问'], 1);
+    const sentinel = ev('session-user', { text: '【评审哨兵】…', system: true });
+    expect(guard.consume(sentinel)).toBe(false); // 交还给状态机（其自身按最后一条 sys 去重）
+    expect(guard.isActive()).toBe(true); // 防御：哨兵不打乱覆盖序
+    expect(guard.consume(ev('session-user', { text: '一问' }))).toBe(true);
+    expect(guard.consume(ev('assistant-done', { content: '答一', toolCalls: [] }))).toBe(true);
+    expect(guard.isActive()).toBe(false);
+  });
+
+  it('未 arm 恒放行（幂等默认）', () => {
+    const guard = createReplayGuard();
+    expect(guard.consume(ev('session-user', { text: 'x' }))).toBe(false);
+    expect(guard.isActive()).toBe(false);
+  });
+
+  it('GET 回放里连续两条同文本用户消息（合法重复）→ 各占一行，不被尾比较吞掉', () => {
+    const store = createMessageStore();
+    // 历史里连续两个真实消息（服务端两次 POST，事务内两帧）—— 状态机照实渲染
+    store.dispatch(ev('session-user', { text: '再说一次' }));
+    store.dispatch(ev('assistant-done', { content: 'A', toolCalls: [] }));
+    store.dispatch(ev('session-user', { text: '再说一次' }));
+    store.dispatch(ev('assistant-done', { content: 'B', toolCalls: [] }));
+    const snap = store.snapshot();
+    expect(snap.items.filter((i) => i.kind === 'user')).toHaveLength(2);
+    expect(snap.items.filter((i) => i.kind === 'assistant')).toHaveLength(2);
   });
 });

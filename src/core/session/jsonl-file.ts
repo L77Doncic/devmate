@@ -26,13 +26,21 @@ export interface JsonlFileAdapterOptions {
  * 崩溃一致性（ADR-0004 / research §3.2）：每次 append 以单次 write 写入整行（以 \n 结尾）并 fsync 后再返回，
  * 因此任意时刻崩溃只留下「完整合法行 + 可能的一个截断尾行」。写端在追加前做尾部归一化
  * （normalizeTail）：尾行可解析为完整事件 → 补 \n（保留）；不可解析（撕裂半行）→ 截断 + 告警。
- * 读端逐行容错，半行/坏行跳过并告警。seq 由磁盘实际尾部推导（reserveNextSeq），不允许跨实例静默复用
- * 陈旧缓存（单写者假设，见 ADR-0004）。
+ * 读端逐行容错，半行/坏行跳过并告警。
+ *
+ * 单写者假设（ADR-0004 注释保留）：每个会话同一时刻只有一个写入实例。本类的落地方式 —
+ * 1) 同实例并发 append 按会话串行化（进程内单写：appendQueues，seq 严格递增无重复）；
+ * 2) seq 每写前从磁盘实际尾部冗余推导（lastSeqOnDisk+1），nextSeqBySession 缓存降级为
+ *    纯提示：缓存与磁盘不一致时以磁盘为准（告警诊断后继续写），绝不因缓存陈旧把「另一次
+ *    续写」变成用户可见的硬错；跨进程双写不由本类防御（端口/会话级锁已防，见 ADR-0004）。
  */
 export class JsonlFileAdapter extends BaseSessionStore {
   private readonly dir: string;
   private readonly warn: (message: string) => void;
+  /** 纯提示缓存（hint）：记录本实例上次分配的下一个 seq，只用于不一致诊断，不作裁决依据。 */
   private readonly nextSeqBySession = new Map<string, number>();
+  /** 每会话 append 串行队列（进程内单写者的执行体）：前一个 append 完成才放行下一个。 */
+  private readonly appendQueues = new Map<string, Promise<void>>();
 
   constructor(options: JsonlFileAdapterOptions) {
     super();
@@ -66,6 +74,37 @@ export class JsonlFileAdapter extends BaseSessionStore {
   }
 
   async append<K extends EventKind>(
+    id: string,
+    input: SessionEventInput<K>,
+  ): Promise<SessionEvent<K>> {
+    return this.enqueueAppend(id, input);
+  }
+
+  /** per-session 串行化：同一会话的 append 严格按调用序执行（seq 分配/写入的排队互斥）。 */
+  private enqueueAppend<K extends EventKind>(
+    id: string,
+    input: SessionEventInput<K>,
+  ): Promise<SessionEvent<K>> {
+    const prev = this.appendQueues.get(id);
+    const task =
+      prev === undefined
+        ? this.doAppend(id, input)
+        : prev.then(
+            () => this.doAppend(id, input),
+            () => this.doAppend(id, input), // 前序失败不阻断本序（错误只传给各自调用方）
+          );
+    // 队列尾部存「已收敛」的结束哨兵：下一个 append 不管本序成败都能继续。
+    this.appendQueues.set(
+      id,
+      task.then(
+        () => undefined,
+        () => undefined,
+      ),
+    );
+    return task;
+  }
+
+  private async doAppend<K extends EventKind>(
     id: string,
     input: SessionEventInput<K>,
   ): Promise<SessionEvent<K>> {
@@ -162,16 +201,28 @@ export class JsonlFileAdapter extends BaseSessionStore {
   }
 
   /**
-   * 预订下一个 seq：以磁盘实际尾部的最后一个完整合法事件的 seq 为准 +1——不信任可能
-   * 陈旧的 nextSeqBySession 缓存（resume 后另一实例可能已续写）。与本实例缓存比对：
-   * 不一致即单写者假设被破坏（两个写入实例），报错而非静默复用陈旧 seq
-   * （否则重复 seq 行会被读端静默丢弃，新事件无声消失）。
+   * 预订下一个 seq：以磁盘实际尾部的最后一个完整合法事件的 seq 为准 +1（每写前冗余读取，
+   * 不信任缓存——resume 后另一实例可能已续写）。nextSeqBySession 只是纯提示：
+   * - 缓存与磁盘不一致（通常是另一实例/resume 续写了更多行，磁盘在前）→ 以磁盘为准继续写，
+   *   并告警诊断（含 id/cached/derived）；缓存不一致绝不演变为用户可见的硬错；
+   * - 仅当磁盘回退（lastSeqOnDisk < 缓存-1，即本实例已写入的 seq 从磁盘消失——文件被
+   *   另一进程替换/截断的病态场景，概率≈0）仍抛 SessionSeqConflictError 兜底。
    */
   private async reserveNextSeq(id: string, path: string): Promise<number> {
-    const next = (await lastEventSeqOnDisk(path)) + 1;
+    const last = await lastEventSeqOnDisk(path);
+    const next = last + 1;
     const cached = this.nextSeqBySession.get(id);
-    if (cached !== undefined && cached !== next) {
-      throw new SessionSeqConflictError(id, cached, next);
+    if (cached !== undefined) {
+      if (next < cached) {
+        throw new SessionSeqConflictError(id, cached, next);
+      }
+      if (next > cached) {
+        this.warn(
+          `${id}.jsonl seq cache stale: cached next=${cached}, disk-derived next=${next}; ` +
+            'disk truth wins (another writer may have appended this session; ' +
+            'single-writer per session is assumed per ADR-0004, cache kept as hint only)',
+        );
+      }
     }
     this.nextSeqBySession.set(id, next);
     return next;

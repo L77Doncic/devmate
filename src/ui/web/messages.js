@@ -14,13 +14,23 @@
  * assistant-done 不代表 run 结束（还有工具/审批/下一轮）。发送门禁与停止按钮都由它驱动。
  *
  * ## 状态机规则（与 S12 协议一一对应）
- * - session-user    ：追加用户气泡；与最后一条用户气泡文本相同时去重（POST /api/chat
- *                     已在发送端先渲染一条，回放时同句只显示一次）；**无论去重与否都
- *                     重置轮次边界**（run 之间 activeAssistantId 必须重新开始）。
+ * - session-user    ：追加用户气泡。发送渲染单一来源（CS-001「双行同样」修复）——
+ *                     「POST 响应后的乐观 addUser」与「SSE 回声帧」按**发送事一次对账**收口：
+ *                     回声帧命中本地乐观气泡 → 原地合并（id 稳定，DOM 行不重建）；
+ *                     SSE 帧先落地（长活流直投快于 POST 响应返回）→ 该帧即唯一渲染，
+ *                     后续 addUser 消费竞态标记（awaitEcho）不再追加。**不做**「与最后
+ *                     一条用户文本相同即去重」的尾比较 —— 那会把「连续两条同文本的合法
+ *                     用户消息」当重放误吞；重放重复由 createReplayGuard 在 app.js 的
+ *                     onEvent 上游统一丢弃。**无论以何种顺序收口都重置轮次边界**（run
+ *                     之间 activeAssistantId 必须重新开始 —— 见 addUser/session-user）。
  *                     哨兵帧（R2-S2：data.system===true = 评审哨兵注入的系统样式消息）
  *                     作为**独立消息项**（kind 'sys'，系统样式渲染）追加——**不算新用户
  *                     回合**：不重置轮次边界、不打断 delta 累加、不触碰 runActive；系统
  *                     样式单行显示在消息流中（服务端自然收尾前注入，锚定上下文有据）。
+ * - 恢复历史回放去重：GET /api/sessions/:id 逐帧 dispatch 后，长活流重放窗（SessionBroker
+ *                     「后进回放」）会把同序事务帧再投一遍 —— app.js 经 createReplayGuard
+ *                     逐段丢弃（覆盖回合段直到覆盖过的最后一条 assistant-done / 新序外
+ *                     用户帧即解防放行实时流）。本模块产出快照的份数恒 = 事务真实份数。
  * - assistant-delta ：就地累积当前助手气泡文本（流式光标只在此态闪烁）。
  * - assistant-done  ：定稿；content 以其为准（delta 千字万句不如服务端权威值），
  *                     工具调用列表并卡（已存在的不重复）；回合结束（下一轮 delta 由
@@ -88,6 +98,87 @@ export function msgKind(item) {
   return 'system';
 }
 
+/**
+ * 恢复历史回放去重守卫（纯逻辑；app.js 接在长活流 onEvent 上游）。
+ *
+ * 问题（CS-001「恢复历史产生重复」）：restoreSession 先用 GET /api/sessions/:id 把
+ * 会话事务逐帧 dispatch（store 已是全量视图），随后 ensureStream 接入 /api/stream ——
+ * SessionBroker 的「后进回放」会把同序事务帧（含直播合成的 delta 帧，与 GET 的
+ * done 帧形状不同）**再投一遍** → user/assistant 双份。boot 恢复没有 GET（store 为空，
+ * 重放即是历史本体）—— 不需要守卫；只在 GET 先行后接流的那一条路径上 arm。
+ *
+ * 覆盖判定：broker 重放窗 ⊆ GET 覆盖（窗是「服务端本进程内存缓冲」，GET 是「会话事件
+ * 最近窗口」，窗内容恒为后者的子序）。按「回合段」跳过：session-user 帧命中期望序
+ * （GET 覆盖的用户文本序列，有序）→ 该回合整段（delta/done/tool/usage/run-status…）
+ * 丢弃；段终判据（解防）：
+ * - 已丢完覆盖过的最后一条 assistant-done（doneSeen >= coveredDone）→ 其后为实时帧；
+ * - 出现与期望序不匹配的用户帧（新一轮实时消息 / 实时消息先到）→ 解防并放行该帧。
+ * 哨兵帧（system:true 的 session-user 不做序匹配 —— 状态机自身有「最后一条 sys 同文本
+ * 即跳过」的尾去重；本守卫既不打乱覆盖序，也不因哨兵提前解防。
+ *
+ * 纯函数边界：无 DOM / 定时器；consume() 返回 true = 回放重复（调用方丢弃，不 dispatch）。
+ */
+export function createReplayGuard() {
+  let armed = false;
+  let expectedUsers = [];
+  let idx = 0;
+  let inSegment = false;
+  let coveredDone = 0;
+  let doneSeen = 0;
+
+  return {
+    /** arm 守卫：users = GET 覆盖的用户文本（有序；哨兵帧除外）；doneCount = GET 覆盖的
+     *  assistant-done 帧数（覆盖段终止判据）。 */
+    arm(users, doneCount) {
+      expectedUsers = Array.isArray(users) ? users.filter((u) => typeof u === 'string') : [];
+      idx = 0;
+      inSegment = false;
+      doneSeen = 0;
+      coveredDone = Number.isFinite(Number(doneCount)) ? Number(doneCount) : 0;
+      armed = true;
+    },
+    /** 解防（切换会话/GET 失败等路径显式调用；序列不匹配时亦自动解防）。 */
+    clear() {
+      armed = false;
+      idx = 0;
+      inSegment = false;
+      doneSeen = 0;
+      coveredDone = 0;
+      expectedUsers = [];
+    },
+    isActive() {
+      return armed;
+    },
+    consume(ev) {
+      if (!armed) return false;
+      const event = ev?.event;
+      if (event === 'session-user') {
+        const isSentinel = ev?.data?.system === true;
+        if (isSentinel) {
+          // 哨兵：不参与序匹配、不触发解防（状态机侧自行尾去重）；
+          // 段内（覆盖回合的收尾注入）直接随段丢弃，段外（回放前导）放行交给状态机。
+          return inSegment;
+        }
+        const text = ev?.data?.text;
+        if (idx < expectedUsers.length && text === expectedUsers[idx]) {
+          idx += 1;
+          inSegment = true;
+          return true; // 覆盖回合的用户帧：丢弃
+        }
+        armed = false; // 期望序外的新用户帧 = 实时开始：解防（本帧放行）
+        return false;
+      }
+      if (event === 'assistant-done') {
+        doneSeen += 1;
+        if (doneSeen >= coveredDone) armed = false; // 覆盖段耗尽：其后为实时帧（本帧仍丢）
+        return inSegment;
+      }
+      // 段内同伴帧（delta / tool / usage / run-status / compaction …）→ 随段丢弃
+      return inSegment;
+    },
+  };
+}
+
 export function createMessageStore({ maxItems = DEFAULT_MAX_ITEMS } = {}) {
   const state = {
     sessionId: null,
@@ -121,6 +212,14 @@ export function createMessageStore({ maxItems = DEFAULT_MAX_ITEMS } = {}) {
     // R2-S2：评审哨兵系统样式消息（kind 'sys'）计数（本会话累计；reset 清零 ——
     // 快照暴露 systemUser 供测试锚点与统计；不受长会话裁剪影响）。
     systemUser: 0,
+    // 发送竞态收口（CS-001「先两条同样、随后消失一条」：一条消息恒一条用户气泡）——
+    // - localUserId：乐观气泡（POST 响应先回，addUser）id；回声帧同文本命中 → 原地合并定稿。
+    // - awaitedEcho：SSE 帧先落地（长活流直投快于 POST 响应返回）的竞态兜底标记
+    //   （文本）；addUser 命中即不再追加（回声帧已渲染该消息的唯一气泡）。
+    //   两项均由 startStream / reset 清空 —— 恢复回放（GET 逐帧 dispatch 不带 addUser）
+    //   的残留绝不误吞下一次发送（见 addUser 竞态收口）。
+    localUserId: null,
+    awaitedEcho: null, // { text: string }
   };
 
   const listeners = new Set();
@@ -224,7 +323,6 @@ export function createMessageStore({ maxItems = DEFAULT_MAX_ITEMS } = {}) {
           break;
         }
         const text = String(data?.text ?? '');
-        const lastUser = findLastKind('user');
         // 轮次边界与去重解耦：无论回放是否去重，新 run 的 delta 必须进新气泡。
         // 同时置 run 边界标记（下一条 usage = 新 run 全额 —— /cost 累计正确性前提）。
         // R2-S1 方法论线同边界：新回合清空（旧 run 的小牌不再持续显示）。
@@ -233,7 +331,25 @@ export function createMessageStore({ maxItems = DEFAULT_MAX_ITEMS } = {}) {
         state.usageRunStarted = false;
         state.methodLine = null;
         state.methodTrackedId = null;
-        if (lastUser && lastUser.text === text) break; // 去重（见头注释）
+        // 单一事实渲染（CS-001）：本帧必为「本次发送的消息」的回声，与乐观 addUser
+        // 按一次发送对账 —— 绝不并存两条同文本用户气泡；同时**不设**「与最后一条用户
+        // 同文本即跳过」的尾去重（会把「连续两条同文本的合法用户消息」当重放误吞；
+        // 重放重复由下方 createReplayGuard 在 app.js 的事件上游统一丢弃）。
+        // ① 乐观气泡先行（POST 响应短于直投）：原地合并（id 稳定 —— DOM 行不重建）；
+        if (state.localUserId !== null) {
+          const local = state.items.find(
+            (it) => it.id === state.localUserId && it.kind === 'user' && it.local === true,
+          );
+          if (local && local.text === text) {
+            local.local = false;
+            state.localUserId = null;
+            state.awaitedEcho = null;
+            break; // 边界重置已在上面完成
+          }
+        }
+        // ② SSE 帧先落地（长活流直投快于 POST 响应）：本帧即该消息的唯一渲染 —
+        //    记 awaitedEcho 供接下来的 addUser 消费（追加被吞，不产生第二行）。
+        state.awaitedEcho = { text };
         state.items.push({ id: nextId(), kind: 'user', text, at: Date.now() });
         if (!state.title) state.title = text.slice(0, 24);
         break;
@@ -443,9 +559,20 @@ export function createMessageStore({ maxItems = DEFAULT_MAX_ITEMS } = {}) {
   // 主动作（UI 层调用）
   // ---------------------------------------------------------------------
   function addUser(text) {
-    const item = { id: nextId(), kind: 'user', text: String(text), at: Date.now() };
+    const t = String(text);
+    // 竞态收口（CS-001）：echo 帧（session-user）先落地（长活流直投快于 /api/chat 响应
+    // 返回）而 send() 的乐观渲染尚未执行时，该消息的唯一渲染已由回声完成 —— 消费标记，
+    // 绝不追加第二份（同文本的**连续第二条**消息经 startStream/上一 Echo 消费归零后照常落一行）。
+    const echo = state.awaitedEcho;
+    if (echo !== null && echo.text === t) {
+      state.awaitedEcho = null;
+      return;
+    }
+    const item = { id: nextId(), kind: 'user', text: t, at: Date.now(), local: true };
     state.items.push(item);
-    if (!state.title) state.title = String(text).slice(0, 24);
+    state.localUserId = item.id;
+    state.awaitedEcho = null;
+    if (!state.title) state.title = t.slice(0, 24);
     // 轮次边界：乐观渲染的用户消息也是新 run 的起点（下一轮 delta 开新气泡）；
     // 并置 run 边界标记（同上 —— 本次发送产出的 usage 按新 run 全额累计）。
     // R2-S1 方法论线同边界清空（新用户回合即清小牌 —— 与 session-user 对称）。
@@ -496,12 +623,16 @@ export function createMessageStore({ maxItems = DEFAULT_MAX_ITEMS } = {}) {
     state.methodLine = null;
     state.methodTrackedId = null;
     state.systemUser = 0;
+    state.localUserId = null;
+    state.awaitedEcho = null;
     emit();
   }
 
   /**
    * 开一次 run（发送门禁）：run 进行中返回 false —— 调用方提示
    * 「上一条任务仍在运行，请等待或按停止」（不再静默吞）。
+   * 每轮发送前清竞态标记：恢复回放（GET 逐帧 dispatch 不带 addUser）留下的
+   * awaitedEcho / localUserId 残留绝不误吞本次发送（见 addUser 竞态收口）。
    */
   function startStream() {
     if (state.runActive) return false;
@@ -509,6 +640,8 @@ export function createMessageStore({ maxItems = DEFAULT_MAX_ITEMS } = {}) {
     state.streaming = true;
     state.lastError = null;
     state.runStartedAt = Date.now();
+    state.awaitedEcho = null;
+    state.localUserId = null;
     emit();
     return true;
   }

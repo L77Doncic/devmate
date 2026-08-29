@@ -37,7 +37,7 @@
  * - 用户与模型文本均经 markdown.js / 纯 textContent 路径；链接 href 过 safeHref 白名单。
  * - 只发同源请求；apiKey 只在 saveSettingsForm 读值瞬间存在，POST 后立即丢弃。
  */
-import { createMessageStore, msgKind } from './messages.js';
+import { createMessageStore, createReplayGuard, msgKind } from './messages.js';
 import { consumeSSE } from './sse.js';
 import { markdownToDOM } from './markdown.js';
 import {
@@ -208,6 +208,9 @@ const LS_SESSION = 'devmate.ui.sessionId';
 // ============================================================== 模块级状态
 
 const store = createMessageStore();
+/** 历史回放去重守卫（messages.js）：恢复会话（GET 先行）后接流时，SessionBroker
+ *  后进回放会把同序事务帧再投一遍 —— 守卫逐段丢弃（见 createReplayGuard 头注释）。 */
+const replayGuard = createReplayGuard();
 /** 单流闸门（streams.js）：记录「当前流」，收尾裁决「引用相等才 endStream」——
  *  旧流 finally 晚到不搅动新流（切会话竞态修复）。 */
 const streamGate = createStreamGate({ onFinished: () => store.endStream() });
@@ -1450,6 +1453,18 @@ async function restoreSession(id) {
   }
   if (restored?.title) store.setTitle(restored.title);
   for (const ev of restored?.events ?? []) store.dispatch(ev);
+  // 回放去重守卫：GET 覆盖的事务（用户文本序 + done 帧数）已是全量视图 —— 随后
+  // ensureStream 接入的 broker 重放窗将投出同序帧（含直播合成的 delta），逐段丢弃。
+  // GET 失败（空窗时兜底历史拉空）→ 解防（重放窗即时序本体，照常渲染）。
+  if (restored) {
+    const coveredUsers = (restored.events ?? [])
+      .filter((e) => e?.event === 'session-user' && e?.data?.system !== true)
+      .map((e) => String(e?.data?.text ?? ''));
+    const coveredDone = (restored.events ?? []).filter((e) => e?.event === 'assistant-done').length;
+    replayGuard.arm(coveredUsers, coveredDone);
+  } else {
+    replayGuard.clear();
+  }
   if (restored && restored.truncated) {
     store.addSystem(
       `对话较长：本次载入最近 ${restored.events.length} 条事件（共 ${restored.totalCount} 条）。`,
@@ -1504,6 +1519,7 @@ async function newSession(workspaceRoot = null) {
   else localStorage.removeItem(LS_SESSION);
   store.reset();
   store.setSessionId(id);
+  replayGuard.clear(); // 新会话无 GET 回放覆盖序 —— 守卫拆除（重放窗即时序本体）
 
   await backswitch(previousSessionId, previousRunActive);
 
@@ -2827,6 +2843,10 @@ async function ensureStream(sessionId) {
       url: `/api/stream?sessionId=${encodeURIComponent(sessionId)}`,
       signal: ctrl.signal,
       onEvent: (ev) => {
+        // 恢复历史回放去重（CS-001）：GET /api/sessions/:id 先落之后，长活流的重放窗
+        // 会把同序事务帧再投一遍 —— 守卫判定为覆盖段重复的帧直接丢弃（不 dispatch）；
+        // 序列走到下一个实时帧时自动解防，实时流零影响。
+        if (replayGuard.consume(ev)) return;
         store.dispatch(ev);
         // 低成本刷新口径（任务书）：统计/列表随 run-status 事件刷新（run 少而稀疏）
         if (ev?.event === 'run-status' && TERMINAL_STATUSES.includes(ev?.data?.status)) {
