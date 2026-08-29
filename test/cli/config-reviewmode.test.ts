@@ -55,10 +55,7 @@ describe('StoredConfig：reviewMode', () => {
   });
 
   it('既有 methodFirst/reviewMode 独立共存（互不干扰）', () => {
-    const merged = mergeStored(
-      { methodFirst: true, reviewMode: false },
-      { methodFirst: false },
-    );
+    const merged = mergeStored({ methodFirst: true, reviewMode: false }, { methodFirst: false });
     expect(merged.methodFirst).toBe(false);
     expect(merged.reviewMode).toBe(false);
   });

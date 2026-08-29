@@ -56,11 +56,8 @@ function baseOpts(overrides: Partial<RunOptions>): RunOptions {
 
 /** 哨兵事件提取：kind=user 且 meta.system=true（无 → undefined）。 */
 function sentinelEvent(events: Awaited<ReturnType<typeof collectEvents>>) {
-  return events.find(
-    (ev) => ev.kind === 'user' && ev.meta?.system === true,
-  ) as
-    | { kind: 'user'; payload: { content: string }; meta?: Record<string, unknown> }
-    | undefined;
+  return events.find((ev) => ev.kind === 'user' && ev.meta?.system === true) as
+    { kind: 'user'; payload: { content: string }; meta?: Record<string, unknown> } | undefined;
 }
 
 describe('loop：收尾评审哨兵（RunOptions.review）', () => {
@@ -110,7 +107,12 @@ describe('loop：收尾评审哨兵（RunOptions.review）', () => {
 
     const result = await run(
       { sessionId: 's1', task: '改一个' },
-      baseOpts({ store, tools: defineRegistry([echoTool()], { sessionId: 's1' }), llm, review: gate }),
+      baseOpts({
+        store,
+        tools: defineRegistry([echoTool()], { sessionId: 's1' }),
+        llm,
+        review: gate,
+      }),
     );
 
     expect(result.status).toBe('completed');
@@ -128,7 +130,12 @@ describe('loop：收尾评审哨兵（RunOptions.review）', () => {
     const llm = new FakeLlm([{ content: '无事发生' }]);
     const result = await run(
       { sessionId: 's1', task: '看文档' },
-      baseOpts({ store, tools: defineRegistry([echoTool()], { sessionId: 's1' }), llm, review: gate }),
+      baseOpts({
+        store,
+        tools: defineRegistry([echoTool()], { sessionId: 's1' }),
+        llm,
+        review: gate,
+      }),
     );
     expect(result.status).toBe('completed');
     expect(result.steps).toBe(1);
@@ -142,7 +149,12 @@ describe('loop：收尾评审哨兵（RunOptions.review）', () => {
     const llm = new FakeLlm([{ content: '审查完了收尾' }]);
     const result = await run(
       { sessionId: 's1', task: '做一个功能' },
-      baseOpts({ store, tools: defineRegistry([echoTool()], { sessionId: 's1' }), llm, review: gate }),
+      baseOpts({
+        store,
+        tools: defineRegistry([echoTool()], { sessionId: 's1' }),
+        llm,
+        review: gate,
+      }),
     );
     expect(result.status).toBe('completed');
     expect(result.steps).toBe(1);
@@ -169,15 +181,18 @@ describe('loop：收尾评审哨兵（RunOptions.review）', () => {
     const llm = new FakeLlm([{ content: 'a' }, { content: 'b' }]);
     const result = await run(
       { sessionId: 's1', task: '改一个文件' },
-      baseOpts({ store, tools: defineRegistry([echoTool()], { sessionId: 's1' }), llm, review: gate }),
+      baseOpts({
+        store,
+        tools: defineRegistry([echoTool()], { sessionId: 's1' }),
+        llm,
+        review: gate,
+      }),
     );
     expect(result.status).toBe('completed');
     expect(result.steps).toBe(2);
     const events = await collectEvents(store, 's1');
     // 恰好一次注入（r2 的 flag 已置位 → 第二次自然结束直接放行）
-    const sentinels = events.filter(
-      (ev) => ev.kind === 'user' && ev.meta?.system === true,
-    );
+    const sentinels = events.filter((ev) => ev.kind === 'user' && ev.meta?.system === true);
     expect(sentinels).toHaveLength(1);
 
     // 同会话第二次 run（resume）：flag 保持 → 不重复注入
@@ -212,7 +227,12 @@ describe('loop：收尾评审哨兵（RunOptions.review）', () => {
     const llm = new FakeLlm([{ content: '结束' }]);
     const result = await run(
       { sessionId: 's1', task: '改一个文件' },
-      baseOpts({ store, tools: defineRegistry([echoTool()], { sessionId: 's1' }), llm, review: throwing }),
+      baseOpts({
+        store,
+        tools: defineRegistry([echoTool()], { sessionId: 's1' }),
+        llm,
+        review: throwing,
+      }),
     );
     expect(result.status).toBe('completed');
     expect(result.steps).toBe(1);
@@ -252,13 +272,9 @@ describe('loop：评审哨兵语义纯函数（RunStats）', () => {
     expect(hasReviewRun(undefined)).toBe(false);
     const plain: RunStats = { counts: {}, subagentPrompts: ['写代码', '调研数据源'] };
     expect(hasReviewRun(plain)).toBe(false);
-    expect(
-      hasReviewRun({ counts: {}, subagentPrompts: ['请审查这份 diff'] }),
-    ).toBe(true);
+    expect(hasReviewRun({ counts: {}, subagentPrompts: ['请审查这份 diff'] })).toBe(true);
     expect(hasReviewRun({ counts: {}, subagentPrompts: ['Please review the changes'] })).toBe(true);
     expect(hasReviewRun({ counts: {}, subagentPrompts: ['REVIEW'] })).toBe(true);
-    expect(
-      hasReviewRun({ counts: {}, subagentPrompts: ['先查资料', '请审查代码'] }),
-    ).toBe(true);
+    expect(hasReviewRun({ counts: {}, subagentPrompts: ['先查资料', '请审查代码'] })).toBe(true);
   });
 });

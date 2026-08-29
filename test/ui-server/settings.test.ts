@@ -243,9 +243,7 @@ describe('ui/server：reviewMode（R2-S2 评审哨兵开关）', () => {
     const llm = new FakeLlm([
       {
         content: '执行',
-        toolCalls: [
-          { id: 'c1', name: 'run_command', arguments: '{"command":"echo hi"}' },
-        ],
+        toolCalls: [{ id: 'c1', name: 'run_command', arguments: '{"command":"echo hi"}' }],
       },
       { content: 'done' },
     ]);

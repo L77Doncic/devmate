@@ -140,10 +140,7 @@ describe('tools/skill：use_skill', () => {
       content: '---\nname: TDD\n---\nRed. Green. Refactor.',
     });
     // 两者都给：id 优先（skill 写不存在 id 也不受影响——先按 id 命中）
-    const both = await run(
-      fakeIndex(),
-      JSON.stringify({ skill: 'nope', id: 'tdd' }),
-    );
+    const both = await run(fakeIndex(), JSON.stringify({ skill: 'nope', id: 'tdd' }));
     expect(both.ok).toBe(true);
     expect((both as { content: string }).content).toContain('Red. Green. Refactor.');
     // id 存在而 skill 不存在：命中{id}（id 优先）

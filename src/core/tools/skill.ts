@@ -108,7 +108,8 @@ async function executeSkill(call: ToolCall, options: SkillToolOptions): Promise<
     if (typeof parsed === 'object' && parsed !== null && !Array.isArray(parsed)) {
       const record = parsed as Record<string, unknown>;
       const id = record.id;
-      if (typeof id === 'string' && id !== '') skillId = id; // id 优先
+      if (typeof id === 'string' && id !== '')
+        skillId = id; // id 优先
       else {
         const raw = record.skill;
         if (typeof raw === 'string') skillId = raw;

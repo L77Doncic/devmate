@@ -706,9 +706,7 @@ describe('Wave 2：reasoning 思考帧与行 meta 数据（Think Disclosure / Ra
 
 describe('方法论线（R2-S1：回合首条 assistant 提取；用户回合/reset 清空）', () => {
   it('增量命中：delta 到达即提取（运行中即显示）；快照暴露 methodLine', () => {
-    const snap = run([
-      ['assistant-delta', { text: '方法线：tdd\n我先复现这个 bug。' }],
-    ]);
+    const snap = run([['assistant-delta', { text: '方法线：tdd\n我先复现这个 bug。' }]]);
     expect(snap.methodLine).toBe('tdd');
   });
 

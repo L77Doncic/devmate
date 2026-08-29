@@ -160,7 +160,8 @@ export function main() {
   if (existsSync(metaPath)) {
     try {
       const parsed = JSON.parse(readFileSync(metaPath, 'utf8'));
-      metaRaw = typeof parsed === 'object' && parsed !== null && !Array.isArray(parsed) ? parsed : {};
+      metaRaw =
+        typeof parsed === 'object' && parsed !== null && !Array.isArray(parsed) ? parsed : {};
     } catch {
       metaRaw = {};
     }
@@ -225,4 +226,3 @@ export function main() {
 if (resolve(process.argv[1] ?? '') === fileURLToPath(import.meta.url)) {
   main();
 }
-

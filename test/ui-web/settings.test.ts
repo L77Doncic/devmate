@@ -491,9 +491,7 @@ describe('methodFirst（R2-S1 方法论前置门开关：缺省 true / 布尔补
     ).rejects.toThrow(/500/);
     // 回滚 = 失败后再 loadSettings（服务端态还原）；GET 能回到旧值即回滚成立
     const after = await loadSettings({
-      fetchImpl: asFetch(async () =>
-        okResponse({ baseUrl: 'x', model: 'm', methodFirst: true }),
-      ),
+      fetchImpl: asFetch(async () => okResponse({ baseUrl: 'x', model: 'm', methodFirst: true })),
     });
     expect(after.methodFirst).toBe(true);
   });
@@ -574,9 +572,7 @@ describe('reviewMode（R2-S2 收尾评审哨兵开关：缺省 true / 布尔补�
     ).rejects.toThrow(/500/);
     // 回滚 = 失败后再 loadSettings（服务端态还原）；GET 能回到旧值即回滚成立
     const after = await loadSettings({
-      fetchImpl: asFetch(async () =>
-        okResponse({ baseUrl: 'x', model: 'm', reviewMode: true }),
-      ),
+      fetchImpl: asFetch(async () => okResponse({ baseUrl: 'x', model: 'm', reviewMode: true })),
     });
     expect(after.reviewMode).toBe(true);
   });

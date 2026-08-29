@@ -163,7 +163,12 @@ export interface RunStats {
 }
 
 /** 实质变更工具名（写/编辑/命令/子代理；MCP 按 mcp_ 前缀另行判定）。 */
-const SUBSTANTIVE_TOOL_NAMES = new Set(['write_file', 'edit_file', 'run_command', 'spawn_subagent']);
+const SUBSTANTIVE_TOOL_NAMES = new Set([
+  'write_file',
+  'edit_file',
+  'run_command',
+  'spawn_subagent',
+]);
 
 /** 独立审查 prompt 判定（含「审查」或 "review"——大小写不敏感）。 */
 const REVIEW_PROMPT_PATTERN = /审查|review/i;

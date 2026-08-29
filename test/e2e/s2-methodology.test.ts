@@ -136,9 +136,7 @@ describe('E2E-S2：方法论/评审哨兵契约锁定（assembleDeps + fake llm�
       'tool-result',
       'assistant-delta',
     ]);
-    const sentinelIndex = seq.findIndex(
-      (event, i) => event === 'session-user' && i > 0,
-    );
+    const sentinelIndex = seq.findIndex((event, i) => event === 'session-user' && i > 0);
     expect(sentinelIndex).toBeGreaterThan(6);
     expect(seq[seq.length - 1]).toBe('run-status');
     expect(client.frames[client.frames.length - 1]!.data).toMatchObject({

@@ -354,7 +354,11 @@ interface SessionCtx {
   active: boolean;
   /** 评审哨兵（R2-S2）会话级记帐：实质变更工具计数 + 成功审查 spawn 的 prompt + 一次性注入 flag
    * （跨 run 保持——session 级；语义纯函数见 loop/types 的 hasSubstantiveWork/hasReviewRun）。 */
-  readonly reviewStats: { counts: Record<string, number>; subagentPrompts: string[]; flagged: boolean };
+  readonly reviewStats: {
+    counts: Record<string, number>;
+    subagentPrompts: string[];
+    flagged: boolean;
+  };
 }
 
 /** 每会话事件帧缓存上限（帧数；与字节谓词先到先裁，裁最旧）。 */
