@@ -1142,6 +1142,46 @@ pre {
   background: linear-gradient(to bottom, transparent, var(--dsw-specific-sidebar-fill));
   pointer-events: none;
 }
+/* 区块头（dsh WorkspaceBrowser .sectionHeader 定值：h36 r12、label 左 + 尾随动作、
+   高度 36、底 4；iconButton 28px 圆钮 —— 「对话」label + 添加工作区 +） */
+.sectionHeader {
+  flex: none;
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 4px;
+  height: 36px;
+  padding-left: 8px;
+  padding-right: 12px;
+  margin: 2px -4px 4px;
+  box-sizing: border-box;
+  border-radius: 12px;
+  overflow: hidden;
+  color: var(--dsw-alias-label-tertiary);
+}
+.sectionLabel {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+  font-size: 13px;
+  line-height: 20px;
+  color: var(--dsw-alias-label-tertiary);
+}
+.sectionHeader .headerActions {
+  flex: none;
+  display: flex;
+  align-items: center;
+  gap: 4px;
+}
+.sectionHeader .headerActions .iconButton {
+  color: var(--dsw-alias-label-secondary);
+}
+.sectionHeader .headerActions .iconButton:hover {
+  background: var(--dsw-alias-interactive-bg-hover);
+  color: var(--dsw-alias-label-primary);
+}
 /* 唯一滚动区：2px 边距 + stable 8px 主题滚动条 + 剩余 padding = 壳右 inset，
    有/无溢出都不挪行；16px 底 pad 让末行悬于渐隐之上 */
 .list {
@@ -1204,6 +1244,39 @@ pre {
 .projectRow[aria-expanded='true'] .arrow {
   transform: rotate(90deg);
 }
+/* 组头当前工作区（含当前会话的组）：folder 槽 accent（dsh folderActive 语义） */
+.projectRow .folderActive {
+  color: var(--dsw-alias-state-business-primary);
+}
+/* 组头尾随动作（kebab + 新建组内会话 ＋）：仅 hover/菜单开着显露（dsh rowActions） */
+.projectRow .rowActions {
+  height: 20px;
+  gap: 12px;
+}
+.projectRow:hover .rowActions,
+.projectRow.menuOpen .rowActions {
+  display: inline-flex;
+}
+.projectRow.menuOpen {
+  background: var(--dsw-alias-interactive-bg-hover);
+}
+/* 组头文本双行（任务书：title = 根 basename + 小字路径 meta）：
+   34px 行内垂直居中两行 13/18 + 11/14（dsh 单行 title 同字号步进） */
+.projectRow .projectText {
+  gap: 0;
+  justify-content: center;
+}
+.projectRow .projectText .title {
+  font-size: 13px;
+  line-height: 18px;
+}
+.projectRow .projectText .meta {
+  flex: 1;
+  min-width: 0;
+  font-size: 11px;
+  line-height: 14px;
+}
+/* 组头文本座（flex column：title + meta 双行；dsh projectText 解剖） */
 .projectText {
   flex: 1;
   min-width: 0;
@@ -3826,13 +3899,275 @@ pre {
   margin-top: 6px;
 }
 
-/* ---------- 会话分组（侧栏仅对话：组头 = projectRow 同解剖；组体缩进一格） ---------- */
-.sessionGroup {
+/* ---------- 工作区组（dsh WorkspaceBrowser .groupSection：组头 + 紧凑会话行） ----------
+   组体不缩进（dsh：session 行与组头同左缘 —— 层级只由 slot 槽表现，解剖逐值照抄） */
+.wsGroup {
   display: block;
 }
-.sessionGroup .groupList {
-  padding-left: 8px;
+.wsGroup .groupList {
+  padding: 0;
 }
-.sessionGroup .groupHeader {
-  height: 30px; /* 组头稍矮于顶层项目行：34 → 30（行解剖不变，仅节奏） */
+
+/* ---------- ＋新建 菜单（dsh WorkspacePickFlow 形态：Menu 表面 —— 工作区列表 +
+   分隔 + 底部钉置「添加工作区…」） ---------- */
+.wsMenu {
+  position: absolute;
+  z-index: 46;
+  min-width: 200px;
+  max-width: 236px;
+  padding: 4px;
+  border: 1px solid var(--dsw-alias-border-l1);
+  border-radius: 8px;
+  background: var(--dsw-specific-menu);
+  box-shadow: var(--dsw-shadow-lv2);
+  animation: row-menu-in 120ms ease-out;
+  color: var(--dsw-alias-label-secondary);
+  font-size: 13px;
+  line-height: 20px;
+}
+.wsMenuItem {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  width: 100%;
+  height: 30px;
+  padding: 0 8px;
+  border: none;
+  border-radius: 6px;
+  background: transparent;
+  color: inherit;
+  font-size: 13px;
+  line-height: 20px;
+  text-align: left;
+  cursor: pointer;
+}
+.wsMenuItem:hover,
+.wsMenuItem.selected {
+  background: var(--dsw-alias-interactive-bg-hover);
+  color: var(--dsw-alias-label-primary);
+}
+.wsMenuItemIcon {
+  flex: none;
+  width: 16px;
+  height: 16px;
+  color: var(--dsw-alias-label-tertiary);
+}
+.wsMenuItemLabel {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.wsMenuItemMeta {
+  flex: none;
+  max-width: 46%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: 12px;
+  line-height: 20px;
+  color: var(--dsw-alias-label-tertiary);
+}
+.wsMenuItemCheck {
+  flex: none;
+  display: inline-flex;
+  align-items: center;
+  color: var(--dsw-alias-state-business-primary);
+}
+.wsMenuNote {
+  padding: 6px 10px;
+  color: var(--dsw-alias-label-tertiary);
+  font-size: 12px;
+  line-height: 18px;
+  white-space: normal;
+  word-break: break-word;
+}
+.wsMenuSeparator {
+  height: 1px;
+  margin: 4px -4px;
+  background: var(--dsw-alias-separator-primary);
+}
+
+/* ---------- 目录选择弹窗（dsh ui-directory-picker-browse：标题 + 可点路径条 +
+   目录行列表 + 底部「选择此文件夹」） ---------- */
+.ws-picker {
+  position: fixed;
+  left: 50%;
+  top: 50%;
+  transform: translate(-50%, -50%);
+  z-index: 61;
+  width: min(560px, calc(100vw - 48px));
+  max-height: min(72vh, 620px);
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+  background: var(--dsw-alias-bg-layer-2);
+  border: 1px solid var(--dsw-alias-border-inverted);
+  border-radius: 24px;
+  box-shadow: var(--dsw-shadow-lv3);
+}
+.ws-picker-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 18px 20px 10px;
+}
+.ws-picker-head h2 {
+  flex: 1;
+  min-width: 0;
+  margin: 0;
+  font-size: var(--dsw-font-size-lg);
+  line-height: 24px;
+  font-weight: 500;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.ws-picker-body {
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+  padding: 0 20px;
+  overflow: hidden;
+}
+/* 当前路径条（面包屑分段可点；首段 = 根） */
+.ws-picker-crumbs {
+  flex: none;
+  display: flex;
+  align-items: center;
+  gap: 2px;
+  min-height: 32px;
+  max-height: 56px;
+  overflow-x: auto;
+  overflow-y: hidden;
+  white-space: nowrap;
+  padding: 4px 8px;
+  margin-bottom: 8px;
+  border-radius: 8px;
+  background: var(--dsw-specific-input-major);
+  color: var(--dsw-alias-label-tertiary);
+  font-family: var(--font-mono);
+  font-size: 12px;
+  line-height: 20px;
+}
+.ws-crumb {
+  flex: none;
+  border: none;
+  padding: 0 4px;
+  border-radius: 4px;
+  background: transparent;
+  color: var(--dsw-alias-label-tertiary);
+  font-family: inherit;
+  font-size: inherit;
+  line-height: inherit;
+  cursor: pointer;
+}
+.ws-crumb:hover {
+  background: var(--dsw-alias-interactive-bg-hover);
+  color: var(--dsw-alias-label-primary);
+}
+.ws-crumb.root {
+  color: var(--dsw-alias-label-secondary);
+}
+/* 目录行列表（首行恒 `..`；行点击选中、回车/双击进级） */
+.ws-picker-dirs {
+  flex: 1;
+  min-height: 140px;
+  max-height: 320px;
+  overflow-y: auto;
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  scrollbar-gutter: stable;
+}
+.ws-picker-dir {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  height: 36px;
+  padding: 0 8px;
+  border-radius: 8px;
+  color: var(--dsw-alias-label-primary);
+  font-size: 13px;
+  line-height: 20px;
+  cursor: pointer;
+  user-select: none;
+}
+.ws-picker-dir:hover {
+  background: var(--dsw-alias-interactive-bg-hover);
+}
+.ws-picker-dir.selected {
+  background: var(--dsw-alias-interactive-bg-hover);
+  color: var(--dsw-alias-state-business-primary);
+}
+.ws-picker-dir.selected .ws-dirIcon {
+  color: var(--dsw-alias-state-business-primary);
+}
+.ws-dirIcon {
+  flex: none;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 16px;
+  height: 20px;
+  color: var(--dsw-alias-label-tertiary);
+}
+.ws-dirName {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.ws-picker-empty {
+  padding: 14px 12px;
+  color: var(--dsw-alias-label-tertiary);
+  font-size: 12px;
+  line-height: 18px;
+}
+/* 手动路径输入兜底 */
+.ws-picker-manual {
+  flex: none;
+  display: flex;
+  gap: 8px;
+  align-items: center;
+  padding: 10px 0 12px;
+}
+.ws-picker-manual .input {
+  flex: 1;
+  min-width: 0;
+  height: 36px;
+  font-size: 12px;
+}
+.ws-picker-foot {
+  flex: none;
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 8px;
+  padding: 12px 20px 18px;
+  border-top: 1px solid var(--dsw-alias-border-l1);
+}
+/* 添加失败错误文案（dsh folderError .modalError：12/18 err 色） */
+.ws-error-text {
+  color: var(--dsw-alias-state-error-primary) !important;
+  font-size: 12px !important;
+  line-height: 18px !important;
+}
+
+/* ---------- 空态「选择工作区…」快捷入口（dsh EmptyHero 次级动作胶囊） ---------- */
+.hero-add-workspace {
+  margin-top: 14px;
+  height: 36px;
+  padding: 0 16px;
+  border-radius: 18px;
+  font-size: 14px;
+  line-height: 22px;
+}
+.hero-add-workspace svg {
+  flex: none;
+  width: 16px;
+  height: 16px;
+  color: var(--dsw-alias-label-tertiary);
 }

@@ -220,6 +220,13 @@ describe('mergeConfig / mergeStored：单点合并写（三节 + settings 共用
     expect(readJson(configPath).mcp).toEqual([a]);
   });
 
+  it('workspaces 清单整节替换（服务端全量快照为准；已删根不复活——同 mcp 语义）', () => {
+    const configPath = join(tmpHome, '.devmate', 'config.json');
+    mergeConfig(configPath, { workspaces: ['/ws-a', '/ws-b'] });
+    mergeConfig(configPath, { workspaces: ['/ws-b'] });
+    expect(readJson(configPath).workspaces).toEqual(['/ws-b']);
+  });
+
   it('patch 显式 undefined = 删除该键（apiKey 清空语义）', () => {
     const configPath = join(tmpHome, '.devmate', 'config.json');
     mergeConfig(configPath, { model: 'm0', apiKey: 'sk-old' });

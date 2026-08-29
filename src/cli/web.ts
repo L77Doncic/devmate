@@ -333,14 +333,24 @@ export async function runWeb(args: string[], io: RunWebIo): Promise<number> {
   const saveMcpConfig = (servers: StoredMcpServer[]): void => {
     mergeConfig(io.configPath, { mcp: servers });
   };
+  // 工作区注册表（多工作区）：初值读回 config.json 的 workspaces 节（缺省 [workspace——
+  // 服务端默认根恒在）；saveWorkspaces 经 mergeConfig 整节替换落盘（以服务端快照为准）。
+  const workspacesInitial: string[] = Array.isArray(stored.workspaces)
+    ? stored.workspaces
+    : [webArgs.workspace];
+  const saveWorkspaces = (roots: string[]): void => {
+    mergeConfig(io.configPath, { workspaces: roots });
+  };
   const server = module.createDevmateServer(
     attachDeps(deps, {
       persistSettings,
       saveSkillsConfig,
       saveWorkflow,
       saveMcpConfig,
+      saveWorkspaces,
       workflow: workflowInitial,
       mcpServers: mcpServersInitial,
+      workspaces: workspacesInitial,
       // 服务端当前只持久化 skills 开关（开关表初值缺省 {} = 全开；无初值注入缝——
       // attach 模式下本键透传不影响现有行为，服务端接缝扩展后即生效）。
       skillsRecord,

@@ -55,6 +55,8 @@ export interface StoredConfig {
   workflow?: StoredWorkflowConfig;
   /** MCP 服务器配置清单（配置层；P2 协议客户端接入前只存配置）。 */
   mcp?: StoredMcpServer[];
+  /** 工作区注册表（多工作区：canonical 根清单；整节替换——以服务端快照为准，同 mcp）。 */
+  workspaces?: string[];
 }
 
 /** 工作流配置节（字段可缺省；服务端断言 maxParallel 整数 1-4，CLI 初值加载夹紧）。 */
@@ -137,7 +139,7 @@ export function mergeConfig(configPath: string, patch: StoredConfigPatch): void 
  * 纯合并（注入 configPath 的单点实现；单测直测）：
  * - 顶层键 patch 优先；patch 显式 undefined = 删除该键（POST /api/settings apiKey:'' 的清空语义）；
  * - skills/workflow 节内深合（既有键保留，冲突键 patch 优先）；
- * - mcp 清单以服务端全量快照为准——整节替换（按名合并会让已删服务器复活）。
+ * - mcp/workspaces 清单以服务端全量快照为准——整节替换（按名合并会让已删根/服务器复活）。
  */
 export function mergeStored(stored: StoredConfig, patch: StoredConfigPatch): StoredConfig {
   const raw: Record<string, unknown> = { ...stored, ...patch };
@@ -148,6 +150,7 @@ export function mergeStored(stored: StoredConfig, patch: StoredConfigPatch): Sto
   if (patch.skills !== undefined) out.skills = { ...stored.skills, ...patch.skills };
   if (patch.workflow !== undefined) out.workflow = { ...stored.workflow, ...patch.workflow };
   if (patch.mcp !== undefined) out.mcp = patch.mcp;
+  if (patch.workspaces !== undefined) out.workspaces = patch.workspaces;
   return out as StoredConfig;
 }
 

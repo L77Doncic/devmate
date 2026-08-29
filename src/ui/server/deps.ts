@@ -5,10 +5,11 @@
  * - 监狱 + 工具面：createJail（workspaceRoot 默认边界）→ createFsTools（六个文件工具）
  *   + createPersistentShell（run_command，常驻 Shell：S10）+ createSkillTool（use_skill）
  *   + createSubagentTool（spawn_subagent）→ defineRegistry 名称分发 → securedRegistry 脱敏；
- *   工具面共 9 个，按会话懒建（createSessionToolsFactory）：fs 工具与 use_skill/spawn_subagent
- *   共享一组（不消费 ctx），**shell 每会话一个 PersistentShell 实例**（契约本来就是
- *   ctx.sessionId 键控），依 deps.ts 上文档的 S10 契约真正落地 —— shell 实例按 sessionId
- *   缓存在 Map，dispose()（serve close 路径）统杀全部会话 shell；
+ *   工具面共 9 个，按会话懒建（createSessionToolsFactory）：use_skill/spawn_subagent 共享一组
+ *   （不消费 ctx），**fs 组 + 监狱 + shell 每会话按解析根一组**（多工作区 per-session 根：
+ *   workspaceRootOf 读会话 meta（无 meta → 默认根），canonical 一次 realpath——jail 与
+ *   shell 同源注入；未注入 = 单根形态用缺省根监狱）；shell 实例按 sessionId 缓存在 Map，
+ *   dispose()（serve close 路径）统杀全部会话 shell；
  *   use_skill 的技能索引经**晚绑定引用**（attachSkillsIndex 回填，服务端索引缓存单源）
  *   执行期现读——开关变化即时生效；spawn_subagent 的池 config 闭包同样晚绑定
  *   （attachWorkflowConfig）——POST /api/workflow 后后续 spawn 即时生效；
@@ -79,6 +80,8 @@ import type {
 export interface DevmateConfig {
   /** 工作区根：监狱默认边界（启动目录），同时是 run_command 初值 cwd。 */
   workspaceRoot: string;
+  /** 工作区注册表初值（多工作区；欠省 [workspaceRoot]。注册值 = canonical 形式，去重保序）。 */
+  workspaces?: string[] | undefined;
   /** 会话目录；缺省 ~/.devmate/sessions（每会话一个 <id>.jsonl）。 */
   sessionsDir?: string | undefined;
   /** 供应商端点；缺省 = preset.baseUrl（LlmClient 惰性连接，组装不触网）。 */
@@ -122,10 +125,13 @@ export const DEFAULT_IDLE_SHELL_TTL_MS = 600_000;
 /** 会话工具工厂输出（assembleDeps 与 E2E 测试共用；shell 每会话独立实例）。 */
 export interface SessionToolsFactory {
   /** 缺省会话的注册表（兼容单例形态；任意并发服务在有 createSessionTools 时不用它）。
-   *  懒构建：首次访问才建 __fallback__ 壳（构造即建 = 未 spawn 也计数的幽灵实例）。 */
+   *  懒构建：首次访问才建 __fallback__ 壳（构造即建 = 未 spawn 也计数的幽灵实例）。
+   *  兜底注册表恒绑定**缺省根**（资产=服务开始时的工作区根）——展示层工具面无会话态。 */
   tools: ToolRegistry;
-  /** 按会话懒建注册表：同一 sessionId 恒返回同一对象（含同一 shell 实例）；每次调用刷新 lastUsedAt。 */
-  createSessionTools(sessionId: string): ToolRegistry;
+  /** 按会话懒建注册表：同一 sessionId 恒返回同一对象（含同一 jail/shell/fs 组）；每次调用刷新 lastUsedAt。
+   *  多工作区（注入 workspaceRootOf）时按会话解析根——jail 与 shell 同源（per 会话，
+   *  S2 的 canonicalWorkspaceRoot 逻辑平移到会话级）；异步（根解析/监狱构造）。 */
+  createSessionTools(sessionId: string): Promise<ToolRegistry>;
   /** 杀掉全部会话 shell（幂等）；serve close 路径经 deps.dispose 调用。 */
   dispose(): Promise<void>;
   /** 释放单个会话的 shell 与注册表缓存（幂等）；DELETE /api/sessions/:id 联动。 */
@@ -138,14 +144,20 @@ export interface SessionToolsFactory {
 }
 
 /**
- * 会话工具面（fs 共享一组 + shell 每会话一实例 + use_skill/spawn_subagent 共享各一；
- * 返回注册表缓存工厂）。
- * 工具面共 9 个：6 文件工具 + run_command + use_skill + spawn_subagent——后两个是
- * Workflow 能力（技能懒加载 + 子代理隔离上下文），共享单例（无会话态：技能索引经
- * 晚绑定引用执行期现读、子代理池是池级单例），与 fs 工具同属「构造一次、各会话复用」。
+ * 会话工具面（多工作区 per-session 根：jail + fs 组 + shell 每会话按**解析根**构建；
+ * use_skill/spawn_subagent 共享各一——无会话态：技能索引经晚绑定引用执行期现读、
+ * 子代理池是池级单例）。
+ * 工具面共 9 个：6 文件工具 + run_command + use_skill + spawn_subagent。
+ * 根解析（workspaceRootOf 注入时）：每会话解一次（读 meta 或默认根，deps 实现按会话缓存）；
+ * 解析根经 S2 小修同源化——会话根 canonical 一次 realpath，createJail(canonical)+
+ * createPersistentShell(canonical)（字面 != canonical 时字面登记为别名根）；同一 canonical
+ * 根的多会话共享监狱与 fs 组（边界同、无会话态）。未注入 workspaceRootOf = 单根形态：
+ * 全部会话固定用 options.workspaceRoot 的既有监狱（构造期已建）——兼容回退。
  */
 export function createSessionToolsFactory(options: {
+  /** 缺省工作区根（canonical 形）；无 workspaceRootOf 注入时 = 全部会话根。 */
   workspaceRoot: string;
+  /** 缺省根的监狱（构造期一次建好；无 workspaceRootOf 时的共用监狱 + 兜底注册表）。 */
   jail: Jail;
   toolTimeoutMs?: number;
   /** 空闲 shell TTL（ms；缺省 DEFAULT_IDLE_SHELL_TTL_MS）。 */
@@ -156,90 +168,139 @@ export function createSessionToolsFactory(options: {
    * win32 宿主上经 PATH 解析 Git Bash 的 bash.exe 真跑（同 test/shell-tools 口径）。
    */
   shellPlatform?: 'posix' | 'win32';
-  /** 测试注入：与 createPersistentShell 同契约的替换工厂（真实装配不传）。 */
-  createShell?: (sessionId: string) => PersistentShell;
+  /** 测试注入：与 createPersistentShell 同契约的替换工厂（真实装配不传；收到解析后的会话根与监狱）。 */
+  createShell?: (sessionId: string, workspaceRoot: string, jail: Jail) => PersistentShell;
+  /**
+   * 会话根解析（多工作区）：返回该会话的根（读会话 meta 的 workspaceRoot，无 meta →
+   * 缺省根；deps 装配实现按会话缓存）。未注入 = 单根形态（全部会话用 options.workspaceRoot）。
+   */
+  workspaceRootOf?: (sessionId: string) => Promise<string>;
   /** 技能索引读取器（晚绑定：服务端 attach 回填前为 null → use_skill 执行期报 skill-index-unavailable）。 */
   skillsIndex?: () => SkillsIndex | null;
   /** 子代理池（池级单例；缺省 = 恒 disabled 的占位池——只保障工具面形状，真实装配必传）。 */
   subagentPool?: SubagentPool;
 }): SessionToolsFactory {
   const idleShellTtlMs = options.idleShellTtlMs ?? DEFAULT_IDLE_SHELL_TTL_MS;
-  // fs 工具共享一组：不消费 ctx（无会话态），无隔离漂移面
-  const fsTools = createFsTools({ sessionId: 'fs-shared', jail: options.jail });
   // use_skill / spawn_subagent：无会话态共享一组（索引执行期现读、池级单例——开关即时生效）
   const skillTool = createSkillTool({ index: options.skillsIndex ?? (() => null) });
   const subagentTool = createSubagentTool({ pool: options.subagentPool ?? disabledPool() });
   const shells = new Map<string, PersistentShell>();
-  const registries = new Map<string, ToolRegistry>();
+  const sessionBuilds = new Map<string, Promise<ToolRegistry>>();
+  /** 持久会话根 → 监狱 + shell 初值 cwd（canonical；多次构建共享——同一根多会话同监狱）。 */
+  const rootBuilds = new Map<string, Promise<SessionBuild>>();
   /** 会话 shell 最近使用时间（createSessionTools 与每次 execute 均刷新；空闲回收判据）。 */
   const lastUsedAt = new Map<string, number>();
   /** 在飞 execute 计数（执行中的 shell 兜底豁免：即使活跃集合未覆盖也不释放）。 */
   const executing = new Map<string, number>();
-  const createShell = (sessionId: string): PersistentShell =>
+
+  const makeShell = (sessionId: string, root: string, jail: Jail): PersistentShell =>
     options.createShell !== undefined
-      ? options.createShell(sessionId)
+      ? options.createShell(sessionId, root, jail)
       : createPersistentShell({
-          workspaceRoot: options.workspaceRoot,
-          jail: options.jail,
+          workspaceRoot: root,
+          jail,
           ...(options.toolTimeoutMs !== undefined ? { timeoutMs: options.toolTimeoutMs } : {}),
           ...(options.shellPlatform !== undefined ? { platform: options.shellPlatform } : {}),
         });
 
-  const forId = (sessionId: string): ToolRegistry => {
-    let registry = registries.get(sessionId);
-    if (registry === undefined) {
-      let shell = shells.get(sessionId);
-      if (shell === undefined) {
-        shell = createShell(sessionId);
-        shells.set(sessionId, shell);
-      }
-      const base = securedRegistry(
-        defineRegistry([...fsTools, shell.tool, skillTool, subagentTool], { sessionId }),
-      );
-      // 包装 execute：① 在飞计数（执行中的 shell 绝不空闲回收）② 每次 execute 起止刷新
-      // lastUsedAt（TTL 判据更精确——长 run 内多次工具调用不会触发误杀）
-      registry = {
-        list: () => base.list(),
-        async execute(call) {
-          executing.set(sessionId, (executing.get(sessionId) ?? 0) + 1);
-          try {
-            return await base.execute(call);
-          } finally {
-            const next = (executing.get(sessionId) ?? 1) - 1;
-            if (next <= 0) executing.delete(sessionId);
-            else executing.set(sessionId, next);
-            lastUsedAt.set(sessionId, Date.now());
-          }
-        },
-      };
-      registries.set(sessionId, registry);
+  const makeRegistry = (sessionId: string, jail: Jail, root: string): ToolRegistry => {
+    // fs 工具 per 会话（jail 构造期闭包绑定——会话根不同监狱不同，不能跨会话共享）
+    const fsTools = createFsTools({ sessionId, jail });
+    let shell = shells.get(sessionId);
+    if (shell === undefined) {
+      shell = makeShell(sessionId, root, jail);
+      shells.set(sessionId, shell);
     }
+    const base = securedRegistry(
+      defineRegistry([...fsTools, shell.tool, skillTool, subagentTool], { sessionId }),
+    );
+    // 包装 execute：① 在飞计数（执行中的 shell 绝不空闲回收）② 每次 execute 起止刷新
+    // lastUsedAt（TTL 判据更精确——长 run 内多次工具调用不会触发误杀）
+    return {
+      list: () => base.list(),
+      async execute(call) {
+        executing.set(sessionId, (executing.get(sessionId) ?? 0) + 1);
+        try {
+          return await base.execute(call);
+        } finally {
+          const next = (executing.get(sessionId) ?? 1) - 1;
+          if (next <= 0) executing.delete(sessionId);
+          else executing.set(sessionId, next);
+          lastUsedAt.set(sessionId, Date.now());
+        }
+      },
+    };
+  };
+
+  const buildForRoot = (rootLiteral: string): Promise<SessionBuild> => {
+    const cached = rootBuilds.get(rootLiteral);
+    if (cached !== undefined) return cached;
+    const built = (async (): Promise<SessionBuild> => {
+      // 缺省根（装配期已按 canonical 建过监狱）直接复用——S2 拼写一致（字面别名已登记）
+      if (rootLiteral === options.workspaceRoot) {
+        return { jail: options.jail, root: options.workspaceRoot };
+      }
+      // S2 小修的 per-session 版：canonical 一次解析，jail 与 shell 同源；字面 != canonical
+      // 时把字面登记为额外别名根（模型按调用方视角给字面路径不再「字面越界」）
+      const canonical = await realpath(rootLiteral);
+      const jail = await createJail({
+        workspaceRoot: canonical,
+        ...(rootLiteral !== canonical ? { extraRoots: [rootLiteral] } : {}),
+      });
+      return { jail, root: canonical };
+    })();
+    rootBuilds.set(rootLiteral, built);
+    return built;
+  };
+
+  const forId = (sessionId: string): Promise<ToolRegistry> => {
     // 每次使用会话工具（run 开始/继续）刷新：该会话 shell 视为活跃
     lastUsedAt.set(sessionId, Date.now());
-    return registry;
+    const existing = sessionBuilds.get(sessionId);
+    if (existing !== undefined) return existing;
+    const built = (async (): Promise<ToolRegistry> => {
+      // 会话根解析：workspaceRootOf（meta 或默认根；deps 实现按会话缓存）或缺省根——
+      // jail 与 shell 同源（解析后的会话根，非固定全局根）
+      const rootLiteral =
+        options.workspaceRootOf !== undefined
+          ? await options.workspaceRootOf(sessionId)
+          : options.workspaceRoot;
+      const { jail, root } = await buildForRoot(rootLiteral);
+      return makeRegistry(sessionId, jail, root);
+    })();
+    // 构建失败（根不可解析等）：不让失败承诺污染缓存——下次调用重建（与 execute 无关）
+    built.catch(() => {
+      if (sessionBuilds.get(sessionId) === built) sessionBuilds.delete(sessionId);
+    });
+    sessionBuilds.set(sessionId, built);
+    return built;
   };
 
   const disposeSession = async (sessionId: string): Promise<void> => {
     lastUsedAt.delete(sessionId);
+    sessionBuilds.delete(sessionId);
     const shell = shells.get(sessionId);
     if (shell === undefined) return;
     shells.delete(sessionId);
-    registries.delete(sessionId);
     await shell.dispose();
   };
 
   let fallbackRegistry: ToolRegistry | undefined;
   return {
-    // 懒构建：构造即建 __fallback__ 会留下「未 spawn 但计数」的幽灵实例（stats 启动为 0）
+    // 懒构建：构造即建 __fallback__ 会留下「未 spawn 但计数」的幽灵实例（stats 启动为 0）；
+    // 兜底注册表绑定缺省根监狱（不做 per-session 解析——展示层工具面）
     get tools(): ToolRegistry {
-      if (fallbackRegistry === undefined) fallbackRegistry = forId('__fallback__');
+      if (fallbackRegistry === undefined) {
+        fallbackRegistry = makeRegistry('__fallback__', options.jail, options.workspaceRoot);
+        lastUsedAt.set('__fallback__', Date.now());
+      }
       return fallbackRegistry;
     },
     createSessionTools: forId,
     async dispose(): Promise<void> {
       const all = [...shells.values()];
       shells.clear();
-      registries.clear();
+      sessionBuilds.clear();
       lastUsedAt.clear();
       executing.clear();
       for (const shell of all) await shell.dispose();
@@ -260,6 +321,12 @@ export function createSessionToolsFactory(options: {
     },
     activeShellCount: () => shells.size,
   };
+}
+
+/** per-根构建结果：监狱（canonical 边界，含字面别名）+ shell 初值 cwd（canonical）。 */
+interface SessionBuild {
+  jail: Jail;
+  root: string;
 }
 
 /**
@@ -842,6 +909,18 @@ function defaultSessionsDir(): string {
   return join(homedir(), '.devmate', 'sessions');
 }
 
+/** 去重保序（工作区注册表：首次出现顺序保留；重复值只留首见）。 */
+export function dedupeKeepOrder(values: readonly string[]): string[] {
+  const seen = new Set<string>();
+  const out: string[] = [];
+  for (const value of values) {
+    if (seen.has(value)) continue;
+    seen.add(value);
+    out.push(value);
+  }
+  return out;
+}
+
 /** 一次性组装（自备依赖测试全部用假；这里只装真件、零网络往返）。 */
 export async function assembleDeps(config: DevmateConfig): Promise<DevmateServerDeps> {
   // S2 小修：工作区根一致化——装配时一次 realpath 解析出 canonical 根，jail 与 shell
@@ -897,9 +976,35 @@ export async function assembleDeps(config: DevmateConfig): Promise<DevmateServer
     config: () => (workflowRef.get !== null ? workflowRef.get() : initialWorkflow),
   });
 
+  // 会话根解析（多工作区 per-session）：读会话 meta 的 workspaceRoot（session-workspace
+  // 事件）；无 meta（旧会话/未建 → 迁移）→ 缺省根（config.workspaceRoot 字面——展示层拼写
+  // 不因规范化漂移）；按会话缓存（meta 只写一次，缓存即会话生命周期语义）。
+  // workspaceRootOf 经 factory 的 per-session 构建消费：jail 与 shell 同源（S2 平移到
+  // 会话级——解析根的 canonical 一次 realpath，字面别名登记，见 createSessionToolsFactory）。
+  const sessionRootCache = new Map<string, Promise<string>>();
+  const workspaceRootOf = (sessionId: string): Promise<string> => {
+    let cached = sessionRootCache.get(sessionId);
+    if (cached === undefined) {
+      cached = (async () => {
+        try {
+          for await (const ev of store.events(sessionId)) {
+            const root = sessionWorkspaceOf(ev);
+            if (root !== null) return root;
+          }
+        } catch {
+          // 会话不存在/读取失败 → 缺省根（fail-closed：无 meta = 历史会话语义）
+        }
+        return config.workspaceRoot;
+      })();
+      sessionRootCache.set(sessionId, cached);
+    }
+    return cached;
+  };
+
   const sessionTools = createSessionToolsFactory({
     workspaceRoot: canonicalWorkspaceRoot,
     jail,
+    workspaceRootOf,
     ...(config.toolTimeoutMs !== undefined ? { toolTimeoutMs: config.toolTimeoutMs } : {}),
     ...(config.idleShellTtlMs !== undefined ? { idleShellTtlMs: config.idleShellTtlMs } : {}),
     // use_skill 索引晚绑定 + spawn_subagent 池单例（工具面共 9 个）
@@ -949,6 +1054,8 @@ export async function assembleDeps(config: DevmateConfig): Promise<DevmateServer
     store,
     // A 档：会话首建的 workspaceRoot（服务端写入 session-workspace meta；分组语义单一来源）
     workspaceRoot: config.workspaceRoot,
+    // 工作区注册表（多工作区；欠省 [默认根]；去重保序——服务端 POST/DELETE /api/workspaces 增删）
+    workspaces: dedupeKeepOrder(config.workspaces ?? [config.workspaceRoot]),
     // 懒构建（getter）：组装不预建 __fallback__ 壳；服务端实际需要时（GET /api/tools 等）才建
     get tools(): ToolRegistry {
       return sessionTools.tools;
@@ -975,8 +1082,9 @@ export async function assembleDeps(config: DevmateConfig): Promise<DevmateServer
       subagentPool.dispose();
       await sessionTools.dispose();
     },
-    // 会话删除联动：删文件 + 释放该会话 shell（幂等；rm force 容忍半途消失）
+    // 会话删除联动：删文件 + 释放该会话 shell + 清会话根缓存（幂等；rm force 容忍半途消失）
     disposeSession: async (sessionId: string): Promise<void> => {
+      sessionRootCache.delete(sessionId);
       await sessionTools.disposeSession(sessionId);
       await rm(join(sessionsDir, `${sessionId}.jsonl`), { force: true });
     },

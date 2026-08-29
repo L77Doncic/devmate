@@ -12,17 +12,22 @@
  * 发送门禁与停止按钮统一由 runActive 驱动（run-status 8 终态事件后置 false，
  * 终态表单一源 = format.js RUN_STATUS_SEMANTICS）。
  *
- * 侧边栏（S13，仅对话区 —— 工具/MCP/插件的侧栏区已删，入口只存在于设置页）：
+ * 侧边栏（S13/S14，仅对话区 —— 工具/MCP/插件的侧栏区已删，入口只存在于设置页）：
  * - 会话列表 GET /api/sessions；恢复 = GET /api/sessions/:id（协议形状 events ≤500）
  *   → **单流协调时序（与代码顺序一致）**：1) 关旧流 broker（abort）→ 2) store.reset +
  *     回放历史 → 3) 旧 run 视状态 POST /api/interrupt（backswitch，best-effort）
  *     → 4) UI 收口（选中态/列表/统计/「已恢复」toast）→ 5) ensureStream(新会话)。
  *     UI 收口必须先于 ensureStream：流长活（run 结束不关、心跳保活，仅切会话/出错才闭），
  *     await 在其后排序即把提示与刷新推迟到流关闭 —— 恢复/新建提示永不显示。
- * - 会话按 workspaceRoot 分**作者分组**（组头 = 文件夹 basename + chevron 折叠；
- *   未知项目组放尾组；归组纯逻辑 = sessions.js groupSessionsByWorkspace，可单测）。
- * - /api/sessions、/api/stats 未实现时逐项容错（列表不可用说明/占位符），
- *   端点就绪即自然点亮；无内层重试风暴（一次请求失败即降级）。
+ * - 会话按**工作区**分组（dsh WorkspaceBrowser）：组 = 注册根（ProjectRowItem 组头
+ *   34px：folder↔hover chevron + basename/meta + kebab/＋）+ SessionNodeItem 32px 行；
+ *   未注册根/无根会话 = 尾组「未知项目」（无操作菜单）；归组纯逻辑 = workspaces.js
+ *   groupSessionsByRegisteredWorkspaces（可单测）。组折叠 per-workspace 持久化。
+ * - ＋新建 = dsh WorkspacePickFlow 菜单（工作区列表 + 勾选当前 + 添加工作区…）；
+ *   目录选择弹窗 = dsh ui-directory-picker-browse 形态；移除工作区 = 确认 modal →
+ *   DELETE /api/workspaces/:root（默认根禁用项；400 回授校正默认根启发）。
+ * - /api/sessions、/api/stats、/api/workspaces 未实现时逐项容错（列表不可用说明/
+ *   占位符 + 会话根并集伪注册根 —— 组仍可见；端点就绪即自然点亮；无内层重试风暴）。
  * - 侧栏无「供应商」区块（用户裁定：协议开放任意 OpenAI 兼容端点，无需列预设）。
  * - 侧栏折叠（宽屏手动收放）：默认展开；持久化键 devdev.sidebarCollapsed 仅字面量
  *   'true' 服从（损坏/未定义 → 展开）—— 逻辑在 sidebar.js（纯函数可单测）。
@@ -114,8 +119,32 @@ import {
   normalizeSessionDetail,
   normalizeStats,
   formatStatsLine,
-  groupSessionsByWorkspace,
 } from './sessions.js';
+import {
+  WS_DEGRADED_NOTE,
+  WS_EMPTY_NOTE,
+  WS_MENU_ITEMS,
+  isAbsolutePath,
+  normalizeWorkspaceRoots,
+  dedupeKeepOrder,
+  workspaceName,
+  workspacePathMeta,
+  workspaceMenuOrder,
+  pickDefaultRoot,
+  groupSessionsByRegisteredWorkspaces,
+  workspaceOfSession,
+  createBrowseState,
+  normalizeBrowse,
+  browseNavigate,
+  browseUp,
+  browseLoaded,
+  browseSelect,
+  browseCanCommit,
+  breadcrumbSegments,
+  loadWorkspaceCollapse,
+  saveWorkspaceCollapse,
+  workspaceErrorInfo,
+} from './workspaces.js';
 import {
   statusLabel,
   statusTone,
@@ -219,6 +248,23 @@ const ui = {
   pendingDelete: null,
   confirmOpen: false,
   foldEl: null,
+  // S14：多工作区（dsh WorkspaceBrowser / WorkspacePickFlow 语义）——
+  // workspaces = 注册根（注册序）；wsDefaultRoot = 默认根（roots[0] 启发 +
+  // DELETE 400 'cannot delete the default workspace root' 回授校正）；
+  // wsCollapsed = per-workspace 折叠映射；wsLoaded = 注册表端点本会话曾成功过
+  wsLoaded: false,
+  workspaces: [],
+  wsDefaultRoot: null,
+  wsCollapsed: {},
+  wsNewMenuOpen: false,
+  wsPickerOpen: false,
+  wsPickerState: null, // 目录浏览状态机（workspaces.js 纯逻辑）
+  wsPickerBrowseFailed: false,
+  wsPickerFetchSeq: 0, // 浏览拉取序列号（乱序响应收敛：只认最新一发）
+  wsErrorOpen: false,
+  wsErrorText: '',
+  wsRemoveOpen: false,
+  wsRemoveTarget: null,
   // 设置页扩展区：Subagent 工作流偏好（source: 'server' = 与 /api/workflow 同步；
   // 'local' = 服务端不可达，降级仅本地，旁注「未同步（仅本地）」。defaults 见 extensions.js）
   subagent: { ...SUBAGENT_DEFAULTS },
@@ -257,10 +303,32 @@ const el = {
   regionArea: document.querySelector('#sidebar .regionArea'),
   treeBody: document.getElementById('tree-body'),
   sideList: document.getElementById('side-list'),
-  sideSessionList: document.getElementById('side-session-list'),
+  wsGroups: document.getElementById('ws-groups'),
   sessionsEmpty: document.getElementById('sessions-empty'),
   sessionsUnavailable: document.getElementById('sessions-unavailable'),
   rowMenu: document.getElementById('row-menu'),
+  // S14 多工作区：＋新建菜单 / 添加工作区 / 目录弹窗 / 错误对话框 / 移除确认
+  wsNewMenu: document.getElementById('ws-new-menu'),
+  btnAddWorkspace: document.getElementById('btn-add-workspace'),
+  wsPicker: document.getElementById('ws-picker'),
+  wsPickerScrim: document.getElementById('ws-picker-scrim'),
+  wsCrumbs: document.getElementById('ws-crumbs'),
+  wsDirs: document.getElementById('ws-dirs'),
+  wsManualInput: document.getElementById('ws-manual-input'),
+  btnWsPickerClose: document.getElementById('btn-ws-picker-close'),
+  btnWsPickerCancel: document.getElementById('btn-ws-picker-cancel'),
+  btnWsPickerSelect: document.getElementById('btn-ws-picker-select'),
+  wsError: document.getElementById('ws-error'),
+  wsErrorScrim: document.getElementById('ws-error-scrim'),
+  wsErrorText: document.getElementById('ws-error-text'),
+  btnWsErrorCancel: document.getElementById('btn-ws-error-cancel'),
+  btnWsErrorRetry: document.getElementById('btn-ws-error-retry'),
+  wsRemoveConfirm: document.getElementById('ws-remove-confirm'),
+  wsRemoveScrim: document.getElementById('ws-remove-scrim'),
+  wsRemoveText: document.getElementById('ws-remove-text'),
+  btnWsRemoveOk: document.getElementById('btn-ws-remove-ok'),
+  btnWsRemoveCancel: document.getElementById('btn-ws-remove-cancel'),
+  btnEmptyAddWorkspace: document.getElementById('btn-empty-add-workspace'),
   statsLine: document.getElementById('stats-line'),
   confirm: document.getElementById('confirm'),
   confirmScrim: document.getElementById('confirm-scrim'),
@@ -552,37 +620,26 @@ function wireQuietBars() {
   });
 }
 
-/** 区块折叠：组头 projectRow（dsh ProjectRowItem）点击/键盘切换 aria-expanded 级联本体。 */
-function wireSectionToggles() {
-  for (const row of document.querySelectorAll('#sidebar .projectRow')) {
-    const toggle = () => {
-      const expanded = row.getAttribute('aria-expanded') === 'true';
-      row.setAttribute('aria-expanded', String(!expanded));
-      const body = document.getElementById(row.getAttribute('aria-controls'));
-      if (body) body.hidden = expanded;
-    };
-    row.addEventListener('click', toggle);
-    row.addEventListener('keydown', (event) => {
-      if (event.key === 'Enter' || event.key === ' ') {
-        event.preventDefault();
-        toggle();
-      }
-    });
-  }
-}
-
 // ---- 行菜单（kebab → dsh Menu：纯逻辑见 menu.js；DOM 装配与开关在此） ----
 
-let menuSessionId = null; // 菜单当前指向的会话 id（删除目标）
+let menuTarget = null; // 菜单当前指向：{type:'session', sessionId} | {type:'workspace', root, disabled}
 
+/**
+ * 行菜单装配（kebab → dsh Menu）：条目表按目标类型取单一来源
+ * （会话行 = SESSION_MENU_ITEMS；工作区组头 = WS_MENU_ITEMS —— 默认根项 disabled）。
+ */
 function buildRowMenu() {
   el.rowMenu.replaceChildren();
-  for (const item of SESSION_MENU_ITEMS) {
+  const target = menuTarget;
+  const items = target?.type === 'workspace' ? WS_MENU_ITEMS : SESSION_MENU_ITEMS;
+  const source = target?.type === 'workspace' ? WS_MENU_ITEMS : SESSION_MENU_ITEMS;
+  for (const item of items) {
     const btn = document.createElement('button');
     btn.type = 'button';
     btn.className = 'rowMenuItem' + (item.danger ? ' danger' : '');
     btn.dataset.menuId = item.id;
     btn.setAttribute('role', 'menuitem');
+    btn.disabled = Boolean(target?.type === 'workspace' && target.disabled);
     const icon = document.createElementNS('http://www.w3.org/2000/svg', 'svg');
     icon.setAttribute('class', 'rowMenuItemIcon');
     icon.setAttribute('viewBox', '0 0 16 16');
@@ -601,26 +658,40 @@ function buildRowMenu() {
     label.textContent = item.label;
     btn.append(icon, label);
     btn.addEventListener('click', () => {
-      const action = menuItemById(SESSION_MENU_ITEMS, item.id);
-      // 先取目标（closeRowMenu 会清 menuSessionId —— 顺序是钉点：不得反转）
-      const sessionId = menuSessionId;
+      const action = menuItemById(source, item.id);
+      // 先取目标（closeRowMenu 会清 menuTarget —— 顺序是钉点：不得反转）
+      const sessionTarget = menuTarget;
       closeRowMenu();
       // 白名单匹配：未知 id 不落入任何 else
-      if (action?.id === 'delete' && sessionId !== null) {
-        const s = ui.sessionItems.find((candidate) => candidate.sessionId === sessionId);
+      if (action === null) return;
+      if (
+        sessionTarget?.type === 'session' &&
+        action.id === 'delete' &&
+        sessionTarget.sessionId !== null
+      ) {
+        const s = ui.sessionItems.find(
+          (candidate) => candidate.sessionId === sessionTarget.sessionId,
+        );
         if (s) requestDeleteSession(s);
+      } else if (
+        sessionTarget?.type === 'workspace' &&
+        !sessionTarget.disabled &&
+        action.id === 'remove'
+      ) {
+        requestRemoveWorkspace(sessionTarget.root);
       }
     });
     el.rowMenu.appendChild(btn);
   }
 }
 
-function openRowMenu(anchorButton, sessionId) {
-  menuSessionId = sessionId;
+function openRowMenu(anchorButton, target) {
+  menuTarget = target;
   // 行的 menuOpen 钉住 hover 显隐（dsh menuOpen 语义：菜单开着行保持 hover 面）
-  const row = anchorButton.closest('li.sessionRow');
+  const row = anchorButton.closest('li.sessionRow, .wsGroupHead');
   if (row) row.classList.add('menuOpen');
   el.rowMenu.hidden = false;
+  buildRowMenu();
   const size = { width: el.rowMenu.offsetWidth, height: el.rowMenu.offsetHeight };
   const rect = anchorButton.getBoundingClientRect();
   const sbRect = el.sidebar.getBoundingClientRect();
@@ -641,14 +712,13 @@ function openRowMenu(anchorButton, sessionId) {
 function closeRowMenu() {
   if (el.rowMenu.hidden) return;
   el.rowMenu.hidden = true;
-  menuSessionId = null;
-  for (const row of el.sidebar.querySelectorAll('li.sessionRow.menuOpen')) {
+  menuTarget = null;
+  for (const row of el.sidebar.querySelectorAll('li.sessionRow.menuOpen, .wsGroupHead.menuOpen')) {
     row.classList.remove('menuOpen');
   }
 }
 
 function wireRowMenu() {
-  buildRowMenu();
   // 外部点击关闭（菜单自身点击不关闭 —— item handler 处理；kebab 换行/关闭由其
   // 自身监听负责 —— 此处不得抢先 close，否则 openRowMenu 后立即被击穿）。
   // Escape 亦关闭。
@@ -675,7 +745,8 @@ function wireRowMenu() {
   );
 }
 
-// ---- 会话列表（行解剖 = dsh SessionNodeItem：slot 状态 / title / time / kebab） ----
+// ---- 会话列表 · 工作区组（dsh WorkspaceBrowser：注册根 → ProjectRowItem 组头 +
+//      SessionNodeItem 行；未注册根/未知会话 = 尾组；纯逻辑见 workspaces.js） ----
 
 async function refreshSessionList(silent = false) {
   let list = null;
@@ -687,7 +758,7 @@ async function refreshSessionList(silent = false) {
   if (list === null) {
     if (!ui.sessionsLoaded && !silent) {
       // 端点缺失/异常：显示不可用说明（保留既有列表不清空；静默刷新失败不打扰）
-      el.sideSessionList.replaceChildren();
+      el.wsGroups.replaceChildren();
       el.sessionsEmpty.hidden = true;
       el.sessionsUnavailable.hidden = false;
     }
@@ -698,59 +769,59 @@ async function refreshSessionList(silent = false) {
   renderSessionList(list);
 }
 
+/**
+ * 注册表端点不可达时的诚实降级：以会话自身 workspaceRoot 并集作伪注册根
+ * （组仍可见、组头照常按 basename 命名 —— 仅「移除工作区」不提供，因未注册）。
+ */
+function effectiveWorkspaceRoots() {
+  if (ui.workspaces.length > 0) return ui.workspaces;
+  return dedupeKeepOrder(
+    ui.sessionItems.map((s) => s.workspaceRoot).filter((r) => typeof r === 'string' && r !== ''),
+  );
+}
+
 function renderSessionList(list) {
   const sorted = sortSessionList(list);
   ui.sessionItems = sorted;
-  el.sideSessionList.replaceChildren();
-  el.sessionsEmpty.hidden = sorted.length > 0;
-  // 分组（组序 = 组内最新会话新→旧首现；未知项目组恒为尾组 —— sessions.js 纯逻辑）
-  const groups = groupSessionsByWorkspace(sorted);
-  for (const group of groups) {
-    el.sideSessionList.appendChild(buildSessionGroup(group));
-  }
+  const groups = groupSessionsByRegisteredWorkspaces(sorted, effectiveWorkspaceRoots());
+  el.wsGroups.replaceChildren();
+  el.sessionsEmpty.textContent = WS_EMPTY_NOTE;
+  el.sessionsEmpty.hidden = groups.length > 0;
+  for (const group of groups) el.wsGroups.appendChild(buildWorkspaceGroup(group));
 }
 
-/**
- * 组头（dsh ProjectRowItem 解剖：folder slot ↔ hover chevron 互换 + 组标题；
- * aria-expanded 级联本体 = 折叠）。点击走 sideSessionList 委托收口；
- * 键盘（Enter/Space）在组头自身监听（组头随列表重建，不挂全局 wireSectionToggles）。
- */
-function buildSessionGroup(group) {
-  const li = document.createElement('li');
-  li.className = 'sessionGroup';
+/** 当前会话所属工作区根（菜单「勾选当前」用；null = 无/未注册）。 */
+function currentSessionRoot() {
+  if (!ui.sessionId) return null;
+  const s = ui.sessionItems.find((candidate) => candidate.sessionId === ui.sessionId);
+  return s === undefined ? null : workspaceOfSession(effectiveWorkspaceRoots(), s);
+}
 
-  const head = document.createElement('div');
-  head.className = 'projectRow groupHeader';
-  head.setAttribute('role', 'button');
-  head.tabIndex = 0;
-  head.setAttribute('aria-expanded', 'true');
-  const bodyId = `group-body-${String(ui.groupSeq++)}`;
-  head.setAttribute('aria-controls', bodyId);
-  head.title = group.workspaceRoot ?? '';
+/** folder slot 对（展开/悬停互换；dsh ProjectRowItem: folder ↔ hover chevron）。 */
+function buildFolderSlot(variant, active) {
+  const slot = document.createElement('span');
+  slot.className = 'slot folder ' + variant + (active ? ' folderActive' : '');
+  slot.setAttribute('aria-hidden', 'true');
+  const svg = document.createElementNS('http://www.w3.org/2000/svg', 'svg');
+  svg.setAttribute('viewBox', '0 0 16 16');
+  svg.setAttribute('width', '16');
+  svg.setAttribute('height', '16');
+  svg.setAttribute('aria-hidden', 'true');
+  const path = document.createElementNS('http://www.w3.org/2000/svg', 'path');
+  path.setAttribute('fill', 'currentColor');
+  path.setAttribute(
+    'd',
+    variant === 'folderOpen'
+      ? 'M6.9 2.8h5.6c.9 0 1.6.7 1.6 1.6v1.8H3.2c-.5 0-1 .3-1.2.7l-.3-3.1c-.1-.6.4-1 1-1zm6.9 3.4v2.3c0 .9-.7 1.6-1.6 1.6H3.8c-.9 0-1.6-.7-1.6-1.6V6.6c0-.4.3-.8.7-.9l.3.1h9.3c.3 0 .8-.1 1.3.4z'
+      : 'M3.2 2.8h3l1.5 1.5h5c.9 0 1.6.7 1.6 1.6v5.6c0 .9-.7 1.6-1.6 1.6H3.2c-.9 0-1.6-.7-1.6-1.6V4.4c0-.9.7-1.6 1.6-1.6z',
+  );
+  svg.appendChild(path);
+  slot.appendChild(svg);
+  return slot;
+}
 
-  // folder slot 对（展开/悬停互换，与静态项目行同解剖）
-  for (const variant of ['folderOpen', 'folderClose']) {
-    const slot = document.createElement('span');
-    slot.className = `slot folder ${variant}`;
-    slot.setAttribute('aria-hidden', 'true');
-    const svg = document.createElementNS('http://www.w3.org/2000/svg', 'svg');
-    svg.setAttribute('viewBox', '0 0 16 16');
-    svg.setAttribute('width', '16');
-    svg.setAttribute('height', '16');
-    svg.setAttribute('aria-hidden', 'true');
-    const path = document.createElementNS('http://www.w3.org/2000/svg', 'path');
-    path.setAttribute('fill', 'currentColor');
-    path.setAttribute(
-      'd',
-      variant === 'folderOpen'
-        ? 'M6.9 2.8h5.6c.9 0 1.6.7 1.6 1.6v1.8H3.2c-.5 0-1 .3-1.2.7l-.3-3.1c-.1-.6.4-1 1-1zm6.9 3.4v2.3c0 .9-.7 1.6-1.6 1.6H3.8c-.9 0-1.6-.7-1.6-1.6V6.6c0-.4.3-.8.7-.9l.3.1h9.3c.3 0 .8-.1 1.3.4z'
-        : 'M3.2 2.8h3l1.5 1.5h5c.9 0 1.6.7 1.6 1.6v5.6c0 .9-.7 1.6-1.6 1.6H3.2c-.9 0-1.6-.7-1.6-1.6V4.4c0-.9.7-1.6 1.6-1.6z',
-    );
-    svg.appendChild(path);
-    slot.appendChild(svg);
-    head.appendChild(slot);
-  }
-  // chevron slot（hover 显露）
+/** chevron slot（hover 显露；arrow rotate 90° = 展开；dsh 150ms 过渡）。 */
+function buildChevronSlot() {
   const chev = document.createElement('span');
   chev.className = 'slot chevron';
   chev.setAttribute('aria-hidden', 'true');
@@ -765,7 +836,121 @@ function buildSessionGroup(group) {
   chevPath.setAttribute('d', 'M5.4 3.3l5 4.7-5 4.7z');
   chevSvg.appendChild(chevPath);
   chev.appendChild(chevSvg);
-  head.appendChild(chev);
+  return chev;
+}
+
+/** ＋ 字形（组头/菜单「添加」行；dsh IconPlusOutline16）。 */
+function plusGlyphSvg() {
+  const svg = document.createElementNS('http://www.w3.org/2000/svg', 'svg');
+  svg.setAttribute('viewBox', '0 0 16 16');
+  svg.setAttribute('aria-hidden', 'true');
+  const path = document.createElementNS('http://www.w3.org/2000/svg', 'path');
+  path.setAttribute('fill', 'none');
+  path.setAttribute('stroke', 'currentColor');
+  path.setAttribute('stroke-width', '1.3');
+  path.setAttribute('stroke-linecap', 'round');
+  path.setAttribute('d', 'M8 3.2v7.6M4.2 7h7.6');
+  svg.appendChild(path);
+  return svg;
+}
+
+/** 竖三点 kebab 字形（组头/菜单；dsh IconEllipsisOutline16 同族）。 */
+function kebabGlyphSvg() {
+  const svg = document.createElementNS('http://www.w3.org/2000/svg', 'svg');
+  svg.setAttribute('viewBox', '0 0 16 16');
+  svg.setAttribute('aria-hidden', 'true');
+  for (const cy of [3, 8, 13]) {
+    const c = document.createElementNS('http://www.w3.org/2000/svg', 'circle');
+    c.setAttribute('cx', '8');
+    c.setAttribute('cy', String(cy));
+    c.setAttribute('r', '1.3');
+    c.setAttribute('fill', 'currentColor');
+    svg.appendChild(c);
+  }
+  return svg;
+}
+
+/** 文件夹字形（16 视口；open=true 用打开态 —— 菜单/目录行通用）。 */
+function folderGlyphSvg(open) {
+  const svg = document.createElementNS('http://www.w3.org/2000/svg', 'svg');
+  svg.setAttribute('viewBox', '0 0 16 16');
+  svg.setAttribute('aria-hidden', 'true');
+  const path = document.createElementNS('http://www.w3.org/2000/svg', 'path');
+  path.setAttribute('fill', 'currentColor');
+  path.setAttribute(
+    'd',
+    open
+      ? 'M6.9 2.8h5.6c.9 0 1.6.7 1.6 1.6v1.8H3.2c-.5 0-1 .3-1.2.7l-.3-3.1c-.1-.6.4-1 1-1zm6.9 3.4v2.3c0 .9-.7 1.6-1.6 1.6H3.8c-.9 0-1.6-.7-1.6-1.6V6.6c0-.4.3-.8.7-.9l.3.1h9.3c.3 0 .8-.1 1.3.4z'
+      : 'M3.2 2.8h3l1.5 1.5h5c.9 0 1.6.7 1.6 1.6v5.6c0 .9-.7 1.6-1.6 1.6H3.2c-.9 0-1.6-.7-1.6-1.6V4.4c0-.9.7-1.6 1.6-1.6z',
+  );
+  svg.appendChild(path);
+  return svg;
+}
+
+/** 对勾字形（菜单「勾选当前工作区」；dsh Menu selected check 同族 accent）。 */
+function checkGlyphSvg() {
+  const svg = document.createElementNS('http://www.w3.org/2000/svg', 'svg');
+  svg.setAttribute('viewBox', '0 0 16 16');
+  svg.setAttribute('aria-hidden', 'true');
+  const path = document.createElementNS('http://www.w3.org/2000/svg', 'path');
+  path.setAttribute('fill', 'none');
+  path.setAttribute('stroke', 'currentColor');
+  path.setAttribute('stroke-width', '1.6');
+  path.setAttribute('stroke-linecap', 'round');
+  path.setAttribute('stroke-linejoin', 'round');
+  path.setAttribute('d', 'M3.4 8.6l3.1 3L12.6 4.8');
+  svg.appendChild(path);
+  return svg;
+}
+
+/** 「..」上级字形（目录浏览首行；dsh folder 同族 + 上箭头语义）。 */
+function upDirGlyphSvg() {
+  const svg = document.createElementNS('http://www.w3.org/2000/svg', 'svg');
+  svg.setAttribute('viewBox', '0 0 16 16');
+  svg.setAttribute('aria-hidden', 'true');
+  const path = document.createElementNS('http://www.w3.org/2000/svg', 'path');
+  path.setAttribute('fill', 'none');
+  path.setAttribute('stroke', 'currentColor');
+  path.setAttribute('stroke-width', '1.4');
+  path.setAttribute('stroke-linecap', 'round');
+  path.setAttribute('stroke-linejoin', 'round');
+  path.setAttribute('d', 'M3.2 12.8h9.6M8 3.6v6M5 6.4L8 3.4l3 3');
+  svg.appendChild(path);
+  return svg;
+}
+
+/**
+ * 工作区组（dsh WorkspaceBrowser .groupSection）：组头 = ProjectRowItem（folder slot ↔
+ * hover chevron 互换、34px、title = 根 basename + meta 小字路径）+ 会话行。
+ * - 组折叠 per-workspace（持久化 devmate.ui.wsCollapsed；默认展开）；
+ * - 组头 kebab（移除工作区；默认根禁用）+ 组内 ＋（新建会话于该组）——
+ *   仅 registered 组提供（「未知项目」无操作项 —— dsh ungrouped 语义）。
+ * 点击走 wsGroups 委托收口；键盘（Enter/Space）在组头自身监听。
+ */
+function buildWorkspaceGroup(group) {
+  const section = document.createElement('section');
+  section.className = 'groupSection wsGroup';
+  section.dataset.wsRoot = group.workspaceRoot ?? '';
+  section.setAttribute('role', 'treeitem');
+  section.setAttribute('aria-expanded', String(!ui.wsCollapsed[group.workspaceRoot ?? '']));
+
+  const rootKey = group.workspaceRoot ?? '';
+  const expanded = !ui.wsCollapsed[rootKey];
+  const head = document.createElement('div');
+  head.className = 'projectRow wsGroupHead';
+  head.dataset.wsRoot = rootKey;
+  head.setAttribute('role', 'button');
+  head.tabIndex = 0;
+  head.setAttribute('aria-expanded', String(expanded));
+  const bodyId = `ws-body-${String(ui.groupSeq++)}`;
+  head.setAttribute('aria-controls', bodyId);
+  head.title = group.workspaceRoot ?? group.label;
+
+  const active = expanded && group.registered && group.workspaceRoot === currentSessionRoot();
+  for (const variant of ['folderOpen', 'folderClose']) {
+    head.appendChild(buildFolderSlot(variant, active));
+  }
+  head.appendChild(buildChevronSlot());
 
   const text = document.createElement('span');
   text.className = 'projectText';
@@ -773,30 +958,67 @@ function buildSessionGroup(group) {
   title.className = 'title';
   title.textContent = group.label;
   text.appendChild(title);
+  if (group.workspaceRoot !== null) {
+    const meta = document.createElement('span');
+    meta.className = 'meta';
+    meta.textContent = workspacePathMeta(group.workspaceRoot, null);
+    meta.title = group.workspaceRoot;
+    text.appendChild(meta);
+  }
   head.appendChild(text);
+
+  // rowActions（dsh ProjectRowItem：kebab + 组内新建 ＋—— 仅 hover 显露）
+  if (group.registered && group.workspaceRoot !== null) {
+    const actions = document.createElement('span');
+    actions.className = 'rowActions';
+    const plus = document.createElement('button');
+    plus.type = 'button';
+    plus.className = 'rowIconButton';
+    plus.dataset.wsPlus = group.workspaceRoot;
+    plus.setAttribute('aria-label', `新建会话：${group.label}`);
+    plus.title = `新建会话：${group.label}`;
+    plus.appendChild(plusGlyphSvg());
+    const kebab = document.createElement('button');
+    kebab.type = 'button';
+    kebab.className = 'rowIconButton';
+    kebab.dataset.wsKebab = group.workspaceRoot;
+    kebab.disabled = group.workspaceRoot === ui.wsDefaultRoot;
+    kebab.setAttribute('aria-label', `工作区操作：${group.label}`);
+    kebab.title =
+      group.workspaceRoot === ui.wsDefaultRoot
+        ? '默认工作区不可移除'
+        : `工作区操作：${group.label}`;
+    kebab.appendChild(kebabGlyphSvg());
+    actions.append(plus, kebab);
+    head.appendChild(actions);
+  }
 
   const body = document.createElement('ul');
   body.className = 'rowList groupList';
   body.id = bodyId;
+  body.hidden = !expanded;
   for (const s of group.sessions) body.appendChild(buildSessionItem(s));
+  section.append(head, body);
 
   head.addEventListener('keydown', (event) => {
     if (event.key === 'Enter' || event.key === ' ') {
       event.preventDefault();
-      toggleSessionGroup(head);
+      toggleWsGroup(head);
     }
   });
-
-  li.append(head, body);
-  return li;
+  return section;
 }
 
-/** 组头折叠切换（aria-expanded 级联本体 hidden；默认全部展开）。 */
-function toggleSessionGroup(head) {
+/** 组头折叠切换（aria-expanded 级联本体 hidden；per-workspace 持久化）。 */
+function toggleWsGroup(head) {
+  const root = head.dataset.wsRoot ?? '';
   const expanded = head.getAttribute('aria-expanded') === 'true';
   head.setAttribute('aria-expanded', String(!expanded));
   const body = document.getElementById(head.getAttribute('aria-controls') ?? '');
   if (body) body.hidden = expanded;
+  // 折叠映射持久化（默认展开 = 无记录；写入即记住）—— 只写本组，不整表重放
+  ui.wsCollapsed = { ...ui.wsCollapsed, [root]: expanded };
+  saveWorkspaceCollapse(localStorage, ui.wsCollapsed);
 }
 
 /** 当前会话变化（恢复/新建/删除当前）后的选中态即时同步：缓存重渲染（不进网络）。 */
@@ -852,6 +1074,409 @@ function buildSessionItem(s) {
   actions.appendChild(kebab);
   li.append(slot, title, time, actions);
   return li;
+}
+
+// ============================================================== 多工作区（S14：dsh WorkspaceBrowser / WorkspacePickFlow）
+
+/**
+ * 注册表重读：GET /api/workspaces → 注册根 + 默认根启发（roots[0]）；
+ * 失败 → wsLoaded=false 但**保留最后已知表**（会话仍在跑时端点瞬断不捣乱）——
+ * 组渲染随 effectiveWorkspaceRoots 降级为会话根并集。成功后重渲染组。
+ */
+async function refreshWorkspaces() {
+  try {
+    const roots = normalizeWorkspaceRoots(await fetchJson('/api/workspaces'));
+    ui.workspaces = roots;
+    ui.wsDefaultRoot = pickDefaultRoot(roots);
+    ui.wsLoaded = true;
+  } catch {
+    ui.wsLoaded = false;
+  }
+  refreshSessionSelection();
+  void refreshSessionList(true);
+}
+
+// ---- ＋新建 菜单（dsh WorkspacePickFlow：锚于「＋新建」按钮 —— 工作区列表 +
+//      勾选当前 + 分隔 + 底部钉置「添加工作区…」；默认根项在下） ----
+
+/** 菜单装载（打开时重建 —— 菜单随数据变化即时一致）。 */
+function buildWsNewMenu() {
+  el.wsNewMenu.replaceChildren();
+  const loaded = ui.wsLoaded || ui.workspaces.length > 0;
+  const currentRoot = currentSessionRoot();
+  if (ui.wsLoaded && ui.workspaces.length === 0) {
+    const note = document.createElement('div');
+    note.className = 'wsMenuNote';
+    note.textContent = '暂无可用工作区：先添加一个。';
+    el.wsNewMenu.appendChild(note);
+  }
+  const items = workspaceMenuOrder(ui.workspaces, ui.wsDefaultRoot);
+  for (const root of items) {
+    const btn = document.createElement('button');
+    btn.type = 'button';
+    btn.className = 'wsMenuItem';
+    btn.dataset.wsRoot = root;
+    btn.setAttribute('role', 'menuitem');
+    const icon = document.createElement('span');
+    icon.className = 'wsMenuItemIcon';
+    icon.setAttribute('aria-hidden', 'true');
+    icon.appendChild(folderGlyphSvg(false));
+    const label = document.createElement('span');
+    label.className = 'wsMenuItemLabel';
+    label.textContent = workspaceName(root);
+    label.title = root;
+    const meta = document.createElement('span');
+    meta.className = 'wsMenuItemMeta';
+    meta.textContent = workspacePathMeta(root, null);
+    btn.append(icon, label, meta);
+    if (root === currentRoot) {
+      const check = document.createElement('span');
+      check.className = 'wsMenuItemCheck';
+      check.setAttribute('aria-hidden', 'true');
+      check.appendChild(checkGlyphSvg());
+      btn.appendChild(check);
+      btn.setAttribute('aria-checked', 'true');
+    } else {
+      btn.setAttribute('aria-checked', 'false');
+    }
+    btn.addEventListener('click', () => {
+      const targetRoot = root;
+      closeWsNewMenu();
+      void newSession(targetRoot);
+    });
+    el.wsNewMenu.appendChild(btn);
+  }
+  if (!loaded && items.length === 0) {
+    const note = document.createElement('div');
+    note.className = 'wsMenuNote';
+    note.textContent = WS_DEGRADED_NOTE + ' 新建会话将使用默认工作区。';
+    el.wsNewMenu.appendChild(note);
+  }
+  // 分隔 + 底部钉置「添加工作区…」（dsh Menu footer：恒可见的侧边选项）
+  const sep = document.createElement('div');
+  sep.className = 'wsMenuSeparator';
+  sep.setAttribute('aria-hidden', 'true');
+  const addBtn = document.createElement('button');
+  addBtn.type = 'button';
+  addBtn.className = 'wsMenuItem';
+  addBtn.dataset.wsMenuAdd = '';
+  addBtn.setAttribute('role', 'menuitem');
+  const addIcon = document.createElement('span');
+  addIcon.className = 'wsMenuItemIcon';
+  addIcon.setAttribute('aria-hidden', 'true');
+  addIcon.appendChild(plusGlyphSvg());
+  const addLabel = document.createElement('span');
+  addLabel.className = 'wsMenuItemLabel';
+  addLabel.textContent = '添加工作区…';
+  addBtn.append(addIcon, addLabel);
+  addBtn.addEventListener('click', () => {
+    closeWsNewMenu();
+    openWsPicker();
+  });
+  el.wsNewMenu.append(sep, addBtn);
+}
+
+/** 菜单开关（固定定位、视口钳制 —— dsh Menu portal 语义的本地等价；
+ *  —— 侧栏 rail 折叠态下按钮在 56px 轨上，fixed 定位逃出 overflow 剪裁）。 */
+function toggleWsNewMenu(force) {
+  const open = force !== undefined ? force : !ui.wsNewMenuOpen;
+  if (open) {
+    buildWsNewMenu();
+    el.wsNewMenu.hidden = false;
+    const size = { width: el.wsNewMenu.offsetWidth, height: el.wsNewMenu.offsetHeight };
+    const rect = el.btnNewSession.getBoundingClientRect();
+    const pos = menuPosition(
+      { left: rect.left, top: rect.top, width: rect.width, height: rect.height },
+      size,
+      { width: window.innerWidth, height: window.innerHeight },
+    );
+    el.wsNewMenu.style.left = `${pos.left}px`;
+    el.wsNewMenu.style.top = `${pos.top}px`;
+    ui.wsNewMenuOpen = true;
+  } else {
+    el.wsNewMenu.hidden = true;
+    ui.wsNewMenuOpen = false;
+  }
+}
+
+function closeWsNewMenu() {
+  toggleWsNewMenu(false);
+}
+
+/** ---- 目录选择弹窗（dsh ui-directory-picker-browse 形态） ---- */
+
+async function openWsPicker() {
+  if (ui.wsPickerOpen) return;
+  ui.wsPickerOpen = true;
+  // 状态沿用上次浏览落点（错误重试路径）：全新打开 = createBrowseState→home
+  if (ui.wsPickerState === null) ui.wsPickerState = createBrowseState('');
+  ui.wsPickerBrowseFailed = false;
+  el.wsManualInput.value = '';
+  el.wsPickerScrim.hidden = false;
+  el.wsPicker.hidden = false;
+  renderWsPicker();
+  await wsPickerFetch(null);
+  el.btnWsPickerCancel.focus();
+}
+
+function closeWsPicker() {
+  if (!ui.wsPickerOpen) return;
+  ui.wsPickerOpen = false;
+  ui.wsPickerBrowseFailed = false;
+  el.wsPicker.hidden = true;
+  el.wsPickerScrim.hidden = true;
+}
+
+/** 当前级目录拉取（path=null 时无参 = homedir；失败容错：空表 + 说明行）。
+ *  乱序收敛：序号递增，过期响应（非最新一发）丢弃 —— 快速连点/连回车不串级。 */
+async function wsPickerFetch(path) {
+  const seq = ++ui.wsPickerFetchSeq;
+  const query = typeof path === 'string' && path !== '' ? `?path=${encodeURIComponent(path)}` : '';
+  let res = null;
+  try {
+    res = normalizeBrowse(await fetchJson(`/api/workspaces/browse${query}`));
+  } catch {
+    res = null;
+  }
+  if (seq !== ui.wsPickerFetchSeq) return;
+  ui.wsPickerBrowseFailed = res === null;
+  ui.wsPickerState = browseLoaded(
+    ui.wsPickerState,
+    res ?? { base: typeof path === 'string' ? path : ui.wsPickerState.base, dirs: [] },
+  );
+  renderWsPicker();
+}
+
+/** 进级（目录行进级/面包屑）：browseNavigate 置在途 → 渲染 → 拉取新级。 */
+async function wsPickerEnter(path) {
+  const next = browseNavigate(ui.wsPickerState, path);
+  if (next === ui.wsPickerState) return;
+  ui.wsPickerState = next;
+  renderWsPicker();
+  await wsPickerFetch(path);
+}
+
+/** 回退上级（`..` 行）：browseUp 仅弹栈（根 base 不逃逸）。 */
+async function wsPickerGoUp() {
+  const next = browseUp(ui.wsPickerState);
+  if (next === ui.wsPickerState) return;
+  ui.wsPickerState = next;
+  renderWsPicker();
+  await wsPickerFetch(next.base);
+}
+
+/** 面包屑分段：略去末段（当前级）；先弹栈至目标前缀，非前缀才走进级。 */
+async function wsPickerGoBreadcrumb(path) {
+  if (path === ui.wsPickerState.base) return;
+  let state = ui.wsPickerState;
+  let guard = 0;
+  while (state.base !== path && state.stack.length > 0 && guard++ < 64) state = browseUp(state);
+  if (state.base !== path) state = browseNavigate(state, path);
+  ui.wsPickerState = state;
+  renderWsPicker();
+  await wsPickerFetch(state.base);
+}
+
+/** 选中当前级目录（行点击；selected 清空/切换由状态机裁决）。 */
+function wsPickerSelect(path) {
+  ui.wsPickerState = browseSelect(ui.wsPickerState, path);
+  renderWsPicker();
+}
+
+/** 手动路径输入（回车）：绝对路径校验 → 进入该级并**自动选中该目录**（便于直接
+ *  「选择此文件夹」）；未命中/非法 → 错误对话框兜底。 */
+async function wsPickerManualEnter() {
+  const value = el.wsManualInput.value.trim();
+  if (value === '') return;
+  if (!isAbsolutePath(value)) {
+    await openWsError('路径无效：必须是绝对目录路径。');
+    return;
+  }
+  const state = ui.wsPickerState;
+  const next = browseNavigate(state, value);
+  if (next === state) {
+    // 同路径/无变化：直接落点 base（「在此级选中即注册」）
+    ui.wsPickerState = browseSelect(state, value);
+    renderWsPicker();
+    return;
+  }
+  ui.wsPickerState = browseSelect(next, value);
+  renderWsPicker();
+  await wsPickerFetch(value);
+}
+
+function renderWsPicker() {
+  const state = ui.wsPickerState;
+  // 路径条（面包屑：分段可点，末段当前级不可点）
+  el.wsCrumbs.replaceChildren();
+  const crumbs = breadcrumbSegments(state.base);
+  crumbs.forEach((segment, index) => {
+    const btn = document.createElement('button');
+    btn.type = 'button';
+    btn.className = 'ws-crumb' + (index === 0 ? ' root' : '');
+    btn.textContent = segment.name;
+    btn.title = segment.path;
+    if (index === crumbs.length - 1) {
+      btn.disabled = true;
+      btn.classList.add('current');
+      btn.setAttribute('aria-current', 'location');
+      btn.style.cursor = 'default';
+    } else {
+      btn.addEventListener('click', () => {
+        void wsPickerGoBreadcrumb(segment.path);
+      });
+    }
+    el.wsCrumbs.appendChild(btn);
+  });
+  if (crumbs.length === 0) el.wsCrumbs.textContent = '（路径不可用）';
+
+  // 目录行（`..` 恒首行；行点击选中，双击/回车进级）
+  el.wsDirs.replaceChildren();
+  if (state.stack.length > 0) {
+    const up = document.createElement('li');
+    up.className = 'ws-picker-dir up';
+    up.tabIndex = 0;
+    up.setAttribute('role', 'button');
+    const icon = document.createElement('span');
+    icon.className = 'ws-dirIcon';
+    icon.setAttribute('aria-hidden', 'true');
+    icon.appendChild(upDirGlyphSvg());
+    const name = document.createElement('span');
+    name.className = 'ws-dirName';
+    name.textContent = '..';
+    up.append(icon, name);
+    up.addEventListener('click', () => {
+      void wsPickerGoUp();
+    });
+    up.addEventListener('keydown', (event) => {
+      if (event.key === 'Enter') {
+        event.preventDefault();
+        void wsPickerGoUp();
+      }
+    });
+    el.wsDirs.appendChild(up);
+  }
+  for (const dir of state.dirs) {
+    const li = document.createElement('li');
+    li.className = 'ws-picker-dir' + (state.selected === dir.path ? ' selected' : '');
+    li.dataset.dirPath = dir.path;
+    li.tabIndex = 0;
+    li.setAttribute('role', 'button');
+    const icon = document.createElement('span');
+    icon.className = 'ws-dirIcon';
+    icon.setAttribute('aria-hidden', 'true');
+    icon.appendChild(folderGlyphSvg(false));
+    const name = document.createElement('span');
+    name.className = 'ws-dirName';
+    name.textContent = dir.name;
+    name.title = dir.path;
+    li.append(icon, name);
+    li.addEventListener('click', () => {
+      wsPickerSelect(dir.path);
+    });
+    li.addEventListener('dblclick', () => {
+      void wsPickerEnter(dir.path);
+    });
+    li.addEventListener('keydown', (event) => {
+      if (event.key === 'Enter') {
+        event.preventDefault();
+        void wsPickerEnter(dir.path);
+      }
+    });
+    el.wsDirs.appendChild(li);
+  }
+  if (state.dirs.length === 0 && state.stack.length === 0 && ui.wsPickerBrowseFailed) {
+    const note = document.createElement('li');
+    note.className = 'ws-picker-empty';
+    note.textContent = WS_DEGRADED_NOTE + ' 可在下方手动输入路径。';
+    el.wsDirs.appendChild(note);
+  } else if (state.dirs.length === 0) {
+    const note = document.createElement('li');
+    note.className = 'ws-picker-empty';
+    note.textContent = '（此目录下没有子目录）';
+    el.wsDirs.appendChild(note);
+  }
+  el.btnWsPickerSelect.disabled = !browseCanCommit(state);
+}
+
+/** 「选择此文件夹」：选中目录 → POST 注册；错误 → dsh folderError 对话框（重试重开）。 */
+async function wsPickerCommit() {
+  const path = ui.wsPickerState?.selected;
+  if (typeof path !== 'string' || path === '') return;
+  el.btnWsPickerSelect.disabled = true;
+  try {
+    await fetchJson('/api/workspaces', { method: 'POST', body: { path } });
+    toast(`已添加工作区「${workspaceName(path)}」`);
+    closeWsPicker();
+    ui.wsPickerState = null; // 下次打开回 homedir
+    await refreshWorkspaces();
+  } catch (err) {
+    el.btnWsPickerSelect.disabled = false;
+    await openWsError(workspaceErrorInfo(err).text);
+  }
+}
+
+/** 错误对话框（dsh folderError：标题 + 文案 + 取消/重试 —— 重试重开目录弹窗）。 */
+async function openWsError(text) {
+  ui.wsErrorOpen = true;
+  ui.wsErrorText = text;
+  el.wsErrorText.textContent = text;
+  el.wsErrorScrim.hidden = false;
+  el.wsError.hidden = false;
+  el.btnWsErrorRetry.focus();
+}
+
+function closeWsError() {
+  if (!ui.wsErrorOpen) return;
+  ui.wsErrorOpen = false;
+  el.wsError.hidden = true;
+  el.wsErrorScrim.hidden = true;
+}
+
+function retryWsError() {
+  closeWsError();
+  closeWsPicker();
+  void openWsPicker(); // 保持上次浏览落点（state 未清 —— 错误后直接在原级重试）
+}
+
+/** ---- 移除工作区（kebab 菜单 → 确认 modal → DELETE；删除失败 400 回授默认根标记） ---- */
+
+function requestRemoveWorkspace(root) {
+  if (ui.wsRemoveOpen) return;
+  ui.wsRemoveTarget = root;
+  ui.wsRemoveOpen = true;
+  el.wsRemoveText.textContent = `确认移除工作区「${workspaceName(root)}」？其下会话保留（归入「未知项目」）。`;
+  el.wsRemoveScrim.hidden = false;
+  el.wsRemoveConfirm.hidden = false;
+  el.btnWsRemoveOk.focus();
+}
+
+function closeWsRemove() {
+  ui.wsRemoveOpen = false;
+  ui.wsRemoveTarget = null;
+  el.wsRemoveConfirm.hidden = true;
+  el.wsRemoveScrim.hidden = true;
+}
+
+async function confirmRemoveWorkspace() {
+  const root = ui.wsRemoveTarget;
+  closeWsRemove();
+  if (!root) return;
+  try {
+    await fetchJson(`/api/workspaces/${encodeURIComponent(root)}`, { method: 'DELETE' });
+    toast(`已移除工作区「${workspaceName(root)}」`);
+  } catch (err) {
+    const info = workspaceErrorInfo(err);
+    if (info.kind === 'default-root') {
+      // 回授校正：DELETE 400 即该根为默认根（客户端启发错位 → 学会并即时禁用）
+      ui.wsDefaultRoot = root;
+      toast(info.text, 'warn');
+      refreshSessionSelection();
+    } else {
+      toast(`移除失败：${info.text}`, 'warn');
+    }
+  }
+  void refreshWorkspaces();
 }
 
 // ---- 底部统计（/api/stats，纯展示；随 run-status 终态刷新） ----
@@ -934,16 +1559,29 @@ async function restoreSession(id) {
   await ensureStream(id);
 }
 
-/** ＋新建：POST /api/sessions（未实现时回退「首条消息创建」）。 */
-async function newSession() {
+/**
+ * ＋新建：POST /api/sessions（未实现时回退「首条消息创建」）。
+ * @param {string|null} workspaceRoot 目标工作区根（来自 ＋新建菜单/组头 ＋；
+ *   null = 服务端默认根）。未注册 → 400 workspace-not-registered（容错映射 + 重读注册表）。
+ */
+async function newSession(workspaceRoot = null) {
   let id = null;
   let created = false;
   try {
-    const res = await fetchJson('/api/sessions', { method: 'POST', body: {} });
+    const res = await fetchJson('/api/sessions', {
+      method: 'POST',
+      // 显式传 null 也省略键：不带 workspaceRoot = 服务端默认根
+      ...{ body: workspaceRoot ? { workspaceRoot } : {} },
+    });
     id = res?.sessionId ?? null;
     created = Boolean(id);
-  } catch {
-    // 服务端未实现预建端点：本地进入全新视图，首条消息经 /api/chat 建会话
+  } catch (err) {
+    // 服务端未实现预建端点：本地进入全新视图，首条消息经 /api/chat 建会话；
+    // 已实现但工作区未注册（表已漂移）→ 提示 + 重读注册表（下轮再试）
+    if (workspaceRoot !== null && workspaceErrorInfo(err).kind === 'not-registered') {
+      toast(workspaceErrorInfo(err).text, 'warn');
+      await refreshWorkspaces();
+    }
   }
   const previousSessionId = ui.sessionId;
   const previousRunActive = store.snapshot().runActive;
@@ -3173,6 +3811,23 @@ function wireEvents() {
         void decideBannerApproval(false);
         return;
       }
+      // S14 多工作区层叠（modal 优先于菜单）：移除确认 → 错误对话框 → 目录弹窗 → ＋新建菜单
+      if (ui.wsRemoveOpen) {
+        closeWsRemove();
+        return;
+      }
+      if (ui.wsErrorOpen) {
+        closeWsError();
+        return;
+      }
+      if (ui.wsPickerOpen) {
+        closeWsPicker();
+        return;
+      }
+      if (ui.wsNewMenuOpen) {
+        closeWsNewMenu();
+        return;
+      }
       if (ui.confirmOpen) {
         closeConfirmModal();
         return;
@@ -3235,33 +3890,93 @@ function wireEvents() {
     }
   });
 
-  // S13：侧边栏（dsh 语义：toggle/品牌/新建 = 侧栏内；行点击/删除 = 委托收口）
+  // S13/S14：侧边栏（dsh 语义：toggle/品牌/新建 = 侧栏内；行点击/删除/组折叠 = 委托收口）
   el.btnSidebarToggle.addEventListener('click', toggleSidebar);
   el.btnBrand.addEventListener('click', () => {
     void newSession();
   });
+  // ＋新建（dsh WorkspacePickFlow）：锚于按钮的菜单 —— 工作区列表 + 添加工作区…
   el.btnNewSession.addEventListener('click', () => {
-    void newSession();
+    toggleWsNewMenu();
   });
-  // 会话行：点击行 = 恢复；kebab = 行菜单（删除）；组头 = 折叠切换；委托单点收口
-  el.sideSessionList.addEventListener('click', (event) => {
-    const kebab = event.target.closest('[data-kebab]');
+  // 工作区组列表（#ws-groups 单点委托）：会话行点击 = 恢复；组头 = 折叠切换；
+  // 组内 ＋ = 新建会话于该组；组头 kebab = 行菜单（移除工作区）
+  el.wsGroups.addEventListener('click', (event) => {
+    const kebab = event.target.closest('[data-ws-kebab]');
     if (kebab) {
       event.stopPropagation();
-      const row = kebab.closest('li.sessionRow');
-      if (row && el.rowMenu.hidden) openRowMenu(kebab, row.dataset.sessionId ?? null);
-      else closeRowMenu();
+      const root = kebab.dataset.wsKebab ?? '';
+      if (!root) return;
+      if (el.rowMenu.hidden) {
+        openRowMenu(kebab, {
+          type: 'workspace',
+          root,
+          disabled: root === ui.wsDefaultRoot,
+        });
+      } else {
+        closeRowMenu();
+      }
       return;
     }
-    const groupHeader = event.target.closest('.groupHeader');
+    const plus = event.target.closest('[data-ws-plus]');
+    if (plus) {
+      event.stopPropagation();
+      const root = plus.dataset.wsPlus ?? '';
+      if (root) void newSession(root);
+      return;
+    }
+    const groupHeader = event.target.closest('.wsGroupHead');
     if (groupHeader) {
-      toggleSessionGroup(groupHeader);
+      toggleWsGroup(groupHeader);
       return;
     }
     const row = event.target.closest('li.sessionRow');
     if (row?.dataset.sessionId) void restoreSession(row.dataset.sessionId);
   });
   wireRowMenu();
+  // ＋新建 菜单外点关闭（菜单自身点击由 item handler 负责 —— 不得抢先关）
+  document.addEventListener('click', (event) => {
+    if (!ui.wsNewMenuOpen) return;
+    if (event.target instanceof Node && el.wsNewMenu.contains(event.target)) return;
+    if (event.target instanceof Element && event.target.closest('#btn-new-session')) return;
+    closeWsNewMenu();
+  });
+  // 添加工作区（区块头 ＋ / 空态按钮）：直达目录弹窗
+  el.btnAddWorkspace.addEventListener('click', () => {
+    void openWsPicker();
+  });
+  el.btnEmptyAddWorkspace.addEventListener('click', () => {
+    void openWsPicker();
+  });
+  // 目录选择弹窗（browse 形态）：面包屑/目录行/手动输入/取消/选择 全部这里挂
+  el.btnWsPickerClose.addEventListener('click', closeWsPicker);
+  el.btnWsPickerCancel.addEventListener('click', closeWsPicker);
+  el.wsPickerScrim.addEventListener('click', closeWsPicker);
+  el.btnWsPickerSelect.addEventListener('click', () => {
+    void wsPickerCommit();
+  });
+  el.wsManualInput.addEventListener('input', () => {
+    // 手动输入即视为落点候选：与当前 selected 共存（回车最终裁决）
+    if (el.wsManualInput.value.trim() === '') return;
+    ui.wsPickerState = browseSelect(ui.wsPickerState, el.wsManualInput.value.trim());
+    renderWsPicker();
+  });
+  el.wsManualInput.addEventListener('keydown', (event) => {
+    if (event.key === 'Enter' && !event.isComposing) {
+      event.preventDefault();
+      void wsPickerManualEnter();
+    }
+  });
+  // 添加工作区错误对话框（dsh folderError：取消/重试）
+  el.btnWsErrorCancel.addEventListener('click', closeWsError);
+  el.wsErrorScrim.addEventListener('click', closeWsError);
+  el.btnWsErrorRetry.addEventListener('click', retryWsError);
+  // 移除工作区确认
+  el.btnWsRemoveOk.addEventListener('click', () => {
+    void confirmRemoveWorkspace();
+  });
+  el.btnWsRemoveCancel.addEventListener('click', closeWsRemove);
+  el.wsRemoveScrim.addEventListener('click', closeWsRemove);
   el.btnConfirmOk.addEventListener('click', () => {
     void confirmDeleteSession();
   });
@@ -3311,7 +4026,6 @@ function wireEvents() {
   el.input.addEventListener('blur', () => {
     window.setTimeout(hideCommandMenu, 120);
   });
-  wireSectionToggles();
   wireQuietBars();
   wireTheme();
 
@@ -3381,8 +4095,11 @@ async function boot() {
     void ensureStream(ui.sessionId);
   }
 
-  // 侧栏数据（会话/统计）：端点未实现时各自降级（列表不可用说明/占位符）；
-  // 工具清单与 MCP 只存在于设置页（settings 扩展区），启动不预载侧栏区
+  // S14：per-workspace 折叠映射（损坏/缺失 → 全展开；读写容错见 workspaces.js）
+  ui.wsCollapsed = loadWorkspaceCollapse(localStorage);
+  // 侧栏数据（会话/工作区/统计）：端点未实现时各自降级（列表不可用说明/说明行 +
+  // 会话根并集伪注册根 —— 组仍可见；工具清单与 MCP 只存在于设置页）
+  void refreshWorkspaces();
   void refreshSessionList();
   void refreshStats();
 

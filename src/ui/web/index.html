@@ -98,67 +98,51 @@
             <span class="newSessionLabel wide">新建</span>
           </button>
 
-          <!-- 浏览区（dsh regionArea：仅「对话」区 —— 会话按项目文件夹分组；
+          <!-- 浏览区（dsh WorkspaceBrowser：仅「对话」区 —— 会话按**工作区**分组；
                工具/MCP/插件区已删（入口在设置）；rail 态为空座位）
-               .list 是唯一滚动区：stable 8px 滚动条 + 底部 24px 渐隐遮罩 -->
+               结构 = dsh sectionHeader（label + 尾随加号）+ .list 滚动区
+               （工作区组：ProjectRowItem 34px 组头 + SessionNodeItem 32px 行） -->
           <div class="regionArea">
             <div class="treeBody wide" id="tree-body">
-              <div class="list" id="side-list">
-                <!-- 对话：条目实际是**会话（Session）**——点击恢复的是会话
-                     （GET /api/sessions/:id），非「对话」视图（术语见 CONTEXT.md）；
-                     组头（组内渲染）按 workspaceRoot 分作者分组（app.js 装配） -->
-                <section class="groupSection" id="sec-sessions">
-                  <div
-                    class="projectRow"
-                    id="row-sessions"
-                    role="button"
-                    tabindex="0"
-                    aria-expanded="true"
-                    aria-controls="body-sessions"
+              <div class="sectionHeader wide" id="ws-header">
+                <span class="sectionLabel" id="ws-section-label">对话</span>
+                <div class="headerActions" id="ws-header-actions">
+                  <!-- 添加工作区（dsh IconProjectAddOutline16 28px 圆钮）：直达目录弹窗 -->
+                  <button
+                    class="iconButton"
+                    id="btn-add-workspace"
+                    type="button"
+                    aria-label="添加工作区"
+                    title="添加工作区"
                   >
-                    <span class="slot folder folderOpen" aria-hidden="true">
-                      <svg viewBox="0 0 16 16" width="16" height="16" aria-hidden="true">
-                        <path
-                          fill="currentColor"
-                          d="M6.9 2.8h5.6c.9 0 1.6.7 1.6 1.6v1.8H3.2c-.5 0-1 .3-1.2.7l-.3-3.1c-.1-.6.4-1 1-1zm6.9 3.4v2.3c0 .9-.7 1.6-1.6 1.6H3.8c-.9 0-1.6-.7-1.6-1.6V6.6c0-.4.3-.8.7-.9l.3.1h9.3c.3 0 .8-.1 1.3.4z"
-                        />
-                      </svg>
-                    </span>
-                    <span class="slot folder folderClose" aria-hidden="true">
-                      <svg viewBox="0 0 16 16" width="16" height="16" aria-hidden="true">
-                        <path
-                          fill="currentColor"
-                          d="M3.2 2.8h3l1.5 1.5h5c.9 0 1.6.7 1.6 1.6v5.6c0 .9-.7 1.6-1.6 1.6H3.2c-.9 0-1.6-.7-1.6-1.6V4.4c0-.9.7-1.6 1.6-1.6z"
-                        />
-                      </svg>
-                    </span>
-                    <span class="slot chevron" aria-hidden="true">
-                      <svg
-                        class="arrow"
-                        viewBox="0 0 14 14"
-                        width="14"
-                        height="14"
-                        aria-hidden="true"
-                      >
-                        <path fill="currentColor" d="M5.4 3.3l5 4.7-5 4.7z" />
-                      </svg>
-                    </span>
-                    <span class="projectText"><span class="title">对话</span></span>
+                    <svg viewBox="0 0 16 16" aria-hidden="true">
+                      <path
+                        fill="none"
+                        stroke="currentColor"
+                        stroke-width="1.3"
+                        stroke-linecap="round"
+                        stroke-linejoin="round"
+                        d="M8 3.2v3M8 6.2h3M8 6.2v3M3 6.4h1.4M1.6 6.4H3M12.8 6.4h1.4M8 12.8v1.4M6.5 11.2h3M3.4 10.6v.9a1.4 1.4 0 0 0 1.4 1.4h6.4a1.4 1.4 0 0 0 1.4-1.4v-.9"
+                      />
+                    </svg>
+                  </button>
+                </div>
+              </div>
+              <div class="list" id="side-list">
+                <!-- 工作区组（全部由 app.js 装配：注册根 → 组头 + 会话行；未注册/
+                     未知根会话 = 尾组「未知项目」）。#ws-groups 恒为骨架/降级/重渲染
+                     的收口容器（侧栏本体永不因此隐藏） -->
+                <div id="ws-groups">
+                  <ul class="rowList" id="side-session-list" aria-hidden="true">
+                    <li class="side-skeleton" aria-hidden="true"></li>
+                    <li class="side-skeleton" aria-hidden="true"></li>
+                    <li class="side-skeleton" aria-hidden="true"></li>
+                  </ul>
+                  <div class="empty" id="sessions-empty" hidden>暂无会话，点新建开始</div>
+                  <div class="empty" id="sessions-unavailable" hidden>
+                    会话列表暂不可用。稍后重试或检查服务状态。
                   </div>
-                  <div id="body-sessions">
-                    <ul class="rowList" id="side-session-list">
-                      <!-- 骨架占位：服务端数据未到前的定高条（防侧栏内容跳动；数据/降级
-                           说明到达即被 replaceChildren 替换 —— 侧栏本体永不因此隐藏） -->
-                      <li class="side-skeleton" aria-hidden="true"></li>
-                      <li class="side-skeleton" aria-hidden="true"></li>
-                      <li class="side-skeleton" aria-hidden="true"></li>
-                    </ul>
-                    <div class="empty" id="sessions-empty" hidden>暂无会话，点新建开始</div>
-                    <div class="empty" id="sessions-unavailable" hidden>
-                      会话列表暂不可用。稍后重试或检查服务状态。
-                    </div>
-                  </div>
-                </section>
+                </div>
               </div>
               <span class="fade"></span>
             </div>
@@ -186,8 +170,14 @@
           </footer>
 
           <!-- 行菜单（kebab → dsh Menu 语义本地形态：侧栏内绝对定位浮层；
-               定位计算 = menu.js 纯函数 menuPosition；portal 语义 = 逃出 .list 剪裁 -->
+               定位计算 = menu.js 纯函数 menuPosition；portal 语义 = 逃出 .list 剪裁；
+               按目标类型装配：会话行 = 删除会话；工作区组头 = 移除工作区 -->
           <div class="rowMenu" id="row-menu" hidden role="menu" aria-label="会话操作"></div>
+
+          <!-- ＋新建 菜单（dsh WorkspacePickFlow 形态：锚于「＋新建」按钮的浮层菜单；
+               工作区列表（friendly basename + 勾选当前工作区）+ 分隔 + 底部钉置
+               「添加工作区…」（侧边选项，图标行）。菜单项由 app.js 按注册表装配 -->
+          <div class="wsMenu" id="ws-new-menu" hidden role="menu" aria-label="新建会话"></div>
         </aside>
       </div>
 
@@ -228,6 +218,22 @@
               <p class="empty-sub">
                 一个认真讨论后在你机器上执行命令的编程智能体。<br />它做的每一步都看得到、都拦得住、都可追溯。
               </p>
+              <!-- dsh 空态「添加/选择工作区」快捷入口（dsh EmptyHero 语义：
+                   空白的会话 → 建议先选工作区；按钮 = 打开目录选择弹窗）
+                   —— 主区三步卡格式为 DevMate 本地保留差异（见 README-UI） -->
+              <button
+                class="btn btn-outline hero-add-workspace"
+                id="btn-empty-add-workspace"
+                type="button"
+              >
+                <svg viewBox="0 0 16 16" aria-hidden="true">
+                  <path
+                    fill="currentColor"
+                    d="M3.2 2.8h3l1.5 1.5h5c.9 0 1.6.7 1.6 1.6v5.6c0 .9-.7 1.6-1.6 1.6H3.2c-.9 0-1.6-.7-1.6-1.6V4.4c0-.9.7-1.6 1.6-1.6z"
+                  />
+                </svg>
+                <span>选择工作区…</span>
+              </button>
             </div>
             <ol class="steps">
               <li class="step" id="step-1">
@@ -482,6 +488,89 @@
       <div class="approval-actions">
         <button class="btn btn-outline" id="btn-risk-cancel" type="button">取消</button>
         <button class="btn btn-danger" id="btn-risk-ok" type="button">确认</button>
+      </div>
+    </section>
+
+    <!-- ============ 移除工作区确认（dsh delete.workspace 确认 modal 视觉） ============ -->
+    <div class="scrim" id="ws-remove-scrim" hidden></div>
+    <section
+      class="confirm"
+      id="ws-remove-confirm"
+      hidden
+      role="alertdialog"
+      aria-modal="true"
+      aria-labelledby="ws-remove-title"
+    >
+      <h2 id="ws-remove-title">移除工作区</h2>
+      <p id="ws-remove-text">确认移除此工作区？其下会话保留（归入「未知项目」）。</p>
+      <div class="approval-actions">
+        <button class="btn btn-outline" id="btn-ws-remove-cancel" type="button">取消</button>
+        <button class="btn btn-danger" id="btn-ws-remove-ok" type="button">移除工作区</button>
+      </div>
+    </section>
+
+    <!-- ============ 目录选择弹窗（dsh ui-directory-picker-browse 形态） ============ -->
+    <div class="scrim" id="ws-picker-scrim" hidden></div>
+    <section
+      class="ws-picker"
+      id="ws-picker"
+      hidden
+      role="dialog"
+      aria-modal="true"
+      aria-labelledby="ws-picker-title"
+    >
+      <!-- dsh dialog 页头：标题左、关闭 X 右 -->
+      <header class="ws-picker-head">
+        <h2 id="ws-picker-title">选择工作区目录</h2>
+        <button class="btn btn-icon" id="btn-ws-picker-close" type="button" aria-label="关闭">
+          <svg viewBox="0 0 16 16" aria-hidden="true">
+            <path fill="none" stroke="currentColor" stroke-width="1.6" d="M4 4l8 8M12 4l-8 8" />
+          </svg>
+        </button>
+      </header>
+      <div class="ws-picker-body">
+        <!-- 当前路径条（面包屑；点击分段回退/进级 —— 同 dsh browse 的路径可点分段） -->
+        <div class="ws-picker-crumbs" id="ws-crumbs" title="当前路径"></div>
+        <!-- 目录行列表（首行恒 `..` —— 回退上级；行点击 = 选中，回车/双击 = 进级） -->
+        <ul class="ws-picker-dirs" id="ws-dirs"></ul>
+        <!-- 手动路径输入兜底（回车校验并落点；绝对路径判定与注册校验走错误对话框） -->
+        <div class="ws-picker-manual">
+          <input
+            class="input mono"
+            id="ws-manual-input"
+            type="text"
+            placeholder="或输入绝对路径，回车校验"
+            autocomplete="off"
+            autocapitalize="off"
+            spellcheck="false"
+            aria-label="手动路径输入"
+          />
+        </div>
+      </div>
+      <footer class="ws-picker-foot">
+        <button class="btn btn-outline" id="btn-ws-picker-cancel" type="button">取消</button>
+        <button class="btn btn-primary" id="btn-ws-picker-select" type="button" disabled>
+          选择此文件夹
+        </button>
+      </footer>
+    </section>
+
+    <!-- ============ 添加工作区错误对话框（dsh folderError / WorkspacePicker 错误 modal：
+         标题 + 错误文案 + 取消/重试 —— 重试 = 重新打开目录弹窗） ============ -->
+    <div class="scrim" id="ws-error-scrim" hidden></div>
+    <section
+      class="confirm"
+      id="ws-error"
+      hidden
+      role="alertdialog"
+      aria-modal="true"
+      aria-labelledby="ws-error-title"
+    >
+      <h2 id="ws-error-title">添加工作区失败</h2>
+      <p class="ws-error-text" id="ws-error-text"></p>
+      <div class="approval-actions">
+        <button class="btn btn-outline" id="btn-ws-error-cancel" type="button">取消</button>
+        <button class="btn btn-primary" id="btn-ws-error-retry" type="button">重试</button>
       </div>
     </section>
 

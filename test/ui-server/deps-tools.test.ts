@@ -66,9 +66,7 @@ describe('ui/server/deps-tools：技能/子代理接线', () => {
       sessionsDir: join(dir, 's'),
       model: 'm',
     });
-    const names = deps.createSessionTools!('d1')
-      .list()
-      .map((def) => def.name);
+    const names = (await deps.createSessionTools!('d1')).list().map((def) => def.name);
     expect(names).toEqual([...FS_TOOLS, 'run_command', 'use_skill', 'spawn_subagent']);
     await deps.dispose?.();
   });
@@ -114,7 +112,7 @@ describe('ui/server/deps-tools：技能/子代理接线', () => {
     });
 
     // 组装：composeRunTools 每次现装（base 9 + mcp 2；disabled 服务器不产生工具）
-    const base = deps.createSessionTools!('d5');
+    const base = await deps.createSessionTools!('d5');
     expect(base.list().map((d) => d.name)).toEqual([
       ...FS_TOOLS,
       'run_command',
@@ -168,8 +166,9 @@ describe('ui/server/deps-tools：技能/子代理接线', () => {
         throw new Error('spawn failed');
       },
     });
-    const badMerged = await bad.composeRunTools!(bad.createSessionTools!('b1'), 'b1');
-    expect(badMerged).toBe(bad.createSessionTools!('b1')); // 0 工具 → base 原样（不包层）
+    const badBase = await bad.createSessionTools!('b1');
+    const badMerged = await bad.composeRunTools!(badBase, 'b1');
+    expect(badMerged).toBe(badBase); // 0 工具 → base 原样（不包层）
     expect(bad.mcpToolCount!()).toBe(0);
 
     // 关闭：launcher dispose 关闭已连客户端（进程无残留——假客户端 close 计数）
@@ -192,7 +191,7 @@ describe('ui/server/deps-tools：技能/子代理接线', () => {
     const { base, server } = await startServer(deps, 0);
     servers.push(server);
 
-    const registry = deps.createSessionTools!('s-k');
+    const registry = await deps.createSessionTools!('s-k');
     // 成功加载（索引由服务端扫描——工具未自己扫描）
     const okR = await registry.execute({
       id: 'c1',
@@ -246,7 +245,7 @@ describe('ui/server/deps-tools：技能/子代理接线', () => {
     await postJson(base, '/api/workflow', { subagentsEnabled: false });
     prompt = await deps.composeSystemPrompt!();
     expect(prompt).not.toContain('## 子代理');
-    const registry = deps.createSessionTools!('s-w');
+    const registry = await deps.createSessionTools!('s-w');
     const spawnR = await registry.execute({
       id: 'c1',
       name: 'spawn_subagent',

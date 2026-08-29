@@ -68,9 +68,9 @@ describe('ui/server/deps：assembleDeps 一次组装', () => {
     expect(deps.dispose).toBeTypeOf('function');
     expect(deps.createLlm).toBeTypeOf('function');
     expect(deps.createSummarizer).toBeTypeOf('function');
-    const s1a = deps.createSessionTools!('s1');
-    const s1b = deps.createSessionTools!('s1');
-    const s2 = deps.createSessionTools!('s2');
+    const s1a = await deps.createSessionTools!('s1');
+    const s1b = await deps.createSessionTools!('s1');
+    const s2 = await deps.createSessionTools!('s2');
     expect(s1a).toBe(s1b);
     expect(s2).not.toBe(s1a);
     expect(s1a.list().map((d) => d.name)).toEqual(
@@ -136,7 +136,7 @@ describe('ui/server/deps：assembleDeps 一次组装', () => {
     expect(rss).toBeGreaterThan(0);
     expect(deps.disposeAllIdle).toBeTypeOf('function');
 
-    const s1 = deps.createSessionTools!('s1'); // 建 shell（真实进程懒建）
+    const s1 = await deps.createSessionTools!('s1'); // 建 shell（真实进程懒建）
     expect(deps.activeShellCount!()).toBe(1);
     await deps.disposeAllIdle!(new Set(['s1'])); // 活跃集合覆盖 → 跳过
     expect(deps.activeShellCount!()).toBe(1);
@@ -159,7 +159,7 @@ describe('ui/server/deps：assembleDeps 一次组装', () => {
     await symlink(real, link);
     const deps = await assembleDeps({ workspaceRoot: link, model: 'm' });
     try {
-      const registry = deps.createSessionTools!('s-s2');
+      const registry = await deps.createSessionTools!('s-s2');
       // read_file：路径用软链字面拼写（调用方视角）——jail 以 canonical 为边界，
       // 软链字面端经 realpath 落点仍在边界内 → 放行且内容可见
       const read = await registry.execute({

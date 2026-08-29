@@ -28,6 +28,8 @@ interface AttachedDeps {
   saveMcpConfig: (
     servers: Array<{ name: string; command: string; args: string[]; enabled: boolean }>,
   ) => void;
+  saveWorkspaces: (roots: string[]) => void;
+  workspaces: string[];
   workflow: { subagentsEnabled: boolean; maxParallel: number };
   skillsRecord: Record<string, boolean>;
   mcpServers: Array<{ name: string; command: string; args: string[]; enabled: boolean }>;
@@ -102,15 +104,38 @@ describe('runWeb attach 模式：三节初值缺省（首次无配置）', () =>
     expect(deps.workflow).toEqual({ subagentsEnabled: true, maxParallel: 2 });
     expect(deps.skillsRecord).toEqual({}); // 开关表为空 = 全开（服务端 enabled 缺省 true）
     expect(deps.mcpServers).toEqual([]);
+    expect(deps.workspaces).toEqual(['/ws']); // 缺省 = [workspace]（--workspace 传入值）
     expect(deps.persistSettings).toBeTypeOf('function');
     expect(deps.saveSkillsConfig).toBeTypeOf('function');
     expect(deps.saveWorkflow).toBeTypeOf('function');
     expect(deps.saveMcpConfig).toBeTypeOf('function');
+    expect(deps.saveWorkspaces).toBeTypeOf('function');
 
     // saveSkillsConfig({tdd:false}) → skills 节落盘（configPath == RunWebIo.configPath）
     deps.saveSkillsConfig({ tdd: false });
     expect(readConfig(configPath)).toEqual({ skills: { tdd: false } });
     expect(join(tmpHome, '.devmate', 'config.json')).toBe(configPath);
+  });
+
+  it('a1b) workspaces 初值读回（config.json workspaces 节）：注入 deps.workspaces；saveWorkspaces 全量整节替换落盘且其余键保留', async () => {
+    const configPath = join(tmpHome, '.devmate', 'config.json');
+    saveConfig(configPath, {
+      workspaces: ['/ws-a', '/ws-b'],
+      skills: { tdd: false },
+      baseUrl: 'https://keep/v1',
+    });
+    const captured: Captured = { deps: undefined, events: [], onSignal: undefined };
+    const code = await runWeb(['--no-open'], makeIo(configPath, captured));
+    expect(code).toBe(0);
+    expect(depsOf(captured).workspaces).toEqual(['/ws-a', '/ws-b']);
+
+    // 全量快照整节替换（以服务端为准；已删根不复活——同 mcp 语义）
+    depsOf(captured).saveWorkspaces(['/ws-b', '/ws-c']);
+    expect(readConfig(configPath)).toEqual({
+      workspaces: ['/ws-b', '/ws-c'],
+      skills: { tdd: false },
+      baseUrl: 'https://keep/v1',
+    });
   });
 
   it('a2) 初值加载：workflow maxParallel 越界（7/0）在 CLI 初值夹紧为 4/1；skills/mcp 原样注入', async () => {

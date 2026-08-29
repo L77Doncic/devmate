@@ -29,6 +29,14 @@
  *   持久化断环：CLI attach 注入旧快照）；/api/mcp 添加带尺寸限制（name ≤64、command ≤256、
  *   args ≤16 且每项 ≤128，超限 400 {error} 带原因）；GET /api/mcp 响应 args 脱敏
  *   （--header/-H 后 Authorization 头掩码——服务端内部连接仍用原始 args，见 mcp-mask.ts）。
+ * - 多工作区（注册表 + 会话级根）：GET/POST /api/workspaces（缺省表 = [workspaceRoot]；
+ *   POST 校验 绝对/存在/目录/realpath 归一/可读 → 注册 canonical + saveWorkspaces 持久化，
+ *   重复注册幂等）、DELETE /api/workspaces/:encodedRoot（默认根不可删 400；未注册 404；
+ *   会话仍指向已删根 → 允许——会话文件保留）、GET /api/workspaces/browse?path=（只读
+ *   目录列表 {base, dirs}：缺省 os.homedir()、字节序排序、深层错误 → {dirs:[]}、纯展示）。
+ *   会话根：POST /api/sessions|chat 首建的 workspaceRoot 须 ∈ 注册表（400
+ *   workspace-not-registered；resume 忽略参数；缺省 deps.workspaceRoot）——落 session-workspace
+ *   meta；per-session 工具面根解析（deps.workspaceRootOf）后 jail/shell 同源（见 deps.ts）。
  * - MCP 协议客户端（P2）：deps 的 McpLauncher 懒连接 + createMcpTools 工具面合并——
  *   每次 run 与 GET /api/tools 经 composeRunTools 重新组装（POST /api/mcp 开关即时生效）。
  * - 下行（GET /api/stream?sessionId=）：SSE 帧流（事件清单逐字见 emit.ts 的 SseEventData；
@@ -57,8 +65,9 @@ import { randomUUID } from 'node:crypto';
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from 'node:http';
 import type { Socket } from 'node:net';
 import type { Dirent } from 'node:fs';
-import { readFile, readdir } from 'node:fs/promises';
-import { extname, join, resolve, sep } from 'node:path';
+import { readFile, readdir, realpath, stat } from 'node:fs/promises';
+import { homedir } from 'node:os';
+import { extname, isAbsolute, join, normalize, resolve, sep } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 import type { ConversationSummarizer } from '../../core/context/index.js';
@@ -109,7 +118,8 @@ import { maskMcpArgs } from './mcp-mask.js';
 // （层间倒置修复——service 不再向上（cli）依赖；cli/config 留 re-export）
 import { maskApiKey } from '../../shared/masking.js';
 // 装配入口（S14 CLI 从本模块单点导入：assembleDeps + createDevmateServer）
-export { assembleDeps } from './deps.js';
+export { assembleDeps, dedupeKeepOrder } from './deps.js';
+import { dedupeKeepOrder } from './deps.js';
 export type { DevmateConfig } from './deps.js';
 // 掩码单一实现的再导出（历史消费者路径兼容；实现只在 shared/masking）
 export { maskApiKey };
@@ -233,6 +243,15 @@ export interface DevmateServerDeps {
    * 未注入 = 旧服务/假 deps → 不写 meta，详情/列表回退 null）。
    */
   workspaceRoot?: string;
+  /**
+   * 工作区注册表初值（多工作区；欠省 [workspaceRoot]；去重保序）。
+   * 服务端在 POST/DELETE /api/workspaces 上增删（POST 校验后存储 canonical 形式；
+   * 默认根不可删）。会话根参数须 ∈ 本表，否则 400 workspace-not-registered。
+   */
+  workspaces?: string[];
+  /** 工作区注册表持久化回调（POST/DELETE /api/workspaces 变更后调用——全量快照；
+   *  CLI 传 config.ts 的 mergeConfig 包装；无则仅内存）。 */
+  saveWorkspaces?: (roots: string[]) => void | Promise<void>;
   /** 工具注册表（defineRegistry 输出；见 deps.ts 的组装）。缺省 = 空注册表（GET /api/tools 空清单；服务端不自行装配）。 */
   tools?: ToolRegistry;
   /** LLM 接缝（真实为 wiredLlmAdapter；测试注入假流）。 */
@@ -245,8 +264,9 @@ export interface DevmateServerDeps {
   approvalPolicy?: ApprovalPolicy;
   /** run 透传覆写（maxSteps/windowTokens/pricing 等）；store/tools/llm/approver/signal/model 由其接管。 */
   runOptions?: Partial<RunOptions>;
-  /** 会话工具工厂：每会话懒建注册表（shell 每会话独立实例）；缺省用 deps.tools（单例）。 */
-  createSessionTools?: (sessionId: string) => ToolRegistry;
+  /** 会话工具工厂：每会话懒建注册表（shell 每会话独立实例；多工作区时 jail/fs 按会话根）；
+   *  异步（per-session 根解析/监狱构造——工厂契约）；缺省用 deps.tools（单例）。 */
+  createSessionTools?: (sessionId: string) => ToolRegistry | Promise<ToolRegistry>;
   /** 会话资源清理（常驻 shell 等）；createDevmateServer.close() 时调用。 */
   dispose?: () => Promise<void>;
   /** 每 run 从当前设置重建 LLM 接缝；缺省用 deps.llm（构造时固定）。 */
@@ -1228,6 +1248,41 @@ function asString(value: unknown): string | undefined {
   return typeof value === 'string' ? value : undefined;
 }
 
+/** 错误码提取（fs 错误的 code 字段；非 fs 错误 → 'unknown'）。 */
+function errorCodeOf(err: unknown): string {
+  if (typeof err === 'object' && err !== null && 'code' in err) {
+    const code = (err as { code?: unknown }).code;
+    return typeof code === 'string' ? code : 'unknown';
+  }
+  return 'unknown';
+}
+
+/**
+ * DELETE /api/workspaces/:encodedRoot 的单段解码（根含 `/`：%2F 转义进段；
+ * 解码结果必须是绝对路径——否则 400 统一 {error}）。
+ */
+function decodeWorkspaceRoot(raw: string): string {
+  let decoded: string;
+  try {
+    decoded = decodeURIComponent(raw);
+  } catch {
+    throw new HttpError(400, 'invalid workspace root');
+  }
+  if (decoded === '' || !isAbsolute(decoded)) {
+    throw new HttpError(400, 'invalid workspace root');
+  }
+  return decoded;
+}
+
+/**
+ * browse 基数标准化（纯函数）：缺省 os.homedir()；相对路径按 homedir 解析；
+ * normalize 消化 `..`/重复分隔符（traversal 无逃逸面——本接口只读展示，不写任何文件）。
+ */
+export function normalizeBrowseBase(raw: string | null, home: string = homedir()): string {
+  if (raw === null || raw === '') return home;
+  return normalize(isAbsolute(raw) ? raw : join(home, raw));
+}
+
 const MIME: Record<string, string> = {
   '.html': 'text/html; charset=utf-8',
   '.js': 'text/javascript; charset=utf-8',
@@ -1318,6 +1373,14 @@ export function createDevmateServer(deps: DevmateServerDeps): DevmateServer {
     if (registryToolsCache === undefined) registryToolsCache = deps.tools ?? emptyRegistry;
     return registryToolsCache;
   };
+  // -- 工作区注册表（多工作区 dsh 语义）--
+  // 初值 = deps.workspaces ?? [deps.workspaceRoot]（欠省默认根；去重保序）。注册表是
+  // 会话根参数的合法域（POST /api/sessions|chat 首建的 workspaceRoot 须 ∈ 本表，否则
+  // 400 workspace-not-registered）；POST 校验后登记 canonical 形式；默认根不可删。
+  const workspaces: string[] = dedupeKeepOrder(
+    deps.workspaces ?? (deps.workspaceRoot !== undefined ? [deps.workspaceRoot] : []),
+  );
+
   // 空闲 shell 回收节拍（缺省 60s；测试注入调度器捕获 handler，不真等）
   const idleSweepMs = deps.idleSweepMs ?? 60_000;
   const scheduleTick = deps.scheduleTick ?? defaultTickScheduler;
@@ -1447,7 +1510,7 @@ export function createDevmateServer(deps: DevmateServerDeps): DevmateServer {
         }
         const baseTools =
           deps.createSessionTools !== undefined
-            ? deps.createSessionTools(sessionId)
+            ? await deps.createSessionTools(sessionId)
             : registryToolsOf();
         // 每次 run 重建工具面：base（fs/shell/技能/子代理，会话缓存）+ 新组装 MCP
         // 工具（开关/追加变更即时生效；连接失败 → 0 个 mcp 工具，run 不因之失败）
@@ -1523,6 +1586,11 @@ export function createDevmateServer(deps: DevmateServerDeps): DevmateServer {
     } catch {
       throw new HttpError(400, 'invalid session id');
     }
+    // 会话根参数（多工作区）：首建时消费（须 ∈ 注册表）；resume（会话已存在）忽略——见守卫内
+    const rawRoot = (body as Record<string, unknown>).workspaceRoot;
+    if (rawRoot !== undefined && typeof rawRoot !== 'string') {
+      throw new HttpError(400, 'workspaceRoot must be a string');
+    }
 
     const ctx = ctxFor(sessionId);
     if (ctx.active) {
@@ -1534,14 +1602,20 @@ export function createDevmateServer(deps: DevmateServerDeps): DevmateServer {
       try {
         if (!(await deps.store.exists(sessionId))) {
           await deps.store.create(sessionId);
-          // A 档：会话按项目文件夹分组——首建即落 workspace meta（旧会话/resume 无此事件）
-          if (deps.workspaceRoot !== undefined) {
+          // A 档：会话按项目文件夹分组——首建即落 workspace meta（旧会话/resume 无此事件）。
+          // 多工作区：workspaceRoot 参数优先（须 ∈ 注册表——未注册 400 workspace-not-registered；
+          // 参数只作用于首建，resume 忽略）；缺省 = deps.workspaceRoot（默认根）。
+          let root = deps.workspaceRoot;
+          if (rawRoot !== undefined && rawRoot !== '') {
+            if (!workspaces.includes(rawRoot)) {
+              throw new HttpError(400, 'workspace-not-registered');
+            }
+            root = rawRoot;
+          }
+          if (root !== undefined) {
             await observedStore.append(sessionId, {
               kind: 'event',
-              payload: {
-                type: 'session-workspace',
-                data: { workspaceRoot: deps.workspaceRoot },
-              },
+              payload: { type: 'session-workspace', data: { workspaceRoot: root } },
             });
           }
         }
@@ -1693,6 +1767,19 @@ export function createDevmateServer(deps: DevmateServerDeps): DevmateServer {
       }
       text = rawText;
     }
+    // 多工作区：workspaceRoot 参数（须 ∈ 注册表——未注册 400 workspace-not-registered；
+    // POST /api/sessions 恒为新建，参数必然消费）；缺省 = deps.workspaceRoot（默认根）
+    const rawRoot = (body as Record<string, unknown>).workspaceRoot;
+    if (rawRoot !== undefined && typeof rawRoot !== 'string') {
+      throw new HttpError(400, 'workspaceRoot must be a string');
+    }
+    let root = deps.workspaceRoot;
+    if (rawRoot !== undefined && rawRoot !== '') {
+      if (!workspaces.includes(rawRoot)) {
+        throw new HttpError(400, 'workspace-not-registered');
+      }
+      root = rawRoot;
+    }
     const sessionId = `s-${randomUUID()}`;
     ctxFor(sessionId);
     try {
@@ -1704,10 +1791,10 @@ export function createDevmateServer(deps: DevmateServerDeps): DevmateServer {
       throw err;
     }
     // A 档：首建即落 workspace meta（会话按项目文件夹分组；无注入 → 旧服务不落）
-    if (deps.workspaceRoot !== undefined) {
+    if (root !== undefined) {
       await observedStore.append(sessionId, {
         kind: 'event',
-        payload: { type: 'session-workspace', data: { workspaceRoot: deps.workspaceRoot } },
+        payload: { type: 'session-workspace', data: { workspaceRoot: root } },
       });
     }
     // 带首消息：只落首个 user 事件，不启动 run（首消息之后的交互仍走 POST /api/chat）
@@ -1715,6 +1802,101 @@ export function createDevmateServer(deps: DevmateServerDeps): DevmateServer {
       await observedStore.append(sessionId, { kind: 'user', payload: { content: text } });
     }
     sendJson(res, 200, { sessionId });
+  }
+
+  // -- 工作区注册表（GET/POST /api/workspaces、DELETE /api/workspaces/:root、browse） --
+
+  async function handleWorkspacesList(res: ServerResponse): Promise<void> {
+    sendJson(res, 200, { roots: [...workspaces] });
+  }
+
+  async function handleWorkspacesAdd(req: IncomingMessage, res: ServerResponse): Promise<void> {
+    const body = await readJson(req);
+    if (typeof body !== 'object' || body === null || Array.isArray(body)) {
+      throw new HttpError(400, 'request body must be a JSON object');
+    }
+    const path = asString((body as Record<string, unknown>).path);
+    if (path === undefined || path === '') {
+      throw new HttpError(400, 'path is required (non-empty string)');
+    }
+    if (!isAbsolute(path)) {
+      throw new HttpError(400, 'workspace path must be absolute');
+    }
+    // b) 路径校验：存在 + isDirectory；realpath 归一；目录不可读 → 400 带原因（示错闭环）
+    try {
+      const info = await stat(path);
+      if (!info.isDirectory()) {
+        throw new HttpError(400, 'workspace path must be a directory');
+      }
+    } catch (err) {
+      if (err instanceof HttpError) throw err;
+      throw new HttpError(400, `workspace path is not accessible: ${errorCodeOf(err)}`);
+    }
+    let canonical: string;
+    try {
+      canonical = await realpath(path);
+    } catch (err) {
+      throw new HttpError(400, `workspace path is not accessible: ${errorCodeOf(err)}`);
+    }
+    try {
+      await readdir(canonical); // 目录不存在可读性（EACCES 等）→ 400 带原因
+    } catch (err) {
+      throw new HttpError(400, `workspace directory is not readable: ${errorCodeOf(err)}`);
+    }
+    // a) 注册（canonical 归一 + 去重保序）+ 持久化（无 saveWorkspaces 回调 → 仅内存；
+    // 重复注册幂等——注册表未变不触发持久化）
+    if (!workspaces.includes(canonical)) {
+      workspaces.push(canonical);
+      if (deps.saveWorkspaces !== undefined) await deps.saveWorkspaces([...workspaces]);
+    }
+    sendJson(res, 200, { roots: [...workspaces] });
+  }
+
+  async function handleWorkspacesDelete(res: ServerResponse, raw: string): Promise<void> {
+    const root = decodeWorkspaceRoot(raw);
+    // 当前默认根不可删（字面或 canonical 同目录均拦——软链默认根经 canonical 写法也受保护）
+    if (await isDefaultWorkspaceRoot(root)) {
+      throw new HttpError(400, 'cannot delete the default workspace root');
+    }
+    const idx = workspaces.indexOf(root);
+    if (idx < 0) {
+      throw new HttpError(404, `workspace not registered: ${root}`);
+    }
+    workspaces.splice(idx, 1);
+    // remove + persist；仍有会话指向它 → 允许（会话文件保留——展示层归属不因此漂移）
+    if (deps.saveWorkspaces !== undefined) await deps.saveWorkspaces([...workspaces]);
+    sendJson(res, 200, { roots: [...workspaces] });
+  }
+
+  async function handleWorkspaceBrowse(req: IncomingMessage, res: ServerResponse): Promise<void> {
+    // path 缺省 os.homedir()；路径标准化（relative 按 homedir 解析、.. 折叠）——纯展示：
+    // 只读目录列表（readdir withFileTypes 仅目录 + 字节序排序），任何写入路径都不经过这里
+    const path = new URL(req.url ?? '/', `http://${HOST}`).searchParams.get('path');
+    const base = normalizeBrowseBase(path);
+    let entries: Dirent[];
+    try {
+      entries = await readdir(base, { withFileTypes: true });
+    } catch {
+      // 深层错误（不存在/不可读/非目录）→ 空列表（best-effort 展示，不 4xx）
+      sendJson(res, 200, { base, dirs: [] });
+      return;
+    }
+    const dirs = entries
+      .filter((entry) => entry.isDirectory())
+      .sort((a, b) => (a.name < b.name ? -1 : a.name > b.name ? 1 : 0))
+      .map((entry) => ({ name: entry.name, path: join(base, entry.name) }));
+    sendJson(res, 200, { base, dirs });
+  }
+
+  /** 默认根判定（字面相等或 realpath 同目录——软链默认根的 canonical 写法不可删）。 */
+  async function isDefaultWorkspaceRoot(root: string): Promise<boolean> {
+    if (deps.workspaceRoot === undefined) return false;
+    if (root === deps.workspaceRoot) return true;
+    try {
+      return (await realpath(root)) === (await realpath(deps.workspaceRoot));
+    } catch {
+      return false;
+    }
   }
 
   async function handleDeleteSession(res: ServerResponse, rawId: string): Promise<void> {
@@ -2376,6 +2558,14 @@ export function createDevmateServer(deps: DevmateServerDeps): DevmateServer {
     if (method === 'POST' && pathname === '/api/settings') return handleSettings(req, res);
     if (method === 'GET' && pathname === '/api/sessions') return handleListSessions(res);
     if (method === 'POST' && pathname === '/api/sessions') return handleCreateSession(req, res);
+    if (method === 'GET' && pathname === '/api/workspaces') return handleWorkspacesList(res);
+    if (method === 'POST' && pathname === '/api/workspaces') return handleWorkspacesAdd(req, res);
+    if (method === 'GET' && pathname === '/api/workspaces/browse') {
+      return handleWorkspaceBrowse(req, res);
+    }
+    if (method === 'DELETE' && pathname.startsWith('/api/workspaces/')) {
+      return handleWorkspacesDelete(res, pathname.slice('/api/workspaces/'.length));
+    }
     if (pathname.startsWith('/api/sessions/')) {
       const rawId = pathname.slice('/api/sessions/'.length);
       if (rawId === '') throw new HttpError(404, 'not found');

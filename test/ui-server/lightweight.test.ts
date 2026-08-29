@@ -198,7 +198,7 @@ describe('ui/server：shell 空闲释放（deps 工厂）', () => {
     const { factory, created, dir } = await makeFactory(50);
     tempDirs.push(dir);
 
-    factory.createSessionTools('s-1'); // lastUsedAt=1_000_000
+    await factory.createSessionTools('s-1'); // lastUsedAt=1_000_000
     expect(shellsOf(created, 's-1')).toHaveLength(1);
     await factory.disposeIdleShells(Date.now() + 10); // tick1：仅 10ms < TTL
     expect(shellsOf(created, 's-1')[0]!.disposed).toBe(0);
@@ -216,10 +216,10 @@ describe('ui/server：shell 空闲释放（deps 工厂）', () => {
     const { factory, created, dir } = await makeFactory(50);
     tempDirs.push(dir);
 
-    const r1 = factory.createSessionTools('s-2');
+    const r1 = await factory.createSessionTools('s-2');
     await factory.disposeIdleShells(Date.now() + 100);
     expect(shellsOf(created, 's-2')[0]!.disposed).toBe(1);
-    const r2 = factory.createSessionTools('s-2');
+    const r2 = await factory.createSessionTools('s-2');
     expect(shellsOf(created, 's-2')).toHaveLength(2); // 新实例
     expect(shellsOf(created, 's-2')[1]!.disposed).toBe(0);
     expect(r2).not.toBe(r1);
@@ -233,8 +233,8 @@ describe('ui/server：shell 空闲释放（deps 工厂）', () => {
     const { factory, created, dir } = await makeFactory(50);
     tempDirs.push(dir);
 
-    factory.createSessionTools('s-a');
-    factory.createSessionTools('s-b');
+    await factory.createSessionTools('s-a');
+    await factory.createSessionTools('s-b');
     await factory.disposeSession('s-a');
     expect(shellsOf(created, 's-a')[0]!.disposed).toBe(1);
     expect(shellsOf(created, 's-b')[0]!.disposed).toBe(0);
@@ -243,7 +243,7 @@ describe('ui/server：shell 空闲释放（deps 工厂）', () => {
     // dispose 后 activeShellCount = 剩余常驻实例（__fallback__ 未访问不建：只 s-b）
     expect(factory.activeShellCount()).toBe(1);
     // dispose 后重建：新实例 + lastUsed 重新起算
-    factory.createSessionTools('s-a');
+    await factory.createSessionTools('s-a');
     expect(shellsOf(created, 's-a')).toHaveLength(2);
     expect(factory.activeShellCount()).toBe(2);
   });
@@ -271,7 +271,7 @@ describe('ui/server：shell 空闲释放（deps 工厂）', () => {
     const { factory, created, dir } = await makeFactory(50);
     tempDirs.push(dir);
 
-    const reg = factory.createSessionTools('s-x'); // lastUsedAt=5_000_000
+    const reg = await factory.createSessionTools('s-x'); // lastUsedAt=5_000_000
     vi.setSystemTime(5_000_070); // 已超 TTL（70 > 50；若只看 createSessionTools 判据已过期）
     await reg.execute({ id: 'c1', name: 'run_command', arguments: '{}' }); // execute 刷新
     await factory.disposeIdleShells(Date.now() + 30); // tick1：+30ms < TTL：不得 dispose
@@ -290,7 +290,7 @@ describe('ui/server：shell 空闲释放（deps 工厂）', () => {
     const { factory, created, dir } = await makeFactory(50, hold);
     tempDirs.push(dir);
 
-    const reg = factory.createSessionTools('s-busy');
+    const reg = await factory.createSessionTools('s-busy');
     const exec = reg.execute({ id: 'c1', name: 'run_command', arguments: '{}' });
     vi.setSystemTime(6_000_200); // execute 挂起 200ms > TTL
     await factory.disposeIdleShells(Date.now()); // 在飞：不得 dispose（误杀修复）
