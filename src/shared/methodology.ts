@@ -71,3 +71,21 @@ export function sanitizeMethodology(raw: unknown): SkillMethodology | null {
   }
   return meta;
 }
+
+/**
+ * SKILL.md frontmatter 的 methodology 行解析（行值为 JSON 序列化的 flow mapping，如
+ * `methodology: {"type":"method","trigger":"修复 bug","steps":"a|b","done":"c"}`——
+ * copy-skills.mjs 蒸馏的合并块形状）：JSON 解析 + sanitizeMethodology 全量清洗；
+ * 缺失/非字符串/JSON 失败/非对象 → null（调用方收敛为「无本技能方法论」——缺省
+ * reference 语义由索引层兜底，与 methodologies.json 缺键同规；绝不 throw）。
+ */
+export function parseSkillMethodologyValue(value: unknown): SkillMethodology | null {
+  if (typeof value !== 'string' || value === '') return null;
+  let raw: unknown;
+  try {
+    raw = JSON.parse(value);
+  } catch {
+    return null;
+  }
+  return sanitizeMethodology(raw);
+}

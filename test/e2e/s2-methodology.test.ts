@@ -55,6 +55,7 @@ describe('E2E-S2：方法论/评审哨兵契约锁定（assembleDeps + fake llm�
       sessionsDir: join(dir, 'sessions'),
       model: 'deepseek-v4-flash',
       skillsDir,
+      userSkillsDir: join(dir, 'user-skills'),
     });
     deps.llm = fake;
     deps.createLlm = () => fake;

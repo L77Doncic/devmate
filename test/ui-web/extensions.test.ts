@@ -19,6 +19,22 @@ import {
   saveSubagentPref,
   syncWorkflowPref,
   splitMcpArgs,
+  SKILL_INSTALL_API_URL,
+  SKILL_INSTALL_BUSY,
+  SKILL_INSTALL_URL_PLACEHOLDER,
+  SKILL_INSTALL_PATH_PLACEHOLDER,
+  SKILL_INSTALL_HELP_URL,
+  SKILL_INSTALL_HELP_PATH,
+  SKILL_INSTALL_NOTE_DIR,
+  SKILL_INSTALL_EMPTY_SOURCE,
+  SKILL_INSTALL_REJECTED_TEXT,
+  SKILL_INSTALL_UNSUPPORTED_TEXT,
+  SKILL_INSTALL_FAILED_TEXT,
+  SKILL_INSTALL_ERRORS,
+  normalizeSkillErrorKind,
+  skillInstallErrorText,
+  normalizeSkillSource,
+  installSkill,
 } from '../../src/ui/web/extensions.js';
 
 /**
@@ -141,8 +157,15 @@ describe('normalizeSkillsList（{skills:[{id,name,summary,enabled}]}）', () => 
       name: '补丁复核',
       summary: '核对 diff',
       enabled: true,
+      origin: 'bundled',
     });
-    expect(list[1]).toEqual({ id: 'orphan', name: 'orphan', summary: '', enabled: false });
+    expect(list[1]).toEqual({
+      id: 'orphan',
+      name: 'orphan',
+      summary: '',
+      enabled: false,
+      origin: 'bundled',
+    });
   });
 
   it('null/缺 skills 字段 → []；裸数组支持', () => {
@@ -150,6 +173,156 @@ describe('normalizeSkillsList（{skills:[{id,name,summary,enabled}]}）', () => 
     expect(normalizeSkillsList({})).toEqual([]);
     const arr = normalizeSkillsList([{ id: 'a', name: 'A' }]);
     expect(arr[0]?.id).toBe('a');
+  });
+
+  it("origin 白名单：'user' 原样、'bundled' 原样、缺失/未知 → bundled（仅 user 渲染徽章）", () => {
+    const list = normalizeSkillsList({
+      skills: [
+        { id: 'a', name: 'A', origin: 'user' },
+        { id: 'b', name: 'B', origin: 'bundled' },
+        { id: 'c', name: 'C' }, // 缺省
+        { id: 'd', name: 'D', origin: 'weird' }, // 未知
+      ],
+    });
+    expect(list.map((s) => s.origin)).toEqual(['user', 'bundled', 'bundled', 'bundled']);
+  });
+});
+
+describe('技能安装表单（normalizeSkillSource / installSkill / 错误 kind 白名单映射）', () => {
+  it('normalizeSkillSource：trim；非字符串/空 → ""（按钮禁用 + 提交前拦截）', () => {
+    expect(normalizeSkillSource('  https://example.com/sk/SKILL.md\n')).toBe(
+      'https://example.com/sk/SKILL.md',
+    );
+    expect(normalizeSkillSource('   ')).toBe('');
+    expect(normalizeSkillSource(null as unknown as string)).toBe('');
+    expect(normalizeSkillSource(42 as unknown as string)).toBe('');
+  });
+
+  it('安装端点常量 = 契约路径', () => {
+    expect(SKILL_INSTALL_API_URL).toBe('/api/skills/install');
+  });
+
+  it('installSkill 成功：POST {source}；回体 id 与 {skill:{id}} 双形状；无 id → null', async () => {
+    const calls: string[] = [];
+    const fetchImpl = asFetch(async (url: string, opts: unknown) => {
+      calls.push(`${url}|${(opts as { body: string }).body}`);
+      return okResponse({ id: 'my-skill' });
+    });
+    const r1 = await installSkill({ source: ' /tmp/s1 ' }, { fetchImpl });
+    expect(r1).toEqual({ ok: true, id: 'my-skill' });
+    expect(calls[0]).toBe('/api/skills/install|{"source":"/tmp/s1"}');
+    const r2 = await installSkill(
+      { source: '/tmp/s2' },
+      { fetchImpl: asFetch(async () => okResponse({ skill: { id: 's2' } })) },
+    );
+    expect(r2).toEqual({ ok: true, id: 's2' });
+    const r3 = await installSkill(
+      { source: '/tmp/s3' },
+      { fetchImpl: asFetch(async () => okResponse({ ok: true })) },
+    );
+    expect(r3).toEqual({ ok: true, id: null });
+  });
+
+  it('installSkill 空来源：直接 {ok:false,error:{kind:"invalid-source"}}，不发请求', async () => {
+    let called = false;
+    const r = await installSkill({
+      source: '  ',
+      fetchImpl: asFetch(async () => {
+        called = true;
+        return okResponse({});
+      }),
+    } as never as { source: string });
+    expect(r.ok).toBe(false);
+    expect((r.error as { kind: string }).kind).toBe('invalid-source');
+    expect(called).toBe(false);
+  });
+
+  it('installSkill 服务端 400/{error:{type}}：ok=false 且 error 携带契约错误体（映射用）', async () => {
+    const r = await installSkill(
+      { source: 'https://x.dev/x' },
+      { fetchImpl: asFetch(async () => errResponse(400, { error: { type: 'unsupported-host' } })) },
+    );
+    expect(r.ok).toBe(false);
+    expect((r.error as { data: { error: { type: string } } }).data.error.type).toBe(
+      'unsupported-host',
+    );
+  });
+
+  it('installSkill 网络异常（fetch 抛）：ok=false，绝不 throw', async () => {
+    const r = await installSkill({
+      source: 'x',
+      fetchImpl: asFetch(async () => {
+        throw new TypeError('Failed to fetch');
+      }),
+    } as never as { source: string });
+    expect(r.ok).toBe(false);
+    expect(r.error).toBeInstanceOf(TypeError);
+  });
+
+  it('normalizeSkillErrorKind：服务端 {error:{type}} 形状优先；其余位置宽容；未知 → null', () => {
+    expect(
+      normalizeSkillErrorKind({
+        status: 400,
+        data: { error: { type: 'too-large', message: 'x' } },
+      }),
+    ).toBe('too-large');
+    expect(normalizeSkillErrorKind({ status: 400, data: { kind: 'invalid-source' } })).toBe(
+      'invalid-source',
+    );
+    expect(normalizeSkillErrorKind({ kind: 'write-failed' })).toBe('write-failed');
+    expect(normalizeSkillErrorKind({ status: 400, data: { error: 'skill-exists' } })).toBe(
+      'skill-exists',
+    );
+    expect(normalizeSkillErrorKind({ status: 400, data: { error: 'bogus-kind' } })).toBeNull();
+    expect(normalizeSkillErrorKind({ status: 400 })).toBeNull();
+    expect(normalizeSkillErrorKind(null)).toBeNull();
+  });
+
+  it('skillInstallErrorText：六个 kind 全映射（kind 优先）——中文明文案零端点路径', () => {
+    const cases: Array<[string, string]> = [
+      ['invalid-source', '来源无效'],
+      ['fetch-failed', '获取技能失败'],
+      ['too-large', '技能文件过大'],
+      ['unsupported-host', '不支持的下载来源'],
+      ['skill-exists', '技能已存在'],
+      ['write-failed', '写入失败'],
+    ];
+    for (const [kind, prefix] of cases) {
+      const text = skillInstallErrorText({ status: 413, data: { error: { type: kind } } });
+      expect(text.startsWith(prefix)).toBe(true);
+      expect(text).not.toMatch(/\/api\//);
+    }
+  });
+
+  it('skillInstallErrorText：status 阶梯（409 已存在 / 413 过大 / 502 获取失败 / 400/403 通用 / 404 未支持 / 其余通用）', () => {
+    expect(skillInstallErrorText({ status: 409 })).toBe(SKILL_INSTALL_ERRORS['skill-exists']);
+    expect(skillInstallErrorText({ status: 413 })).toBe(SKILL_INSTALL_ERRORS['too-large']);
+    expect(skillInstallErrorText({ status: 502 })).toBe(SKILL_INSTALL_ERRORS['fetch-failed']);
+    expect(skillInstallErrorText({ status: 400 })).toBe(SKILL_INSTALL_REJECTED_TEXT);
+    expect(skillInstallErrorText({ status: 403 })).toBe(SKILL_INSTALL_REJECTED_TEXT);
+    expect(skillInstallErrorText({ status: 404 })).toBe(SKILL_INSTALL_UNSUPPORTED_TEXT);
+    expect(skillInstallErrorText({ status: 500 })).toBe(SKILL_INSTALL_FAILED_TEXT);
+    expect(skillInstallErrorText(new TypeError('Failed to fetch'))).toBe(SKILL_INSTALL_FAILED_TEXT);
+    expect(skillInstallErrorText({})).toBe(SKILL_INSTALL_FAILED_TEXT);
+  });
+
+  it('安装表单文案常量为单一来源且零端点路径（placeholder/帮助/目录说明/安装中/空来源）', () => {
+    const ALL = [
+      SKILL_INSTALL_URL_PLACEHOLDER,
+      SKILL_INSTALL_PATH_PLACEHOLDER,
+      SKILL_INSTALL_HELP_URL,
+      SKILL_INSTALL_HELP_PATH,
+      SKILL_INSTALL_NOTE_DIR,
+      SKILL_INSTALL_BUSY,
+      SKILL_INSTALL_EMPTY_SOURCE,
+      SKILL_INSTALL_REJECTED_TEXT,
+      SKILL_INSTALL_UNSUPPORTED_TEXT,
+      SKILL_INSTALL_FAILED_TEXT,
+      ...Object.values(SKILL_INSTALL_ERRORS),
+    ];
+    for (const text of ALL) expect(text).not.toMatch(/\/api\//);
+    expect(SKILL_INSTALL_BUSY).toBe('安装中…');
+    expect(SKILL_INSTALL_URL_PLACEHOLDER).toContain('raw.githubusercontent.com');
   });
 });
 

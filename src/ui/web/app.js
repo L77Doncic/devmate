@@ -84,7 +84,17 @@ import {
   normalizeSkillsList,
   normalizeMcpServers,
   splitMcpArgs,
+  SKILL_INSTALL_BUSY,
+  SKILL_INSTALL_EMPTY_SOURCE,
+  SKILL_INSTALL_URL_PLACEHOLDER,
+  SKILL_INSTALL_PATH_PLACEHOLDER,
+  SKILL_INSTALL_HELP_URL,
+  SKILL_INSTALL_HELP_PATH,
+  normalizeSkillSource,
+  skillInstallErrorText,
+  installSkill,
 } from './extensions.js';
+import { iconSvg } from './icons.js'; // 线描图标单一来源（d 串 + createElementNS，永不 innerHTML）
 import { loadThemeKey, saveThemeKey, applyTheme } from './theme.js';
 import {
   loadSidebarState,
@@ -258,6 +268,7 @@ const ui = {
   wsCollapsed: {},
   wsNewMenuOpen: false,
   wsPickerOpen: false,
+  skillInstalling: false, // 技能安装在途（按钮态 + 重入护栏）
   wsPickerState: null, // 目录浏览状态机（workspaces.js 纯逻辑）
   wsPickerBrowseFailed: false,
   wsPickerFetchSeq: 0, // 浏览拉取序列号（乱序响应收敛：只认最新一发）
@@ -401,6 +412,13 @@ const el = {
   setReviewmodeEnabled: document.getElementById('set-reviewmode-enabled'),
   skillsList: document.getElementById('skills-list'),
   skillsNote: document.getElementById('skills-note'),
+  // 技能安装表单（URL / 本地路径 单选 + 安装 / 重新扫描）
+  skillInstallSource: document.getElementById('skill-install-source'),
+  skillInstallHelp: document.getElementById('skill-install-help'),
+  skillInstallNote: document.getElementById('skill-install-note'),
+  btnSkillInstall: document.getElementById('btn-skill-install'),
+  btnSkillRescan: document.getElementById('btn-skill-rescan'),
+  skillSrcInputs: [...document.querySelectorAll('input[name="skill-install-src"]')],
   mcpList: document.getElementById('mcp-list'),
   mcpNote: document.getElementById('mcp-note'),
   mcpAddName: document.getElementById('mcp-add-name'),
@@ -640,20 +658,7 @@ function buildRowMenu() {
     btn.dataset.menuId = item.id;
     btn.setAttribute('role', 'menuitem');
     btn.disabled = Boolean(target?.type === 'workspace' && target.disabled);
-    const icon = document.createElementNS('http://www.w3.org/2000/svg', 'svg');
-    icon.setAttribute('class', 'rowMenuItemIcon');
-    icon.setAttribute('viewBox', '0 0 16 16');
-    icon.setAttribute('aria-hidden', 'true');
-    const path = document.createElementNS('http://www.w3.org/2000/svg', 'path');
-    path.setAttribute(
-      'd',
-      'M3 4.5h10M6.2 4.5V3.2h3.6v1.3M4.7 4.5l.35 8.1c.03.5.4.9.9.9h4.1c.5 0 .87-.4.9-.9l.35-8.1M6.7 7v3.7M9.3 7v3.7',
-    );
-    path.setAttribute('fill', 'none');
-    path.setAttribute('stroke', 'currentColor');
-    path.setAttribute('stroke-width', '1.3');
-    path.setAttribute('stroke-linecap', 'round');
-    icon.appendChild(path);
+    const icon = iconSvg('trash', { size: 16, className: 'rowMenuItemIcon' });
     const label = document.createElement('span');
     label.textContent = item.label;
     btn.append(icon, label);
@@ -797,26 +802,16 @@ function currentSessionRoot() {
   return s === undefined ? null : workspaceOfSession(effectiveWorkspaceRoots(), s);
 }
 
-/** folder slot 对（展开/悬停互换；dsh ProjectRowItem: folder ↔ hover chevron）。 */
+/**
+ * folder slot 对（展开/悬停互换；dsh ProjectRowItem: folder ↔ hover chevron）。
+ * 字形即 icons.js 一笔画描边轮廓（<16px 实心疙瘩> 修复 = 由 filled 叠块 → stroke 线形）。
+ */
 function buildFolderSlot(variant, active) {
   const slot = document.createElement('span');
   slot.className = 'slot folder ' + variant + (active ? ' folderActive' : '');
   slot.setAttribute('aria-hidden', 'true');
-  const svg = document.createElementNS('http://www.w3.org/2000/svg', 'svg');
-  svg.setAttribute('viewBox', '0 0 16 16');
-  svg.setAttribute('width', '16');
-  svg.setAttribute('height', '16');
-  svg.setAttribute('aria-hidden', 'true');
-  const path = document.createElementNS('http://www.w3.org/2000/svg', 'path');
-  path.setAttribute('fill', 'currentColor');
-  path.setAttribute(
-    'd',
-    variant === 'folderOpen'
-      ? 'M6.9 2.8h5.6c.9 0 1.6.7 1.6 1.6v1.8H3.2c-.5 0-1 .3-1.2.7l-.3-3.1c-.1-.6.4-1 1-1zm6.9 3.4v2.3c0 .9-.7 1.6-1.6 1.6H3.8c-.9 0-1.6-.7-1.6-1.6V6.6c0-.4.3-.8.7-.9l.3.1h9.3c.3 0 .8-.1 1.3.4z'
-      : 'M3.2 2.8h3l1.5 1.5h5c.9 0 1.6.7 1.6 1.6v5.6c0 .9-.7 1.6-1.6 1.6H3.2c-.9 0-1.6-.7-1.6-1.6V4.4c0-.9.7-1.6 1.6-1.6z',
-  );
-  svg.appendChild(path);
-  slot.appendChild(svg);
+  const svg = iconSvg(variant === 'folderOpen' ? 'folderOpen' : 'folderClosed', { size: 16 });
+  if (svg) slot.appendChild(svg);
   return slot;
 }
 
@@ -825,98 +820,26 @@ function buildChevronSlot() {
   const chev = document.createElement('span');
   chev.className = 'slot chevron';
   chev.setAttribute('aria-hidden', 'true');
-  const chevSvg = document.createElementNS('http://www.w3.org/2000/svg', 'svg');
-  chevSvg.setAttribute('class', 'arrow');
-  chevSvg.setAttribute('viewBox', '0 0 14 14');
-  chevSvg.setAttribute('width', '14');
-  chevSvg.setAttribute('height', '14');
-  chevSvg.setAttribute('aria-hidden', 'true');
-  const chevPath = document.createElementNS('http://www.w3.org/2000/svg', 'path');
-  chevPath.setAttribute('fill', 'currentColor');
-  chevPath.setAttribute('d', 'M5.4 3.3l5 4.7-5 4.7z');
-  chevSvg.appendChild(chevPath);
-  chev.appendChild(chevSvg);
+  const chevSvg = iconSvg('chevronRight', { size: 16, className: 'arrow' });
+  if (chevSvg) chev.appendChild(chevSvg);
   return chev;
 }
 
-/** ＋ 字形（组头/菜单「添加」行；dsh IconPlusOutline16）。 */
-function plusGlyphSvg() {
-  const svg = document.createElementNS('http://www.w3.org/2000/svg', 'svg');
-  svg.setAttribute('viewBox', '0 0 16 16');
-  svg.setAttribute('aria-hidden', 'true');
-  const path = document.createElementNS('http://www.w3.org/2000/svg', 'path');
-  path.setAttribute('fill', 'none');
-  path.setAttribute('stroke', 'currentColor');
-  path.setAttribute('stroke-width', '1.3');
-  path.setAttribute('stroke-linecap', 'round');
-  path.setAttribute('d', 'M8 3.2v7.6M4.2 7h7.6');
-  svg.appendChild(path);
-  return svg;
-}
-
-/** 竖三点 kebab 字形（组头/菜单；dsh IconEllipsisOutline16 同族）。 */
-function kebabGlyphSvg() {
-  const svg = document.createElementNS('http://www.w3.org/2000/svg', 'svg');
-  svg.setAttribute('viewBox', '0 0 16 16');
-  svg.setAttribute('aria-hidden', 'true');
-  for (const cy of [3, 8, 13]) {
-    const c = document.createElementNS('http://www.w3.org/2000/svg', 'circle');
-    c.setAttribute('cx', '8');
-    c.setAttribute('cy', String(cy));
-    c.setAttribute('r', '1.3');
-    c.setAttribute('fill', 'currentColor');
-    svg.appendChild(c);
+/**
+ * index.html 静态图标槽（`<svg data-icon-glyph="…">`：头部「添加工作区」/空态
+ * 「选择工作区…」）→ 以 icons.js 一笔画描边图标替换 —— 单一 d 串来源，
+ * 静态标记只留占位（永不 inline 手写 path 以免两处漂移）。
+ */
+function mountStaticIconGlyphs() {
+  for (const slot of document.querySelectorAll('svg[data-icon-glyph]')) {
+    const name = slot.dataset.iconGlyph ?? '';
+    const size = Number(slot.dataset.iconSize) || 16;
+    const svg = iconSvg(name, { size });
+    if (!svg) continue;
+    const cls = slot.getAttribute('class');
+    if (cls) svg.setAttribute('class', cls);
+    slot.replaceWith(svg);
   }
-  return svg;
-}
-
-/** 文件夹字形（16 视口；open=true 用打开态 —— 菜单/目录行通用）。 */
-function folderGlyphSvg(open) {
-  const svg = document.createElementNS('http://www.w3.org/2000/svg', 'svg');
-  svg.setAttribute('viewBox', '0 0 16 16');
-  svg.setAttribute('aria-hidden', 'true');
-  const path = document.createElementNS('http://www.w3.org/2000/svg', 'path');
-  path.setAttribute('fill', 'currentColor');
-  path.setAttribute(
-    'd',
-    open
-      ? 'M6.9 2.8h5.6c.9 0 1.6.7 1.6 1.6v1.8H3.2c-.5 0-1 .3-1.2.7l-.3-3.1c-.1-.6.4-1 1-1zm6.9 3.4v2.3c0 .9-.7 1.6-1.6 1.6H3.8c-.9 0-1.6-.7-1.6-1.6V6.6c0-.4.3-.8.7-.9l.3.1h9.3c.3 0 .8-.1 1.3.4z'
-      : 'M3.2 2.8h3l1.5 1.5h5c.9 0 1.6.7 1.6 1.6v5.6c0 .9-.7 1.6-1.6 1.6H3.2c-.9 0-1.6-.7-1.6-1.6V4.4c0-.9.7-1.6 1.6-1.6z',
-  );
-  svg.appendChild(path);
-  return svg;
-}
-
-/** 对勾字形（菜单「勾选当前工作区」；dsh Menu selected check 同族 accent）。 */
-function checkGlyphSvg() {
-  const svg = document.createElementNS('http://www.w3.org/2000/svg', 'svg');
-  svg.setAttribute('viewBox', '0 0 16 16');
-  svg.setAttribute('aria-hidden', 'true');
-  const path = document.createElementNS('http://www.w3.org/2000/svg', 'path');
-  path.setAttribute('fill', 'none');
-  path.setAttribute('stroke', 'currentColor');
-  path.setAttribute('stroke-width', '1.6');
-  path.setAttribute('stroke-linecap', 'round');
-  path.setAttribute('stroke-linejoin', 'round');
-  path.setAttribute('d', 'M3.4 8.6l3.1 3L12.6 4.8');
-  svg.appendChild(path);
-  return svg;
-}
-
-/** 「..」上级字形（目录浏览首行；dsh folder 同族 + 上箭头语义）。 */
-function upDirGlyphSvg() {
-  const svg = document.createElementNS('http://www.w3.org/2000/svg', 'svg');
-  svg.setAttribute('viewBox', '0 0 16 16');
-  svg.setAttribute('aria-hidden', 'true');
-  const path = document.createElementNS('http://www.w3.org/2000/svg', 'path');
-  path.setAttribute('fill', 'none');
-  path.setAttribute('stroke', 'currentColor');
-  path.setAttribute('stroke-width', '1.4');
-  path.setAttribute('stroke-linecap', 'round');
-  path.setAttribute('stroke-linejoin', 'round');
-  path.setAttribute('d', 'M3.2 12.8h9.6M8 3.6v6M5 6.4L8 3.4l3 3');
-  svg.appendChild(path);
-  return svg;
 }
 
 /**
@@ -977,7 +900,7 @@ function buildWorkspaceGroup(group) {
     plus.dataset.wsPlus = group.workspaceRoot;
     plus.setAttribute('aria-label', `新建会话：${group.label}`);
     plus.title = `新建会话：${group.label}`;
-    plus.appendChild(plusGlyphSvg());
+    plus.appendChild(iconSvg('plus', { size: 16 }));
     const kebab = document.createElement('button');
     kebab.type = 'button';
     kebab.className = 'rowIconButton';
@@ -988,7 +911,7 @@ function buildWorkspaceGroup(group) {
       group.workspaceRoot === ui.wsDefaultRoot
         ? '默认工作区不可移除'
         : `工作区操作：${group.label}`;
-    kebab.appendChild(kebabGlyphSvg());
+    kebab.appendChild(iconSvg('kebab', { size: 16 }));
     actions.append(plus, kebab);
     head.appendChild(actions);
   }
@@ -1059,18 +982,7 @@ function buildSessionItem(s) {
   kebab.className = 'rowIconButton';
   kebab.dataset.kebab = '';
   kebab.setAttribute('aria-label', `会话操作：${titleText}`);
-  const kebabIcon = document.createElementNS('http://www.w3.org/2000/svg', 'svg');
-  kebabIcon.setAttribute('viewBox', '0 0 16 16');
-  kebabIcon.setAttribute('aria-hidden', 'true');
-  for (const cy of [3, 8, 13]) {
-    const c = document.createElementNS('http://www.w3.org/2000/svg', 'circle');
-    c.setAttribute('cx', '8');
-    c.setAttribute('cy', String(cy));
-    c.setAttribute('r', '1.3');
-    c.setAttribute('fill', 'currentColor');
-    kebabIcon.appendChild(c);
-  }
-  kebab.appendChild(kebabIcon);
+  kebab.appendChild(iconSvg('kebab', { size: 16 }));
   actions.appendChild(kebab);
   li.append(slot, title, time, actions);
   return li;
@@ -1120,7 +1032,7 @@ function buildWsNewMenu() {
     const icon = document.createElement('span');
     icon.className = 'wsMenuItemIcon';
     icon.setAttribute('aria-hidden', 'true');
-    icon.appendChild(folderGlyphSvg(false));
+    icon.appendChild(iconSvg('folderClosed', { size: 16 }));
     const label = document.createElement('span');
     label.className = 'wsMenuItemLabel';
     label.textContent = workspaceName(root);
@@ -1133,7 +1045,7 @@ function buildWsNewMenu() {
       const check = document.createElement('span');
       check.className = 'wsMenuItemCheck';
       check.setAttribute('aria-hidden', 'true');
-      check.appendChild(checkGlyphSvg());
+      check.appendChild(iconSvg('check', { size: 16 }));
       btn.appendChild(check);
       btn.setAttribute('aria-checked', 'true');
     } else {
@@ -1164,7 +1076,7 @@ function buildWsNewMenu() {
   const addIcon = document.createElement('span');
   addIcon.className = 'wsMenuItemIcon';
   addIcon.setAttribute('aria-hidden', 'true');
-  addIcon.appendChild(plusGlyphSvg());
+  addIcon.appendChild(iconSvg('plus', { size: 16 }));
   const addLabel = document.createElement('span');
   addLabel.className = 'wsMenuItemLabel';
   addLabel.textContent = '添加工作区…';
@@ -1340,7 +1252,7 @@ function renderWsPicker() {
     const icon = document.createElement('span');
     icon.className = 'ws-dirIcon';
     icon.setAttribute('aria-hidden', 'true');
-    icon.appendChild(upDirGlyphSvg());
+    icon.appendChild(iconSvg('upDir', { size: 16 }));
     const name = document.createElement('span');
     name.className = 'ws-dirName';
     name.textContent = '..';
@@ -1365,7 +1277,7 @@ function renderWsPicker() {
     const icon = document.createElement('span');
     icon.className = 'ws-dirIcon';
     icon.setAttribute('aria-hidden', 'true');
-    icon.appendChild(folderGlyphSvg(false));
+    icon.appendChild(iconSvg('folderClosed', { size: 16 }));
     const name = document.createElement('span');
     name.className = 'ws-dirName';
     name.textContent = dir.name;
@@ -3448,10 +3360,11 @@ async function openSettings() {
   syncReviewModeToggle(); // R2-S2：收尾评审开关（GET /api/settings 权威回显）
   fillSettingsForm();
   // 设置页扩展区：Subagent 工作流（GET /api/workflow 同步；失败/缺端点降级本地）
-  // + Skills/MCP 端点清单（缺失各自降级）
+  // + Skills/MCP 端点清单（缺失各自降级）+ 安装表单态（空输入 → 安装钮禁用）
   void loadWorkflowPrefView();
   void loadSkills();
   void loadMcp();
+  syncSkillInstallForm();
   syncThemeRadios();
   el.setBaseUrl.focus(); // 键盘可达：打开即聚焦第一表单
 }
@@ -3614,6 +3527,15 @@ function renderSkillList(skills) {
     sum.className = 'set-item-summary';
     sum.textContent = s.summary || '（摘要待补充）';
     main.append(name, sum);
+    li.append(main);
+    // origin='user' 徽章（「用户」小 pill；bundled 不标注 —— 简洁裁定）
+    if (s.origin === 'user') {
+      const badge = document.createElement('span');
+      badge.className = 'badge-mono neutral';
+      badge.textContent = '用户';
+      badge.title = '本机安装的用户技能';
+      li.appendChild(badge);
+    }
     const sw = document.createElement('label');
     sw.className = 'switch';
     const cb = document.createElement('input');
@@ -3624,7 +3546,7 @@ function renderSkillList(skills) {
     const track = document.createElement('span');
     track.className = 'switch-track';
     sw.append(cb, track);
-    li.append(main, sw);
+    li.appendChild(sw);
     el.skillsList.appendChild(li);
   }
 }
@@ -3642,6 +3564,73 @@ async function toggleSkill(id, enabled) {
     el.skillsNote.hidden = false;
     void loadSkills();
   }
+}
+
+// ---- 技能安装表单（URL / 本地路径 单选 → POST /api/skills/install {source}） ----
+
+/** 当前来源类型（'url'|'path'）：分段单选（无选择态兜底 url）。 */
+function skillSourceKind() {
+  const checked = el.skillSrcInputs.find((input) => input.checked);
+  return checked?.value === 'path' ? 'path' : 'url';
+}
+
+/** 分段切换：placeholder 与说明随来源类型联动（文案 = extensions.js 常量单一来源）。 */
+function syncSkillInstallForm() {
+  const kind = skillSourceKind();
+  el.skillInstallSource.placeholder =
+    kind === 'path' ? SKILL_INSTALL_PATH_PLACEHOLDER : SKILL_INSTALL_URL_PLACEHOLDER;
+  el.skillInstallHelp.textContent =
+    kind === 'path' ? SKILL_INSTALL_HELP_PATH : SKILL_INSTALL_HELP_URL;
+  syncSkillInstallButton();
+}
+
+/** 输入/来源变化时重算安装钮可用态（空来源禁用 —— 提交前还有一道空串拦截）。 */
+function syncSkillInstallButton() {
+  const empty = normalizeSkillSource(el.skillInstallSource.value) === '';
+  if (!ui.skillInstalling) {
+    el.btnSkillInstall.textContent = '安装';
+    el.btnSkillInstall.disabled = empty;
+  }
+}
+
+/**
+ * 安装提交：POST /api/skills/install {source}；安装中按钮禁用 + 「安装中…」；
+ * 成功 → toast「已安装 <id>」+ 清空来源 + 重拉清单；失败 → 状态行映射文案
+ * （kind 白名单 → 中文；400/403 / 404 / 其余通用；文案零端点路径）。
+ */
+async function submitSkillInstall() {
+  if (ui.skillInstalling) return;
+  const source = normalizeSkillSource(el.skillInstallSource.value);
+  if (source === '') {
+    el.skillInstallNote.textContent = SKILL_INSTALL_EMPTY_SOURCE;
+    el.skillInstallNote.classList.add('err');
+    el.skillInstallNote.hidden = false;
+    return;
+  }
+  ui.skillInstalling = true;
+  el.btnSkillInstall.disabled = true;
+  el.btnSkillInstall.textContent = SKILL_INSTALL_BUSY;
+  el.skillInstallNote.hidden = true;
+  const result = await installSkill({ source });
+  ui.skillInstalling = false;
+  if (result.ok) {
+    el.skillInstallSource.value = '';
+    syncSkillInstallButton();
+    toast(result.id ? `已安装 ${result.id}` : '已安装');
+    void loadSkills();
+    return;
+  }
+  el.btnSkillInstall.textContent = '安装';
+  el.btnSkillInstall.disabled = false;
+  el.skillInstallNote.textContent = skillInstallErrorText(result.error);
+  el.skillInstallNote.classList.add('err');
+  el.skillInstallNote.hidden = false;
+}
+
+/** 重新扫描：重拉 GET /api/skills（服务端懒读，无独立刷新端点 —— 契约如此）。 */
+function rescanSkills() {
+  void loadSkills();
+  toast('已重新扫描技能目录');
 }
 
 // ---- MCP（GET /api/mcp + POST /api/mcp；客户端协议已实现（stdio JSON-RPC，
@@ -3990,11 +3979,16 @@ function wireEvents() {
     else if (t.dataset.subagentField) applySubagentField(t.dataset.subagentField);
     else if (t.dataset.methodfirstField) applyMethodFirstField(t.checked);
     else if (t.dataset.reviewmodeField) applyReviewModeField(t.checked);
+    else if (t.name === 'skill-install-src') syncSkillInstallForm();
   });
   el.drawer.addEventListener('click', (e) => {
     const action = e.target.closest('[data-set-action]')?.dataset?.setAction;
     if (action === 'mcp-add') void addMcpServer();
+    else if (action === 'skill-install') void submitSkillInstall();
+    else if (action === 'skill-rescan') rescanSkills();
   });
+  // 技能安装输入：非空即解锁安装钮（提交前仍有一次空串拦截）
+  el.skillInstallSource.addEventListener('input', syncSkillInstallButton);
   // 思考强度分段 pill：点击即选 + 防抖提交（失败回滚 toast）
   el.reasoningSeg.addEventListener('click', (event) => {
     const btn = event.target.closest('.reasoning-opt');
@@ -4112,5 +4106,6 @@ async function boot() {
   autogrow();
 }
 
+mountStaticIconGlyphs();
 wireEvents();
 boot();

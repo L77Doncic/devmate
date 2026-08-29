@@ -1,8 +1,9 @@
 /**
  * # test/ui-server/skills：Skills 资产索引 + 运行时开关（波 B：端点契约 A1）
  *
- * GET /api/skills → {skills:[{id,name,summary,enabled}]}：数据源 = deps.skillsDir 下的
+ * GET /api/skills → {skills:[{id,name,summary,enabled,origin}]}：数据源 = deps.skillsDir 下的
  * <id>/SKILL.md frontmatter（name；description 首行 → summary；缺失降级：name=id、summary=''）；
+ * origin 缺省 'bundled'（用户技能安装的合并视图见 skills-install.test.ts；本文件只测 bundled）；
  * 目录不存在/空目录 → 空列表；只含 SKILL.md 的目录进索引。索引缓存（打包资产静态不变）。
  * POST /api/skills/:id {enabled} → 运行时开关（全量开关表经 saveSkillsConfig 持久化到
  * ~/.devmate/config.json 的 skills 节；无则仅内存）；未知 id → 404；enabled 非 boolean → 400；
@@ -18,30 +19,33 @@ import type { DevmateServer, DevmateServerDeps } from '../../src/ui/server/index
 import { FakeLlm } from '../loop/support.js';
 import { postJson, startServer } from './support.js';
 
-function baseDeps(extra: Partial<DevmateServerDeps> = {}): DevmateServerDeps {
+async function baseDeps(extra: Partial<DevmateServerDeps> = {}): Promise<DevmateServerDeps> {
+  // 用户技能目录注入空 tmp（缺省 ~/.devmate/skills 不入测试域——只测 bundled 视图）
+  const userDir = await tempDir();
   return {
     store: new MemorySessionAdapter(),
     tools: defineRegistry([], { sessionId: 's1' }),
     llm: new FakeLlm([{ content: 'x' }]),
     model: 'test-model',
+    userSkillsDir: userDir,
     ...extra,
   };
 }
 
-describe('ui/server：/api/skills', () => {
-  const servers: DevmateServer[] = [];
-  const tempDirs: string[] = [];
+const servers: DevmateServer[] = [];
+const tempDirs: string[] = [];
 
+async function tempDir(): Promise<string> {
+  const dir = await mkdtemp(join(tmpdir(), 'devmate-skills-'));
+  tempDirs.push(dir);
+  return dir;
+}
+
+describe('ui/server：/api/skills', () => {
   afterEach(async () => {
     for (const server of servers.splice(0)) await server.close();
     for (const dir of tempDirs.splice(0)) await rm(dir, { recursive: true, force: true });
   });
-
-  async function tempDir(): Promise<string> {
-    const dir = await mkdtemp(join(tmpdir(), 'devmate-skills-'));
-    tempDirs.push(dir);
-    return dir;
-  }
 
   async function writeSkill(
     skillsDir: string,
@@ -63,7 +67,7 @@ describe('ui/server：/api/skills', () => {
 
   it('k1) 目录不存在/空目录 → {skills:[]}；全量响应不带 SKILL.md 全文', async () => {
     const missing = join(await tempDir(), 'no-such-dir');
-    const { base, server } = await startServer(baseDeps({ skillsDir: missing }));
+    const { base, server } = await startServer(await baseDeps({ skillsDir: missing }));
     servers.push(server);
 
     const res = await fetch(new URL('/api/skills', base));
@@ -73,7 +77,9 @@ describe('ui/server：/api/skills', () => {
 
     const empty = join(await tempDir(), 'empty');
     await mkdir(empty, { recursive: true });
-    const { base: base2, server: server2 } = await startServer(baseDeps({ skillsDir: empty }));
+    const { base: base2, server: server2 } = await startServer(
+      await baseDeps({ skillsDir: empty }),
+    );
     servers.push(server2);
     expect(
       ((await (await fetch(new URL('/api/skills', base2))).json()) as { skills: unknown[] }).skills,
@@ -104,7 +110,7 @@ describe('ui/server：/api/skills', () => {
     await mkdir(join(skillsDir, 'license-copy'), { recursive: true });
     await writeFile(join(skillsDir, 'license-copy', 'README.md'), 'attribution only');
 
-    const { base, server } = await startServer(baseDeps({ skillsDir }));
+    const { base, server } = await startServer(await baseDeps({ skillsDir }));
     servers.push(server);
 
     const res = await fetch(new URL('/api/skills', base));
@@ -113,12 +119,13 @@ describe('ui/server：/api/skills', () => {
     expect(text).not.toContain('Just a title'); // 全文不下发：SKILL.md body 不在响应里
     const body = JSON.parse(text) as { skills: Array<Record<string, unknown>> };
     expect(body.skills).toEqual([
-      { id: 'no-meta', name: 'no-meta', summary: '', enabled: true },
+      { id: 'no-meta', name: 'no-meta', summary: '', enabled: true, origin: 'bundled' },
       {
         id: 'research',
         name: 'research',
         summary: 'Investigate a question against high-trust primary sources.',
         enabled: true,
+        origin: 'bundled',
       },
       {
         id: 'tdd',
@@ -126,6 +133,7 @@ describe('ui/server：/api/skills', () => {
         summary:
           'Test-driven development. Use when the user wants to build features or fix bugs test-first, mentions "red-green-refactor", or wants integration tests.',
         enabled: true,
+        origin: 'bundled',
       },
     ]);
   });
@@ -141,7 +149,7 @@ describe('ui/server：/api/skills', () => {
       '',
     );
     const saveSkillsConfig = vi.fn();
-    const { base, server } = await startServer(baseDeps({ skillsDir, saveSkillsConfig }));
+    const { base, server } = await startServer(await baseDeps({ skillsDir, saveSkillsConfig }));
     servers.push(server);
 
     const off = await postJson(base, '/api/skills/tdd', { enabled: false });
@@ -153,8 +161,8 @@ describe('ui/server：/api/skills', () => {
       skills: Array<{ id: string; enabled: boolean }>;
     };
     expect(list.skills).toEqual([
-      { id: 'research', name: 'research', summary: 'Research.', enabled: true },
-      { id: 'tdd', name: 'tdd', summary: 'TDD loop.', enabled: false },
+      { id: 'research', name: 'research', summary: 'Research.', enabled: true, origin: 'bundled' },
+      { id: 'tdd', name: 'tdd', summary: 'TDD loop.', enabled: false, origin: 'bundled' },
     ]);
 
     const back = await postJson(base, '/api/skills/tdd', { enabled: true });
@@ -169,7 +177,7 @@ describe('ui/server：/api/skills', () => {
     await skill(skillsDir, 'research', '---\nname: research\ndescription: R.\n---\n\n', '');
     const saveSkillsConfig = vi.fn();
     const { base, server } = await startServer(
-      baseDeps({ skillsDir, saveSkillsConfig, skillsRecord: { tdd: false } }),
+      await baseDeps({ skillsDir, saveSkillsConfig, skillsRecord: { tdd: false } }),
     );
     servers.push(server);
 
@@ -192,7 +200,9 @@ describe('ui/server：/api/skills', () => {
     const skillsDir = join(await tempDir(), 'skills');
     await mkdir(skillsDir, { recursive: true });
     await skill(skillsDir, 'tdd', '---\nname: tdd\ndescription: TDD.\n---\n\n', '');
-    const { base, server } = await startServer(baseDeps({ skillsDir, saveSkillsConfig: vi.fn() }));
+    const { base, server } = await startServer(
+      await baseDeps({ skillsDir, saveSkillsConfig: vi.fn() }),
+    );
     servers.push(server);
 
     const unknown = await postJson(base, '/api/skills/ghost', { enabled: false });
@@ -207,7 +217,7 @@ describe('ui/server：/api/skills', () => {
     expect(missing.status).toBe(400);
 
     // 无 saveSkillsConfig：开关仍生效（内存态）
-    const { base: base2, server: server2 } = await startServer(baseDeps({ skillsDir }));
+    const { base: base2, server: server2 } = await startServer(await baseDeps({ skillsDir }));
     servers.push(server2);
     const mem = await postJson(base2, '/api/skills/tdd', { enabled: false });
     expect(mem.status).toBe(200);

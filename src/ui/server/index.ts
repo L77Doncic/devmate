@@ -29,6 +29,15 @@
  *   持久化断环：CLI attach 注入旧快照）；/api/mcp 添加带尺寸限制（name ≤64、command ≤256、
  *   args ≤16 且每项 ≤128，超限 400 {error} 带原因）；GET /api/mcp 响应 args 脱敏
  *   （--header/-H 后 Authorization 头掩码——服务端内部连接仍用原始 args，见 mcp-mask.ts）。
+ * - 用户技能安装（P 档）：POST /api/skills/install {source}——本地（绝对 SKILL.md 或含
+ *   SKILL.md 的目录 → 整目录复制到 <userSkillsDir>/<id>；id = frontmatter name 的 slug（严格
+ *   [a-z0-9-]）；无 name/相对路径 → invalid-source）与 URL（仅 https://raw.githubusercontent.com/
+ *   <owner>/<repo>/<branch>/<path...>.md——host 白名单强制、逐段校验拒绝 .. / %2e / %2f、
+ *   无查询串、重定向不跟随（redirect:'manual'）、读流计数 ≤512KB、UTF-8 文本无 NUL）；
+ *   已存在 → 409 skill-exists（幂等不覆盖）；成功 {ok:true,id,origin:'user'}；错误统一
+ *   {error:{type,message}}（invalid-source 400/unsupported-host 400/too-large 413/
+ *   skill-exists 409/fetch-failed 502/write-failed 500）。大文件/抓取经 deps.fetch（缺省全局
+ *   fetch；测试 mock——禁止外部网络）。**全文绝不下发**：GET /api/skills 只有元数据。
  * - 多工作区（注册表 + 会话级根）：GET/POST /api/workspaces（缺省表 = [workspaceRoot]；
  *   POST 校验 绝对/存在/目录/realpath 归一/可读 → 注册 canonical + saveWorkspaces 持久化，
  *   重复注册幂等）、DELETE /api/workspaces/:encodedRoot（默认根不可删 400；未注册 404；
@@ -65,9 +74,9 @@ import { randomUUID } from 'node:crypto';
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from 'node:http';
 import type { Socket } from 'node:net';
 import type { Dirent } from 'node:fs';
-import { readFile, readdir, realpath, stat } from 'node:fs/promises';
+import { cp, mkdir, readFile, readdir, realpath, stat, writeFile } from 'node:fs/promises';
 import { homedir } from 'node:os';
-import { extname, isAbsolute, join, normalize, resolve, sep } from 'node:path';
+import { basename, dirname, extname, isAbsolute, join, normalize, resolve, sep } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 import type { ConversationSummarizer } from '../../core/context/index.js';
@@ -93,8 +102,9 @@ import type {
   MethodologyEntry,
   MethodologyIndex,
   MethodologyMap,
+  SkillMethodology,
 } from '../../shared/methodology.js';
-import { parseMethodologyMap } from '../../shared/methodology.js';
+import { parseMethodologyMap, parseSkillMethodologyValue } from '../../shared/methodology.js';
 import { assertValidSessionId } from '../../core/session/base.js';
 import { SessionExistsError, SessionNotFoundError } from '../../core/session/errors.js';
 import type { SessionStore } from '../../core/session/index.js';
@@ -292,6 +302,10 @@ export interface DevmateServerDeps {
   idleShellTtlMs?: number;
   /** Skills 资产目录（缺省 resolve(process.cwd(),'dist/assets/skills')）；不存在/为空 → GET /api/skills 空列表。 */
   skillsDir?: string;
+  /** 用户技能目录（缺省 ~/.devmate/skills；懒建——首装时；不入 StoredConfig——CLI 无需改动）。 */
+  userSkillsDir?: string;
+  /** URL 安装的抓取实现（缺省全局 fetch；测试注入 mock——禁止外部网络；不跟随重定向）。 */
+  fetch?: typeof globalThis.fetch;
   /** Skills 开关持久化（~/.devmate/config.json 的 skills 节；CLI 注入 saveConfig 包装——无则仅内存）。 */
   saveSkillsConfig?: (skills: Record<string, boolean>) => void | Promise<void>;
   /** Skills 开关初值（socket 播种：旧开关经 CLI attach 注入，构造期种子；缺省 {} = 全开）。 */
@@ -1083,18 +1097,32 @@ async function sessionDetailFrames(
 // Skills 资产索引（GET /api/skills：deps.skillsDir 的 <id>/SKILL.md frontmatter）
 // ---------------------------------------------------------------------------
 
-/** 技能目录的入口文件（frontmatter 携带 name/description）。 */
+/** 技能目录的入口文件（frontmatter 携带 name/description；用户技能可带 methodology 块行）。 */
 const SKILL_ENTRY = 'SKILL.md';
 
-/** 索引缓存：打包资产静态不变——每实例构建一次，启动后恒定（POST 开关不触发重扫）。 */
+/** 技能来源（GET /api/skills 的 origin；缺省 bundled）。 */
+export type SkillOrigin = 'bundled' | 'user';
+
+/**
+ * 索引行：打包资产静态不变——每实例构建一次，启动后恒定（POST 开关不触发重扫）；
+ * 用户目录行由扫描（mtime 签名懒读 + install 显式失效）动态维护。
+ */
 interface SkillDescriptor {
   id: string;
   name: string;
   summary: string;
+  /** 来源（安装/合并语义：user 同名覆盖 bundled——list 单条、位置不动、descriptor 顶替）。 */
+  origin: SkillOrigin;
+  /** frontmatter 的 methodology 块（仅用户技能可能带；bundled 从 methodologies.json 进）。 */
+  methodology?: SkillMethodology;
 }
 
-/** 解析 SKILL.md 头 frontmatter（`---` … `---`）：name / description 每字段一行；缩进续行忽略。 */
-function parseSkillFrontmatter(content: string): { name?: string; description?: string } {
+/** 解析 SKILL.md 头 frontmatter（`---` … `---`）：name / description / methodology 每字段一行；缩进续行忽略。 */
+function parseSkillFrontmatter(content: string): {
+  name?: string;
+  description?: string;
+  methodology?: SkillMethodology;
+} {
   const m = /^---\r?\n([\s\S]*?)\r?\n---\s*(?:\r?\n|$)/.exec(content);
   if (m === null) return {};
   const fields: Record<string, string> = {};
@@ -1102,9 +1130,11 @@ function parseSkillFrontmatter(content: string): { name?: string; description?: 
     const kv = /^([A-Za-z0-9_-]+):\s*(.*)$/.exec(line);
     if (kv !== null && fields[kv[1]!] === undefined) fields[kv[1]!] = kv[2]!.trim();
   }
+  const methodology = parseSkillMethodologyValue(fields['methodology']);
   return {
     ...(fields.name !== undefined ? { name: fields.name } : {}),
     ...(fields.description !== undefined ? { description: fields.description } : {}),
+    ...(methodology !== null ? { methodology } : {}),
   };
 }
 
@@ -1114,8 +1144,8 @@ function descriptionFirstLine(description: string | undefined): string {
   return (description.split('\n')[0] ?? '').trim();
 }
 
-/** 扫描 skillsDir：每个含 SKILL.md 的子目录 → 索引项；目录不存在/不可读 → 空列表。 */
-async function scanSkillsIndex(skillsDir: string): Promise<SkillDescriptor[]> {
+/** 扫描技能目录：每个含 SKILL.md 的子目录 → 索引项；目录不存在/不可读 → 空列表。 */
+async function scanSkillsIndex(skillsDir: string, origin: SkillOrigin): Promise<SkillDescriptor[]> {
   let entries: Dirent[];
   try {
     entries = await readdir(skillsDir, { withFileTypes: true });
@@ -1136,6 +1166,8 @@ async function scanSkillsIndex(skillsDir: string): Promise<SkillDescriptor[]> {
       id: entry.name,
       name: meta.name ?? entry.name, // 缺失降级：name = id
       summary: descriptionFirstLine(meta.description),
+      origin,
+      ...(meta.methodology !== undefined ? { methodology: meta.methodology } : {}),
     });
   }
   return skills.sort((a, b) => (a.id < b.id ? -1 : a.id > b.id ? 1 : 0));
@@ -1144,6 +1176,98 @@ async function scanSkillsIndex(skillsDir: string): Promise<SkillDescriptor[]> {
 /** 缺省 skills 资产目录（dev 模式服务端在 dist 上跑——统一 dist 路径，静态 dev 可选）。 */
 function defaultSkillsDir(): string {
   return resolve(process.cwd(), 'dist', 'assets', 'skills');
+}
+
+/** 缺省用户技能目录（~/.devmate/skills；懒建——首装时；不入 StoredConfig——CLI 无需改动）。 */
+function defaultUserSkillsDir(): string {
+  return join(homedir(), '.devmate', 'skills');
+}
+
+/** 用户技能 id 的合法域（slug 化后严格 [a-z0-9-]——防路径逃逸的判定根：id 即目录名）。 */
+const USER_SKILL_ID_RE = /^[a-z0-9-]+$/;
+
+/** github raw 白名单 host（URL 安装唯一允许的源——SSRF 面收敛为 raw.githubusercontent.com）。 */
+export const RAW_GITHUB_HOST = 'raw.githubusercontent.com';
+
+/** URL 安装的流大小上限（字节；读流计数，超限 → 413 too-large）。 */
+export const SKILL_INSTALL_MAX_BYTES = 512 * 1024;
+
+/** URL 安装的抓取超时（ms；网络错/超时 → 502 fetch-failed）。 */
+export const SKILL_FETCH_TIMEOUT_MS = 15_000;
+
+/** 安装失败的错误类型（响应 {error:{type,message}} 的 type；状态映射：invalid-source/unsupported-host 400、skill-exists 409、too-large 413、fetch-failed 502、write-failed 500）。 */
+export type SkillInstallErrorType =
+  | 'invalid-source'
+  | 'unsupported-host'
+  | 'fetch-failed'
+  | 'too-large'
+  | 'skill-exists'
+  | 'write-failed';
+
+/**
+ * frontmatter name → 技能 id（slug 化：小写、非 [a-z0-9] 折叠为 '-'、首尾 '-' 修剪；
+ * 结果可为空串——调用方按 invalid-source 收敛）。严格 [a-z0-9-] 是防路径逃逸的根：
+ * id 直接构成 <userSkillsDir>/<id>/，域外字符一律不被清洗进路径（`..`/`/` 全部折叠掉）。
+ */
+export function slugifySkillName(name: string): string {
+  return name
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, '-')
+    .replace(/^-+|-+$/g, '');
+}
+
+/** 合法 github raw 源 URL 的解析结果（构成段全部逐段校验过）。 */
+export interface RawGithubRef {
+  owner: string;
+  repo: string;
+  branch: string;
+  filePath: string;
+}
+
+/**
+ * 白名单 raw 源 URL 校验（纯函数；矩阵见 test/ui-server/skills-install）：
+ * - 仅 https；host 严格 raw.githubusercontent.com（host 白名单强制——其余 host 由
+ *   调用方按 unsupported-host 收敛）；
+ * - 无查询串/无片段（查询注入面整体关闭：query/hash 属于「查询串 abuse」→ 非法）；
+ * - 路径 = owner/repo/branch/<path...>.md（≥4 段、末段 .md 尾、无尾斜杠）；
+ * - 逐段校验：拒绝 `..`（含 . 段）、%2e（大小写，编码点逃逸）、%2f（分支/路径注入）、
+ *   %5c、字面反斜杠与空白/控制字符——段边界不可被编码绕过；
+ * - URL 构造器点段归一化对账：`..` / `%2e..` 会被解析器吃掉（fetch/服务器等价归一）——
+ *   原始路径 != 标准化 pathname 即非法（归一化本身即逃逸信号）。
+ * 非法 → null。
+ */
+export function parseRawGithubUrl(raw: string): RawGithubRef | null {
+  // 空白/控制字符（含 NUL）：URL 构造会静默编码，一律拒绝
+  for (let i = 0; i < raw.length; i += 1) {
+    if (raw.charCodeAt(i) <= 0x20) return null;
+  }
+  let url: URL;
+  try {
+    url = new URL(raw);
+  } catch {
+    return null;
+  }
+  if (url.protocol !== 'https:' || url.hostname !== RAW_GITHUB_HOST) return null;
+  // 端口/用户信息一律拒绝（白名单 host 唯一形态：仅 host+path，其余都可能是注入面）
+  if (url.port !== '' || url.username !== '' || url.password !== '') return null;
+  if (url.search !== '' || url.hash !== '') return null;
+  const rest = raw.slice('https://'.length);
+  const firstSlash = rest.indexOf('/');
+  if (firstSlash === -1) return null;
+  const rawPath = rest.slice(firstSlash);
+  if (rawPath === '' || rawPath.endsWith('/')) return null;
+  if (rawPath !== url.pathname) return null; // 点段被构造器归一化 → 逃逸信号
+  const segments = rawPath.slice(1).split('/');
+  if (segments.length < 4) return null;
+  const filePath = segments.slice(3).join('/');
+  if (!filePath.endsWith('.md')) return null;
+  for (const segment of segments) {
+    if (segment === '.' || segment === '..' || segment.includes('..')) return null;
+    const lower = segment.toLowerCase();
+    if (lower.includes('%2e') || lower.includes('%2f') || lower.includes('%5c')) return null;
+    if (segment.includes('\\')) return null;
+  }
+  return { owner: segments[0]!, repo: segments[1]!, branch: segments[2]!, filePath };
 }
 
 /**
@@ -1926,15 +2050,51 @@ export function createDevmateServer(deps: DevmateServerDeps): DevmateServer {
     sendJson(res, 200, { ok: true });
   }
 
-  // -- Skills（A1：资产索引 + 运行时开关；全文不下发） --
+  // -- Skills（A1：资产索引 + 运行时开关 + 用户技能安装；全文不下发） --
   const skillsDir = deps.skillsDir ?? defaultSkillsDir();
+  const userSkillsDir = deps.userSkillsDir ?? defaultUserSkillsDir();
   let skillsCache: SkillDescriptor[] | null = null;
+  /**
+   * 用户技能索引缓存（懒读 + 即时失效双路径——「不动服务器进程可感知」）：
+   * - 惰性重扫：目录 mtime+size 签名（外部直写/删除目录 → 下次读取自然重扫）；
+   * - 显式失效：install 成功路径清空缓存（写内容不改变父目录 mtime——非新目录的
+   *   覆盖/新增文件靠显式失效兜底）。
+   */
+  let userSkillsCache: { sig: string; entries: SkillDescriptor[] } | null = null;
   // 开关构造期播种（deps.skillsRecord 注入的旧快照——重启禁用保持：持久化断环修复；
-  // 未注入/缺失 id 缺省 true = 全开）；缺省空表。
+  // 未注入/缺失 id 缺省 true = 全开）；缺省空表。一张表覆盖 bundled 与 user（键 = id 通用）。
   const skillsSwitches = new Map<string, boolean>(Object.entries(deps.skillsRecord ?? {}));
-  const ensureSkillsIndex = async (): Promise<SkillDescriptor[]> => {
-    if (skillsCache === null) skillsCache = await scanSkillsIndex(skillsDir);
+  const ensureBundledSkillsIndex = async (): Promise<SkillDescriptor[]> => {
+    if (skillsCache === null) skillsCache = await scanSkillsIndex(skillsDir, 'bundled');
     return skillsCache;
+  };
+  const ensureUserSkillsIndex = async (): Promise<SkillDescriptor[]> => {
+    let sig = 'missing';
+    try {
+      const info = await stat(userSkillsDir);
+      sig = `${info.mtimeMs}:${info.size}`;
+    } catch {
+      // 目录不存在（未装过任何用户技能）→ 空列表；创建后 mtime 签名变化自然重扫
+    }
+    if (userSkillsCache !== null && userSkillsCache.sig === sig) return userSkillsCache.entries;
+    const entries = await scanSkillsIndex(userSkillsDir, 'user');
+    userSkillsCache = { sig, entries };
+    return entries;
+  };
+  /**
+   * 合并索引：bundled（id 序）在前 + pure user（id 序）按首见序追加；同名 id 用户覆盖
+   * ——Map.set 顶替 descriptor、保留 bundled 位置（列表单条、GET origin='user'；
+   * 内容/方法论路由表项一并顶替——见 content 与 loadMethodologyMeta）。
+   */
+  const ensureSkillsIndex = async (): Promise<SkillDescriptor[]> => {
+    const [bundled, user] = await Promise.all([
+      ensureBundledSkillsIndex(),
+      ensureUserSkillsIndex(),
+    ]);
+    const byId = new Map<string, SkillDescriptor>();
+    for (const skill of bundled) byId.set(skill.id, skill);
+    for (const skill of user) byId.set(skill.id, skill);
+    return [...byId.values()];
   };
   const skillsSnapshot = async (): Promise<Record<string, boolean>> => {
     const snapshot: Record<string, boolean> = {};
@@ -1951,6 +2111,7 @@ export function createDevmateServer(deps: DevmateServerDeps): DevmateServer {
         name: skill.name,
         summary: skill.summary,
         enabled: skillsSwitches.get(skill.id) ?? true,
+        origin: skill.origin,
       })),
     });
   }
@@ -1980,6 +2141,236 @@ export function createDevmateServer(deps: DevmateServerDeps): DevmateServer {
     sendJson(res, 200, { ok: true });
   }
 
+  // -- 用户技能安装（P 档：POST /api/skills/install；错误统一 {error:{type,message}}） --
+
+  /** 安装失败（错误形状与 4xx/5xx 状态由类型单一映射；见 handleSkillInstall 的 catch）。 */
+  class SkillInstallError extends Error {
+    constructor(
+      readonly type: SkillInstallErrorType,
+      readonly status: number,
+      message: string,
+    ) {
+      super(message);
+    }
+  }
+
+  /**
+   * 从内容提取技能 id：frontmatter name 的 slug 化（严格 [a-z0-9-]——防路径逃逸的判定根，
+   * 直接在 <userSkillsDir>/<id>/ 落地：id 不合法即拒绝，绝不把域外字符清洗进路径）。
+   * 无 name / slug 为空 → invalid-source。
+   */
+  function skillIdFromContent(content: string): string {
+    const meta = parseSkillFrontmatter(content);
+    const name = meta.name;
+    if (name === undefined || name === '') {
+      throw new SkillInstallError('invalid-source', 400, 'SKILL.md frontmatter has no name');
+    }
+    const id = slugifySkillName(name);
+    if (!USER_SKILL_ID_RE.test(id)) {
+      throw new SkillInstallError(
+        'invalid-source',
+        400,
+        `skill name yields invalid id: ${JSON.stringify(name)}`,
+      );
+    }
+    return id;
+  }
+
+  /** 已存在 → 409 skill-exists（幂等不覆盖；目录或占名文件都视为已存在）。 */
+  async function assertNotInstalled(id: string): Promise<void> {
+    try {
+      await stat(join(userSkillsDir, id));
+      throw new SkillInstallError('skill-exists', 409, `skill already installed: ${id}`);
+    } catch (err) {
+      if (err instanceof SkillInstallError) throw err;
+      // ENOENT（未装）→ 放行
+    }
+  }
+
+  /** 本地安装：绝对 SKILL.md（基名=SKILL.md）或含 SKILL.md 的目录 → 整目录复制。 */
+  async function installFromLocal(source: string): Promise<string> {
+    let info: Awaited<ReturnType<typeof stat>>;
+    try {
+      info = await stat(source);
+    } catch {
+      throw new SkillInstallError('invalid-source', 400, `local source not accessible: ${source}`);
+    }
+    let skillDir: string;
+    if (info.isDirectory()) {
+      try {
+        if (!(await stat(join(source, SKILL_ENTRY))).isFile()) {
+          throw new SkillInstallError('invalid-source', 400, 'SKILL.md is not a file');
+        }
+      } catch (err) {
+        if (err instanceof SkillInstallError) throw err;
+        throw new SkillInstallError('invalid-source', 400, 'directory contains no SKILL.md');
+      }
+      skillDir = source;
+    } else {
+      if (basename(source) !== SKILL_ENTRY) {
+        throw new SkillInstallError('invalid-source', 400, 'local file must be named SKILL.md');
+      }
+      skillDir = dirname(source);
+    }
+    let content: string;
+    try {
+      content = await readFile(join(skillDir, SKILL_ENTRY), 'utf8');
+    } catch {
+      throw new SkillInstallError('invalid-source', 400, 'SKILL.md is not readable');
+    }
+    if (content.includes('\u0000')) {
+      // 写入前 sanitize（与 URL 同规）：仅文本（UTF-8）、拒含 NUL 的字符串
+      throw new SkillInstallError('invalid-source', 400, 'content contains NUL bytes');
+    }
+    const id = skillIdFromContent(content);
+    await assertNotInstalled(id);
+    const dest = join(userSkillsDir, id);
+    try {
+      await mkdir(userSkillsDir, { recursive: true }); // 目录懒建（首装时）
+      await cp(skillDir, dest, { recursive: true });
+    } catch (err) {
+      throw new SkillInstallError('write-failed', 500, `write failed: ${errorCodeOf(err)}`);
+    }
+    userSkillsCache = null; // 显式失效：向后的 list()/content() 立即反映（无需重启）
+    return id;
+  }
+
+  /** URL 安装错误类型的属性映射：URL 可解析且 host 非白名单 → unsupported-host；其余 → invalid-source。 */
+  function installUrlErrorType(source: string): SkillInstallErrorType {
+    try {
+      const url = new URL(source);
+      if (url.protocol === 'https:' && url.hostname !== RAW_GITHUB_HOST) return 'unsupported-host';
+      return 'invalid-source';
+    } catch {
+      return 'invalid-source';
+    }
+  }
+
+  /** URL 正文读取：读流计数（≤ SKILL_INSTALL_MAX_BYTES）+ UTF-8 严格解码（仅文本）+ 拒 NUL。 */
+  async function readBoundedUtf8(response: Response): Promise<string> {
+    const reader = response.body!.getReader();
+    const decoder = new TextDecoder('utf-8', { fatal: true });
+    let text = '';
+    let bytes = 0;
+    let invalidUtf8 = false;
+    for (;;) {
+      let chunk: Uint8Array;
+      try {
+        const { done, value } = await reader.read();
+        if (done) break;
+        chunk = value;
+      } catch {
+        throw new SkillInstallError('fetch-failed', 502, 'response stream interrupted');
+      }
+      bytes += chunk.byteLength;
+      if (bytes > SKILL_INSTALL_MAX_BYTES) {
+        await reader.cancel().catch(() => undefined);
+        throw new SkillInstallError(
+          'too-large',
+          413,
+          `content exceeds ${SKILL_INSTALL_MAX_BYTES} bytes`,
+        );
+      }
+      try {
+        text += decoder.decode(chunk, { stream: true });
+      } catch {
+        invalidUtf8 = true;
+        await reader.cancel().catch(() => undefined);
+        break;
+      }
+    }
+    if (!invalidUtf8) {
+      try {
+        text += decoder.decode();
+      } catch {
+        invalidUtf8 = true;
+      }
+    }
+    if (invalidUtf8) {
+      throw new SkillInstallError('invalid-source', 400, 'content is not valid UTF-8 text');
+    }
+    if (text.includes('\u0000')) {
+      throw new SkillInstallError('invalid-source', 400, 'content contains NUL bytes');
+    }
+    return text;
+  }
+
+  /** URL 安装：白名单校验 → 注入 fetch（不跟随重定向、超时）→ 读流 → 落地 <id>/SKILL.md。 */
+  async function installFromUrl(source: string): Promise<string> {
+    const parsed = parseRawGithubUrl(source);
+    if (parsed === null) {
+      throw new SkillInstallError(installUrlErrorType(source), 400, 'invalid source URL');
+    }
+    const fetcher = deps.fetch ?? globalThis.fetch;
+    let response: Response;
+    try {
+      response = await fetcher(source, {
+        redirect: 'manual', // 重定向不跟随：3xx 一律 fetch-failed（非 200）
+        // 真实抓取才挂超时（fallback fetch）；测试注入 mock 时避免挂真实定时器
+        ...(deps.fetch === undefined
+          ? { signal: AbortSignal.timeout(SKILL_FETCH_TIMEOUT_MS) }
+          : {}),
+      });
+    } catch {
+      throw new SkillInstallError(
+        'fetch-failed',
+        502,
+        'fetch failed (network error, redirect or timeout)',
+      );
+    }
+    if (response.status !== 200) {
+      throw new SkillInstallError('fetch-failed', 502, `fetch returned status ${response.status}`);
+    }
+    if (response.body === null) {
+      throw new SkillInstallError('fetch-failed', 502, 'response body is empty');
+    }
+    const text = await readBoundedUtf8(response);
+    const id = skillIdFromContent(text);
+    await assertNotInstalled(id);
+    const dest = join(userSkillsDir, id);
+    try {
+      await mkdir(dest, { recursive: true }); // 目录懒建（首装时；含 userSkillsDir 本体）
+      await writeFile(join(dest, SKILL_ENTRY), text);
+    } catch (err) {
+      throw new SkillInstallError('write-failed', 500, `write failed: ${errorCodeOf(err)}`);
+    }
+    userSkillsCache = null; // 显式失效：向后的 list()/content() 立即反映（无需重启）
+    return id;
+  }
+
+  /** install 全链串行化（409 检查与写入的 TOCTOU 窗口关闭——同 id 并发装仅首装成功）。 */
+  let installGuard: Promise<unknown> = Promise.resolve();
+  async function handleSkillInstall(req: IncomingMessage, res: ServerResponse): Promise<void> {
+    try {
+      const body = await readJson(req);
+      if (typeof body !== 'object' || body === null) {
+        throw new SkillInstallError('invalid-source', 400, 'request body must be a JSON object');
+      }
+      const source = asString((body as Record<string, unknown>).source);
+      if (source === undefined || source === '') {
+        throw new SkillInstallError('invalid-source', 400, 'source is required (non-empty string)');
+      }
+      const run = async (): Promise<string> => {
+        if (/^https?:\/\//i.test(source)) return installFromUrl(source);
+        if (isAbsolute(source)) return installFromLocal(source);
+        throw new SkillInstallError('invalid-source', 400, 'local source must be an absolute path');
+      };
+      const chained = installGuard.then(run, run);
+      installGuard = chained.then(
+        () => undefined,
+        () => undefined,
+      );
+      const id = await chained;
+      sendJson(res, 200, { ok: true, id, origin: 'user' });
+    } catch (err) {
+      if (err instanceof SkillInstallError) {
+        sendJson(res, err.status, { error: { type: err.type, message: err.message } });
+        return;
+      }
+      throw err;
+    }
+  }
+
   // -- 工作流（A2）与 MCP（A3）：均为配置层（子代理/MCP 实际执行属 P2，端点上只有配置） --
   // maxParallel 夹紧 1-4（单一来源：shared/workflow 的 clampMaxParallel——三处副本已收敛）
   const workflowState = {
@@ -2007,10 +2398,14 @@ export function createDevmateServer(deps: DevmateServerDeps): DevmateServer {
         }));
       },
       async content(id) {
-        const index = await ensureSkillsIndex();
-        if (!index.some((skill) => skill.id === id)) return null;
+        // 内容优先级 user > bundled（同名 id 用户覆盖——用户目录存在即读用户文件；
+        // 仅 bundled 命中才读资产，被用户覆盖的 bundled 内容不再可达）。
+        const user = await ensureUserSkillsIndex();
+        const userHit = user.some((skill) => skill.id === id);
+        const bundled = await ensureBundledSkillsIndex();
+        if (!userHit && !bundled.some((skill) => skill.id === id)) return null;
         try {
-          return await readFile(join(skillsDir, id, SKILL_ENTRY), 'utf8');
+          return await readFile(join(userHit ? userSkillsDir : skillsDir, id, SKILL_ENTRY), 'utf8');
         } catch {
           return null; // 读不到（文件缺失/内容不可读）→ null（工具按 not-found 收敛）
         }
@@ -2026,12 +2421,21 @@ export function createDevmateServer(deps: DevmateServerDeps): DevmateServer {
       },
     });
   }
-  // 方法论索引（R2-S1）：元数据表（methodologies.json 动态读一次 + 缓存——打包资产静态）
-  // × skillsSwitches（运行时开关现读）——前置门 route 与提示词路由节经晚绑定回填现读。
+  // 方法论索引（R2-S1）：元数据表 = methodologies.json（dynamic 读一次 + 缓存——打包资产
+  // 静态）⊕ 用户技能 frontmatter 的 methodology 块（组合：bundled 键序在前——路由优先级；
+  // 同名 id 用户覆盖——顶替路由表项并保留 bundled 位置，与索引合并同规（「注明」即
+  // origin/user 语义与位置不变可见））× skillsSwitches（运行时开关现读）——
+  // 前置门 route 与提示词路由节经晚绑定回填现读。
   let methodologyCache: MethodologyMap | null = null;
   const loadMethodologyMeta = async (): Promise<MethodologyMap> => {
     if (methodologyCache === null) methodologyCache = await loadMethodologies(skillsDir);
-    return methodologyCache;
+    const user = await ensureUserSkillsIndex();
+    if (user.every((skill) => skill.methodology === undefined)) return methodologyCache;
+    const combined: MethodologyMap = { ...methodologyCache };
+    for (const skill of user) {
+      if (skill.methodology !== undefined) combined[skill.id] = skill.methodology;
+    }
+    return combined;
   };
   if (deps.attachMethodologyIndex !== undefined) {
     deps.attachMethodologyIndex({
@@ -2576,6 +2980,11 @@ export function createDevmateServer(deps: DevmateServerDeps): DevmateServer {
     if (method === 'GET' && pathname === '/api/stats') return handleStats(res);
     if (method === 'GET' && pathname === '/api/tools') return handleTools(res);
     if (method === 'GET' && pathname === '/api/skills') return handleSkills(res);
+    // 安装端点先于 toggle 匹配（字面 'install' 专属；id='install' 的技能仍可经
+    // SkillsIndex.setEnabled 或 GET/其它路径管理——路由字面前置，约定俗成）。
+    if (method === 'POST' && pathname === '/api/skills/install') {
+      return handleSkillInstall(req, res);
+    }
     if (method === 'POST' && pathname.startsWith('/api/skills/')) {
       return handleSkillToggle(req, res, pathname.slice('/api/skills/'.length));
     }

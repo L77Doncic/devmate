@@ -1238,6 +1238,19 @@ pre {
 .projectRow:hover .folder {
   display: none;
 }
+/* folder slot 两态互斥（aria-expanded 裁决；hover 时一律退给 chevron） */
+.projectRow[aria-expanded='true'] .folder.folderClose {
+  display: none;
+}
+.projectRow[aria-expanded='true'] .folder.folderOpen {
+  display: inline-flex;
+}
+.projectRow[aria-expanded='false'] .folder.folderOpen {
+  display: none;
+}
+.projectRow[aria-expanded='false'] .folder.folderClose {
+  display: inline-flex;
+}
 .arrow {
   transition: transform 150ms var(--ds-ease-in-out);
 }
@@ -3311,6 +3324,56 @@ pre {
 .set-note.err {
   color: var(--dsw-alias-state-error-primary);
 }
+/* 技能安装「来源」分段 pill（dsh reasoning-opt 同族：单选双输入） */
+.skill-src-seg {
+  display: inline-flex;
+  align-items: center;
+  gap: 2px;
+  padding: 2px;
+  margin-bottom: 10px;
+  border: 1px solid var(--dsw-alias-border-l2-darkmode-thin);
+  border-radius: 999px;
+  background: var(--dsw-alias-interactive-bg-hover);
+}
+.skill-src-opt {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-width: 64px;
+  height: 22px;
+  padding: 0 10px;
+  border: none;
+  border-radius: 999px;
+  background: transparent;
+  color: var(--dsw-alias-label-secondary);
+  font-size: var(--dsw-font-size-xs);
+  line-height: 20px;
+  cursor: pointer;
+}
+.skill-src-opt:hover {
+  color: var(--dsw-alias-label-primary);
+}
+.skill-src-opt:has(input:checked) {
+  background: var(--dsw-alias-button-info-fill);
+  color: var(--dsw-static-neutral-bluish-50);
+}
+.skill-src-opt input {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  margin: -1px;
+  opacity: 0;
+  pointer-events: none;
+}
+/* 安装 + 重新扫描 动作行 */
+.skill-install-actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-top: 10px;
+}
+/* 技能行「用户」来源徽章：复用既有 badge-mono 中性款（origin=user 小 pill；
+   bundled 不标注 —— 简洁裁定，行内仅 user 有徽章） */
 /* 并行数输入（窄数字步进盒；覆盖 .input 的 width:100% —— 优先级靠双类） */
 .input.input-num {
   flex: none;

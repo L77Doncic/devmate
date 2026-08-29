@@ -7,7 +7,7 @@
  * 服务只做 listen/close + 静态页 + settings GET。
  */
 import { mkdir, mkdtemp, realpath, rm, symlink, writeFile } from 'node:fs/promises';
-import { tmpdir } from 'node:os';
+import { homedir, tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
 import { JsonlFileAdapter } from '../../src/core/session/index.js';
@@ -129,6 +129,14 @@ describe('ui/server/deps：assembleDeps 一次组装', () => {
       skillsDir: join(dir, 'custom-skills'),
     });
     expect(override.skillsDir).toBe(join(dir, 'custom-skills'));
+    // 用户技能目录：缺省 ~/.devmate/skills（不入 StoredConfig——CLI 无需配置）；config 可覆盖
+    expect(deps.userSkillsDir).toBe(join(homedir(), '.devmate', 'skills'));
+    const userOverride = await assembleDeps({
+      workspaceRoot: dir,
+      model: 'm',
+      userSkillsDir: join(dir, 'custom-user-skills'),
+    });
+    expect(userOverride.userSkillsDir).toBe(join(dir, 'custom-user-skills'));
 
     // 内存守卫内置装配：真 rss 采样 + disposeAllIdle（Infinity TTL = 全部空闲 shell）
     const rss = await deps.memorySampler!();

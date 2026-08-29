@@ -63,6 +63,7 @@ describe('ui/server/deps-tools：技能/子代理接线', () => {
     const dir = await tempDir();
     const deps = await assembleDeps({
       workspaceRoot: dir,
+      userSkillsDir: join(dir, 'user-skills'),
       sessionsDir: join(dir, 's'),
       model: 'm',
     });
@@ -102,6 +103,7 @@ describe('ui/server/deps-tools：技能/子代理接线', () => {
     );
     const deps = await assembleDeps({
       workspaceRoot: dir,
+      userSkillsDir: join(dir, 'user-skills'),
       sessionsDir: join(dir, 's'),
       model: 'm',
       mcpServers: [
@@ -160,6 +162,7 @@ describe('ui/server/deps-tools：技能/子代理接线', () => {
     // 连接失败路径（单独装配）：0 个 mcp 工具 + 计数 0，工具面与 stats 不炸
     const bad = await assembleDeps({
       workspaceRoot: dir,
+      userSkillsDir: join(dir, 'user-skills'),
       model: 'm',
       mcpServers: [{ name: 'dead', command: 'nope', args: [], enabled: true }],
       mcpConnect: async () => {
@@ -187,7 +190,12 @@ describe('ui/server/deps-tools：技能/子代理接线', () => {
       'ALPHA BODY\nline2',
     );
     await writeSkill(skillsDir, 'beta', 'Beta asset', 'A beta asset for tests.', 'BETA BODY');
-    const deps = await assembleDeps({ workspaceRoot: dir, skillsDir, model: 'm' });
+    const deps = await assembleDeps({
+      workspaceRoot: dir,
+      userSkillsDir: join(dir, 'user-skills'),
+      skillsDir,
+      model: 'm',
+    });
     const { base, server } = await startServer(deps, 0);
     servers.push(server);
 
@@ -230,6 +238,7 @@ describe('ui/server/deps-tools：技能/子代理接线', () => {
     const dir = await tempDir();
     const deps = await assembleDeps({
       workspaceRoot: dir,
+      userSkillsDir: join(dir, 'user-skills'),
       model: 'm',
       workflow: { subagentsEnabled: true, maxParallel: 2 },
     });
@@ -304,6 +313,7 @@ describe('ui/server/deps-tools：技能/子代理接线', () => {
     const dir = await tempDir();
     const deps = await assembleDeps({
       workspaceRoot: dir,
+      userSkillsDir: join(dir, 'user-skills'),
       model: 'm',
       systemPrompt: 'CUSTOM-RULES',
     });

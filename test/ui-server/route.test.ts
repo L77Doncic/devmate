@@ -348,6 +348,8 @@ function methodDeps(options: {
     llm: options.llm,
     model: 'test-model',
     skillsDir: options.skillsDir,
+    // 用户技能目录隔离（宿主机 ~/.devmate/skills 不入测试域）
+    userSkillsDir: join(options.skillsDir, 'user-skills'),
     attachMethodologyIndex: (index) => {
       idxRef.index = index;
     },

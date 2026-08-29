@@ -84,6 +84,8 @@ export interface DevmateConfig {
   workspaces?: string[] | undefined;
   /** 会话目录；缺省 ~/.devmate/sessions（每会话一个 <id>.jsonl）。 */
   sessionsDir?: string | undefined;
+  /** 用户技能目录；缺省 ~/.devmate/skills（懒建——首装时；**不入 StoredConfig**——CLI 无需改动）。 */
+  userSkillsDir?: string | undefined;
   /** 供应商端点；缺省 = preset.baseUrl（LlmClient 惰性连接，组装不触网）。 */
   baseUrl?: string | undefined;
   /** 请求侧模型名（settings.model 初值；POST /api/settings 随时可换）。 */
@@ -909,6 +911,11 @@ function defaultSessionsDir(): string {
   return join(homedir(), '.devmate', 'sessions');
 }
 
+/** 缺省用户技能目录（~/.devmate/skills；与 sessions 同族——CLI 无需配置即可用）。 */
+export function defaultUserSkillsDir(): string {
+  return join(homedir(), '.devmate', 'skills');
+}
+
 /** 去重保序（工作区注册表：首次出现顺序保留；重复值只留首见）。 */
 export function dedupeKeepOrder(values: readonly string[]): string[] {
   const seen = new Set<string>();
@@ -1105,6 +1112,8 @@ export async function assembleDeps(config: DevmateConfig): Promise<DevmateServer
     },
     // skills 打包资产（dist/assets/skills；scripts/copy-skills.mjs 构建时复制）
     skillsDir: config.skillsDir ?? resolve(process.cwd(), 'dist', 'assets', 'skills'),
+    // 用户技能目录（缺省 ~/.devmate/skills；安装生效于该目录——CLI 配置不经 StoredConfig）
+    userSkillsDir: config.userSkillsDir ?? defaultUserSkillsDir(),
     sessionLister: makeSessionLister({ store, dir: sessionsDir }),
     activeShellCount: () => sessionTools.activeShellCount(),
     // stats 的 queuedSubagents（池注入后出现；即池 stats 的排队数）

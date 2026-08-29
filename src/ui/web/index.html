@@ -107,7 +107,8 @@
               <div class="sectionHeader wide" id="ws-header">
                 <span class="sectionLabel" id="ws-section-label">对话</span>
                 <div class="headerActions" id="ws-header-actions">
-                  <!-- 添加工作区（dsh IconProjectAddOutline16 28px 圆钮）：直达目录弹窗 -->
+                  <!-- 添加工作区（dsh IconProjectAddOutline16 28px 圆钮）：直达目录弹窗；
+                       图标由 app.js 按 data-icon-glyph 从 icons.js 装配（单一 d 串来源） -->
                   <button
                     class="iconButton"
                     id="btn-add-workspace"
@@ -115,16 +116,7 @@
                     aria-label="添加工作区"
                     title="添加工作区"
                   >
-                    <svg viewBox="0 0 16 16" aria-hidden="true">
-                      <path
-                        fill="none"
-                        stroke="currentColor"
-                        stroke-width="1.3"
-                        stroke-linecap="round"
-                        stroke-linejoin="round"
-                        d="M8 3.2v3M8 6.2h3M8 6.2v3M3 6.4h1.4M1.6 6.4H3M12.8 6.4h1.4M8 12.8v1.4M6.5 11.2h3M3.4 10.6v.9a1.4 1.4 0 0 0 1.4 1.4h6.4a1.4 1.4 0 0 0 1.4-1.4v-.9"
-                      />
-                    </svg>
+                    <svg data-icon-glyph="folderPlus" viewBox="0 0 16 16" aria-hidden="true"></svg>
                   </button>
                 </div>
               </div>
@@ -226,12 +218,8 @@
                 id="btn-empty-add-workspace"
                 type="button"
               >
-                <svg viewBox="0 0 16 16" aria-hidden="true">
-                  <path
-                    fill="currentColor"
-                    d="M3.2 2.8h3l1.5 1.5h5c.9 0 1.6.7 1.6 1.6v5.6c0 .9-.7 1.6-1.6 1.6H3.2c-.9 0-1.6-.7-1.6-1.6V4.4c0-.9.7-1.6 1.6-1.6z"
-                  />
-                </svg>
+                <!-- 图标由 app.js 按 data-icon-glyph 从 icons.js 装配（单一 d 串来源） -->
+                <svg data-icon-glyph="folderClosed" viewBox="0 0 16 16" aria-hidden="true"></svg>
                 <span>选择工作区…</span>
               </button>
             </div>
@@ -811,13 +799,67 @@
               </div>
             </div>
           </section>
-          <!-- Skills：运行时技能清单（GET /api/skills；后端在途，缺失降级「暂无技能」；
-               开关 → POST /api/skills/:id {enabled}） -->
+          <!-- Skills：安装表单（POST /api/skills/install {source}）+ 运行时技能清单
+               （GET /api/skills；缺失/失败降级「暂无技能」；开关 → POST /api/skills/:id） -->
           <section class="settings-panel" data-tab="skills">
             <h3 class="panel-title">Skills</h3>
             <p class="panel-desc">
               技能是可由 DevMate 按需调用的子工作流；列表由服务端提供，此处只控制启用状态。
             </p>
+            <div class="settings-card">
+              <div class="settings-card-head">
+                <span class="settings-card-title">安装技能</span>
+              </div>
+              <div class="field-group">
+                <!-- 来源单选（dsh 分段 pill 同族）：URL / 本地路径 二选一 -->
+                <div class="skill-src-seg" role="radiogroup" aria-label="技能来源">
+                  <label class="skill-src-opt">
+                    <input type="radio" name="skill-install-src" value="url" checked />
+                    <span>URL</span>
+                  </label>
+                  <label class="skill-src-opt">
+                    <input type="radio" name="skill-install-src" value="path" />
+                    <span>本地路径</span>
+                  </label>
+                </div>
+                <input
+                  class="input mono"
+                  id="skill-install-source"
+                  type="text"
+                  placeholder="https://raw.githubusercontent.com/…/SKILL.md"
+                  autocomplete="off"
+                  autocapitalize="off"
+                  spellcheck="false"
+                  aria-label="技能来源"
+                />
+                <p class="field-help" id="skill-install-help">
+                  URL 支持常见公共代码托管；均要求入口文件为 SKILL.md。
+                </p>
+                <div class="skill-install-actions">
+                  <button
+                    class="btn btn-primary btn-sm"
+                    type="button"
+                    id="btn-skill-install"
+                    data-set-action="skill-install"
+                  >
+                    安装
+                  </button>
+                  <button
+                    class="btn btn-outline btn-sm"
+                    type="button"
+                    id="btn-skill-rescan"
+                    data-set-action="skill-rescan"
+                  >
+                    重新扫描
+                  </button>
+                </div>
+                <p class="set-note" id="skill-install-note" hidden></p>
+                <p class="field-help">
+                  技能目录即插即用：把含 SKILL.md 的目录放进 ~/.devmate/skills/&lt;id&gt;/，
+                  点「重新扫描」即可出现在列表。
+                </p>
+              </div>
+            </div>
             <div class="settings-card">
               <div class="settings-card-head">
                 <span class="settings-card-title">技能列表</span>

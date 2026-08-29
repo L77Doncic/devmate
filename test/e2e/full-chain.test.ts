@@ -504,6 +504,7 @@ describe('E2E-C：subagent 与技能（假池经 createSessionToolsFactory 注�
       model: 'deepseek-v4-flash',
       llm: fake,
       skillsDir,
+      userSkillsDir: join(dir, 'user-skills'),
       // C 组聚焦技能/子代理链（测试脚本固定序）：关掉评审哨兵（spawn_subagent
       // 属实质变更——哨兵注入路径由 e2e/s2-methodology 同链抽样覆盖）
       settings: { reviewMode: false },

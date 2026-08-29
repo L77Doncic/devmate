@@ -2,8 +2,17 @@
  * # extensions.js — 设置页扩展区纯逻辑（Skills / MCP / Subagent 工作流）
  *
  * 协议契约（前端全部宽容归一化，失败由 app.js 调用方降级）：
- * - GET  /api/skills          → { skills: [{ id, name, summary, enabled }] }（裸数组亦可）
+ * - GET  /api/skills          → { skills: [{ id, name, summary, enabled, origin }] }（裸数组亦可；
+ *                               origin 'bundled'|'user'，缺省视作 bundled）
  * - POST /api/skills/:id      → 请求体 { enabled: boolean }（204 | {ok:true}）
+ * - POST /api/skills/install  → 请求体 { source }（URL 或本机绝对 SKILL.md/技能目录）；
+ *                               成功 200 {ok:true, id, origin:'user'}；失败错误体
+ *                               {error:{type,message}}，type ∈ invalid-source（400）/
+ *                               fetch-failed（502）/ too-large（413）/
+ *                               unsupported-host（400）/ skill-exists（409）/
+ *                               write-failed（5xx）；
+ *                               错误映射 = skillInstallErrorText（kind 白名单 → 中文 +
+ *                               status 阶梯兜底），installSkill 绝不 throw
  * - GET  /api/mcp             → { servers: [{ name, command?, enabled }] }（裸数组亦可；
  *                               status 字段服务端若下发也宽容接受 —— 前端按 enabled 渲染徽章，
  *                               契约不依赖 status）
@@ -147,7 +156,11 @@ export async function syncWorkflowPref(patch = {}, { fetchImpl = globalThis.fetc
   }
 }
 
-/** 技能清单：{skills:[...]} 或裸数组；逐项校验，坏项跳过；缺省返回 []。 */
+/**
+ * 技能清单：{skills:[...]} 或裸数组；逐项校验，坏项跳过；缺省返回 []。
+ * origin（'bundled'|'user'）白名单归一到 'user'|'bundled'（缺省/未知 → 'bundled'）；
+ * 行内仅 origin='user' 渲染「用户」小徽章（bundled 不标注 —— 简洁裁定）。
+ */
 export function normalizeSkillsList(res) {
   const raw = Array.isArray(res) ? res : res?.skills;
   if (!Array.isArray(raw)) return [];
@@ -161,9 +174,115 @@ export function normalizeSkillsList(res) {
       name: typeof s.name === 'string' && s.name.trim() ? s.name : id,
       summary: typeof s.summary === 'string' ? s.summary : '',
       enabled: Boolean(s.enabled),
+      origin: s.origin === 'user' ? 'user' : 'bundled',
     });
   }
   return out;
+}
+
+// ---- 技能安装（POST /api/skills/install {source}；错误 kind 白名单 → 中文文案） ----
+
+/** 安装端点（常量单一来源；文案零端点路径已由纪律断言覆盖）。 */
+export const SKILL_INSTALL_API_URL = '/api/skills/install';
+/** 安装进行中按钮态。 */
+export const SKILL_INSTALL_BUSY = '安装中…';
+/** 来源为空（客户端先拦，服务端同样回 invalid-source）。 */
+export const SKILL_INSTALL_EMPTY_SOURCE = '请先填写 URL 或本地路径';
+/** 输入 placeholder 与提示（字段下小字；零端点路径）——index.html 静态同步同文案。 */
+export const SKILL_INSTALL_URL_PLACEHOLDER = 'https://raw.githubusercontent.com/…/SKILL.md';
+export const SKILL_INSTALL_PATH_PLACEHOLDER = '/path/to/skill-dir（含 SKILL.md）';
+export const SKILL_INSTALL_HELP_URL = 'URL 支持常见公共代码托管；均要求入口文件为 SKILL.md。';
+export const SKILL_INSTALL_HELP_PATH = '本地路径：指向含 SKILL.md 的技能目录。';
+export const SKILL_INSTALL_NOTE_DIR =
+  '技能目录即插即用：把含 SKILL.md 的目录放进 ~/.devmate/skills/<id>/，点「重新扫描」即可出现在列表。';
+/** 服务端错误 kind 白名单 → 中文文案（kind 之外的 400/403/404/其余各回通用文案）。 */
+export const SKILL_INSTALL_ERRORS = Object.freeze({
+  'invalid-source': '来源无效：请输入可下载的 URL 或本机技能目录路径',
+  'fetch-failed': '获取技能失败：无法访问或下载内容异常，请检查来源',
+  'too-large': '技能文件过大，超出单技能大小上限',
+  'unsupported-host': '不支持的下载来源：仅允许常见公共代码托管域名',
+  'skill-exists': '技能已存在：相同标识的技能已安装，请直接使用或先移除',
+  'write-failed': '写入失败：无法把技能保存到本机技能目录',
+});
+/** 网络层 400/403 通用文案（无 kind 时兜底）。 */
+export const SKILL_INSTALL_REJECTED_TEXT = '请求被服务端拒绝（HTTP 400 或 403），请检查输入后重试';
+/** 端点缺失（404 = 当前服务端版本无安装功能）。 */
+export const SKILL_INSTALL_UNSUPPORTED_TEXT = '当前服务端版本不支持技能安装';
+/** 其余（5xx/网络异常）通用文案。 */
+export const SKILL_INSTALL_FAILED_TEXT = '安装失败，请稍后重试';
+
+/**
+ * 错误 kind 归一：服务端错误体契约 {error:{type,message}}（test/ui-server
+ * skills-install）为首要形状；宽容读取 data.error.type / data.kind / error.kind /
+ * data.error 字符串任一位置。仅白名单 kind 识别（未知 → null —— 走通用文案）。
+ * @param {unknown} error
+ * @returns {string|null}
+ */
+export function normalizeSkillErrorKind(error) {
+  const data = error && typeof error === 'object' ? (error.data ?? {}) : {};
+  const errObj = data && typeof data.error === 'object' && data.error !== null ? data.error : {};
+  const raw =
+    (typeof errObj.type === 'string' && errObj.type) ||
+    (typeof error?.kind === 'string' && error.kind) ||
+    (typeof data.kind === 'string' && data.kind) ||
+    (typeof data.error === 'string' && data.error) ||
+    '';
+  return Object.prototype.hasOwnProperty.call(SKILL_INSTALL_ERRORS, raw) ? raw : null;
+}
+
+/**
+ * 安装错误 → 中文文案。阶梯：kind 白名单 → 409 已存在（幂等拒绝）→ 413 过大 →
+ * 502 获取失败（上游不可达）→ 400/403 通用 → 404 未支持 → 其余通用。
+ * 绝不 throw；文案零端点路径（纪律断言见 test/ui-web）。
+ * @param {unknown} error
+ * @returns {string}
+ */
+export function skillInstallErrorText(error) {
+  const kind = normalizeSkillErrorKind(error);
+  if (kind !== null) return SKILL_INSTALL_ERRORS[kind];
+  const status = typeof error?.status === 'number' ? error.status : null;
+  if (status === 409) return SKILL_INSTALL_ERRORS['skill-exists'];
+  if (status === 413) return SKILL_INSTALL_ERRORS['too-large'];
+  if (status === 502) return SKILL_INSTALL_ERRORS['fetch-failed'];
+  if (status === 400 || status === 403) return SKILL_INSTALL_REJECTED_TEXT;
+  if (status === 404) return SKILL_INSTALL_UNSUPPORTED_TEXT;
+  return SKILL_INSTALL_FAILED_TEXT;
+}
+
+/** 来源输入归一：trim；空串 = 未填写（按钮禁用 + 提交前再拦一次）。 */
+export function normalizeSkillSource(text) {
+  return typeof text === 'string' ? text.trim() : '';
+}
+
+/**
+ * 安装技能：POST /api/skills/install {source}。
+ * 成功 → {ok:true, id: 服务端回体 id（res.id ?? res.skill.id；缺失 → null，调用方
+ * 只 toast「已安装」）}；失败（含 400/404/网络）→ {ok:false, error}。绝不 throw。
+ * @param {{source: string}} input
+ * @param {{fetchImpl?: typeof fetch}} [opts]
+ * @returns {Promise<{ok: boolean, id?: string|null, error?: unknown}>}
+ */
+export async function installSkill({ source }, { fetchImpl = globalThis.fetch } = {}) {
+  const normalized = normalizeSkillSource(source);
+  if (normalized === '') {
+    return { ok: false, error: { kind: 'invalid-source' } };
+  }
+  try {
+    const res = await fetchJson(SKILL_INSTALL_API_URL, {
+      method: 'POST',
+      body: { source: normalized },
+      fetchImpl,
+    });
+    const id =
+      res && typeof res === 'object'
+        ? typeof res.id === 'string'
+          ? res.id
+          : (res.skill?.id ?? null)
+        : null;
+    return { ok: true, id: typeof id === 'string' && id !== '' ? id : null };
+  } catch (error) {
+    return { ok: false, error };
+  }
 }
 
 /** MCP 服务器清单：{servers:[...]} 或裸数组；坏项跳过；缺省返回 []。
