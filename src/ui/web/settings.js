@@ -65,6 +65,18 @@ export function normalizeMethodFirst(value) {
   return typeof value === 'boolean' ? value : METHODFIRST_DEFAULT;
 }
 
+// ---------------------------------------------------------------------------
+// 收尾评审（R2-S2：settings.reviewMode —— 评审哨兵开关，缺省 true）
+// ---------------------------------------------------------------------------
+
+/** 缺省值（服务端同值兜底：旧服务端 GET 无该键 / 坏值 → 缺省 true = 注入评审哨兵）。 */
+export const REVIEWMODE_DEFAULT = true;
+
+/** 开关归一：boolean 原样；缺失/坏值 → 缺省 true。 */
+export function normalizeReviewMode(value) {
+  return typeof value === 'boolean' ? value : REVIEWMODE_DEFAULT;
+}
+
 /** 上下文窗口覆盖归一：正整数 number 原样；其它（null/非数字/非整数/≤0/字符串）→ null
  *  （null = 未配置：展示层落「—」+ 估算模式 tooltip，不冒充数值）。 */
 export function normalizeWindow(value) {
@@ -163,6 +175,8 @@ function normalize(json) {
     permissionConfirmedAt: normalizeConfirmedAt(j.permissionConfirmedAt),
     // R2-S1：方法论前置门开关（缺省 true；旧服务端无该键/坏值 → 兜底 true）
     methodFirst: normalizeMethodFirst(j.methodFirst),
+    // R2-S2：收尾评审哨兵开关（缺省 true；旧服务端无该键/坏值 → 兜底 true）
+    reviewMode: normalizeReviewMode(j.reviewMode),
   };
 }
 
@@ -247,6 +261,23 @@ export async function saveMethodFirst(methodFirst, { fetchImpl = globalThis.fetc
     headers: { 'content-type': 'application/json' },
     credentials: 'same-origin',
     body: JSON.stringify({ methodFirst: value }),
+  });
+  if (!res.ok) throw new Error(`HTTP ${res.status}`);
+  return normalize(await res.json());
+}
+
+/**
+ * 收尾评审开关单独提交（设置页开关：change 即 POST，防抖在 app.js）：
+ * 只上行 {reviewMode} 一个字段（服务端补丁语义）。值先归一（缺省 true 兜底）。
+ * 返回归一化后的完整设置快照。失败抛错（调用方回滚重读 + toast）。
+ */
+export async function saveReviewMode(reviewMode, { fetchImpl = globalThis.fetch } = {}) {
+  const value = normalizeReviewMode(reviewMode);
+  const res = await fetchImpl('/api/settings', {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    credentials: 'same-origin',
+    body: JSON.stringify({ reviewMode: value }),
   });
   if (!res.ok) throw new Error(`HTTP ${res.status}`);
   return normalize(await res.json());

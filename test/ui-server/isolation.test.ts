@@ -64,6 +64,8 @@ describe('ui/server：会话隔离', () => {
       tools: defineRegistry([runCommandTool()], { sessionId: 's1' }),
       llm: new RoutingLlm(routes),
       model: 'test-model',
+      // 本组聚焦隔离语义：关掉评审哨兵（run_command 属实质变更——防止注入改变 script 序）
+      settings: { reviewMode: false },
     });
     servers.push(server);
 

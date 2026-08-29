@@ -9,7 +9,7 @@ import { defineRegistry } from '../../src/core/loop/index.js';
 import type { DevmateServer } from '../../src/ui/server/index.js';
 import { MemorySessionAdapter } from '../../src/core/session/index.js';
 import type { DevmateServerDeps } from '../../src/ui/server/index.js';
-import { echoTool, FakeLlm } from '../loop/support.js';
+import { echoTool, FakeLlm, runCommandTool } from '../loop/support.js';
 import { postJson, SseClient, startServer, waitForFrames } from './support.js';
 
 const RAW_KEY = 'sk-1234567890abcdef';
@@ -188,5 +188,101 @@ describe('ui/server：settings', () => {
     const badType = await postJson(base, '/api/settings', { model: 42 });
     expect(badType.status).toBe(400);
     expect(((await badType.json()) as { error: string }).error).toBeTypeOf('string');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// R2-S2：评审哨兵开关（reviewMode —— run 级 gate 注入；缺省 true / 布尔补丁 / 触碰持久化）
+// ---------------------------------------------------------------------------
+
+describe('ui/server：reviewMode（R2-S2 评审哨兵开关）', () => {
+  const servers: DevmateServer[] = [];
+  const clients: SseClient[] = [];
+
+  afterEach(async () => {
+    for (const client of clients.splice(0)) client.close();
+    for (const server of servers.splice(0)) await server.close();
+  });
+
+  it('v1) GET 缺省 true；POST 校验（非 boolean → 400）；触碰持久化；未触碰不带键', async () => {
+    const persisted: Array<Record<string, unknown>> = [];
+    const { base, server } = await startServer({
+      ...baseDeps(new FakeLlm([{ content: 'x' }])),
+      persistSettings: (s: unknown) => {
+        persisted.push(JSON.parse(JSON.stringify(s)) as Record<string, unknown>);
+      },
+    });
+    servers.push(server);
+
+    const initial = (await (await fetch(new URL('/api/settings', base))).json()) as {
+      reviewMode: boolean;
+    };
+    expect(initial.reviewMode).toBe(true);
+
+    // 未触碰不带键（补丁语义——与 methodFirst 同规）
+    await postJson(base, '/api/settings', { model: 'm1' });
+    expect(persisted[0]).toEqual({ baseUrl: 'https://default.example/v1', model: 'm1' });
+
+    const off = await postJson(base, '/api/settings', { reviewMode: false });
+    expect(off.status).toBe(200);
+    expect(((await off.json()) as { reviewMode: boolean }).reviewMode).toBe(false);
+    expect(persisted[1]).toEqual({
+      baseUrl: 'https://default.example/v1',
+      model: 'm1',
+      reviewMode: false,
+    });
+    expect(
+      (await (await fetch(new URL('/api/settings', base))).json()) as { reviewMode: boolean },
+    ).toEqual(expect.objectContaining({ reviewMode: false }));
+
+    const bad = await postJson(base, '/api/settings', { reviewMode: 'yes' });
+    expect(bad.status).toBe(400);
+  });
+
+  it('v2) reviewMode:false → run_command 实质变更后自然结束也不注入哨兵（开关关闭链路）', async () => {
+    const llm = new FakeLlm([
+      {
+        content: '执行',
+        toolCalls: [
+          { id: 'c1', name: 'run_command', arguments: '{"command":"echo hi"}' },
+        ],
+      },
+      { content: 'done' },
+    ]);
+    const { base, server } = await startServer({
+      store: new MemorySessionAdapter(),
+      tools: defineRegistry([runCommandTool()], { sessionId: 's1' }),
+      llm,
+      model: 'm0',
+      settings: { reviewMode: false },
+      // 本用例只锁哨兵开关链路：echo 属 ask 级 → 审批直放（审批链在 approval 测试覆盖）
+      approvalPolicy: () => false,
+    });
+    servers.push(server);
+
+    const created = (await (await postJson(base, '/api/chat', { text: '跑命令' })).json()) as {
+      sessionId: string;
+    };
+    const client = await SseClient.connect(base, created.sessionId);
+    clients.push(client);
+    await waitForFrames(client, 9, 10_000);
+    expect(client.frames.map((f) => f.event)).toEqual([
+      'session-user',
+      'assistant-delta',
+      'assistant-done',
+      'tool-start',
+      'tool-result',
+      'assistant-delta',
+      'assistant-done',
+      'usage',
+      'run-status',
+    ]);
+    expect(client.frames[client.frames.length - 1]!.data).toMatchObject({
+      status: 'completed',
+      steps: 2,
+    });
+    // 无哨兵注入：只有首个任务 user（无第二个 session-user 帧；无请求 #3）
+    expect(client.frames.filter((f) => f.event === 'session-user')).toHaveLength(1);
+    expect(llm.requests).toHaveLength(2);
   });
 });

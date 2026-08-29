@@ -27,6 +27,8 @@ function toolDeps(scripts: FakeScript[], tools: Tool[]): DevmateServerDeps {
     tools: defineRegistry(tools, { sessionId: 's1' }),
     llm: new FakeLlm(scripts),
     model: 'test-model',
+    // 本组聚焦审批矩阵：关掉评审哨兵（run_command 属实质变更——防止注入打断脚本序）
+    settings: { reviewMode: false },
   };
 }
 

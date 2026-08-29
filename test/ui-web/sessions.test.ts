@@ -184,6 +184,14 @@ describe('normalizeSessionDetail / toProtocolEvent', () => {
       event: 'session-user',
       data: { text: 'hi' },
     });
+    // R2-S2：评审哨兵存储形态（meta.system=true）→ 协议帧 system:true（messages.js 渲染为系统样式）
+    expect(
+      toProtocolEvent({ kind: 'user', payload: { content: '评审哨兵' }, meta: { system: true } }),
+    ).toEqual({ event: 'session-user', data: { text: '评审哨兵', system: true } });
+    // 非哨兵（显式 false / 无 meta）→ 不带 system 键（普通 user 帧零变化）
+    expect(
+      toProtocolEvent({ kind: 'user', payload: { content: 'hi' }, meta: { system: false } }),
+    ).toEqual({ event: 'session-user', data: { text: 'hi' } });
     expect(
       toProtocolEvent({
         kind: 'assistant',

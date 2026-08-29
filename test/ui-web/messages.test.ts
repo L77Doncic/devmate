@@ -3,7 +3,7 @@
  * 事件形状与 sse.js 输出、S12 协议一一对应。
  */
 import { describe, expect, it } from 'vitest';
-import { createMessageStore } from '../../src/ui/web/messages.js';
+import { createMessageStore, msgKind } from '../../src/ui/web/messages.js';
 import { TERMINAL_STATUSES } from '../../src/ui/web/format.js';
 
 const ev = (event: string, data: unknown) => ({ event, data });
@@ -798,5 +798,158 @@ describe('方法论线（R2-S1：回合首条 assistant 提取；用户回合/re
       ['assistant-delta', { text: '方法线：domain-modeling' }],
     ]);
     expect(snap.methodLine).toBe('domain-modeling');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// R2-S2：评审哨兵系统样式消息（session-user 帧 data.system===true → 独立 'sys' 消息项）
+// ---------------------------------------------------------------------------
+
+describe('评审哨兵系统样式消息（R2-S2：system:true 帧 → 独立 sys 消息项，不算新用户回合）', () => {
+  it('system:true → 追加独立 sys 消息项（非用户气泡）；快照暴露 systemUser 计数', () => {
+    const snap = run([
+      ['session-user', { text: '帮我改代码' }],
+      ['assistant-delta', { text: '正在改' }],
+      ['assistant-done', { content: '正在改', toolCalls: [] }],
+      ['session-user', { text: '【评审哨兵】本轮任务产生了实质变更…', system: true }],
+    ]);
+    expect(snap.items.map((i) => i.kind)).toEqual(['user', 'assistant', 'sys']);
+    const sys = snap.items[2]!;
+    expect(sys).toEqual({
+      id: expect.any(String),
+      kind: 'sys',
+      text: '【评审哨兵】本轮任务产生了实质变更…',
+      at: expect.any(Number),
+    });
+    expect(snap.systemUser).toBe(1);
+  });
+
+  it('不重置回合边界：流式期间的哨兵帧不打断 delta 累加（同气泡续写，runActive 保持）', () => {
+    const store = createMessageStore();
+    store.dispatch(ev('session-user', { text: '第一问' }));
+    store.dispatch(ev('assistant-delta', { text: '你好' }));
+    store.dispatch(ev('run-status', { status: 'running' }));
+    store.dispatch(ev('session-user', { text: '【评审哨兵】…', system: true }));
+    const mid = store.snapshot();
+    // 哨兵不是用户回合：activeAssistantId 未清 —— 后续 delta 继续进同一气泡
+    store.dispatch(ev('assistant-delta', { text: '，世界' }));
+    const snap = store.snapshot();
+    const assistants = snap.items.filter((i) => i.kind === 'assistant');
+    expect(assistants).toHaveLength(1);
+    expect(assistants[0]!.text).toBe('你好，世界');
+    expect(snap.runActive).toBe(true);
+    expect(mid.systemUser).toBe(1);
+  });
+
+  it('哨兵不重置方法论线 / usage run 边界标记 / lastDoneAssistantId（同回合归并视角）', () => {
+    const store = createMessageStore();
+    store.dispatch(ev('session-user', { text: '第一问' }));
+    store.dispatch(ev('assistant-delta', { text: '方法线：tdd\n开始' }));
+    store.dispatch(ev('assistant-done', { content: '方法线：tdd\n开始', toolCalls: [] }));
+    store.dispatch(ev('session-user', { text: '【评审哨兵】…', system: true }));
+    // 定稿后的哨兵帧：late reasoning 仍归并最后一条助手气泡（lastDoneAssistantId 未被清）
+    store.dispatch(ev('reasoning', { text: '（思考）' }));
+    const snap = store.snapshot();
+    expect(snap.methodLine).toBe('tdd'); // 当前用户回合未终结
+    const assistant = snap.items.find((i) => i.kind === 'assistant');
+    expect(assistant?.reasoning).toBe('（思考）');
+    // 后续 assistant-delta（审查回应）进新气泡 —— 仍属同一用户回合
+    store.dispatch(ev('assistant-delta', { text: '我来审查' }));
+    expect(store.snapshot().items.filter((i) => i.kind === 'assistant')).toHaveLength(2);
+    expect(store.snapshot().methodLine).toBe('tdd');
+  });
+
+  it('哨兵从不设置标题（会话标题 = 首条真实用户消息）', () => {
+    const snap = run([
+      ['session-user', { text: '【评审哨兵】…', system: true }],
+      ['session-user', { text: '真实问题' }],
+    ]);
+    // 哨兵先到也不抢标题：真实用户消息成为标题（防御：回放序保证哨兵后于真实首句）
+    expect(snap.title).toBe('真实问题');
+  });
+
+  it('哨兵帧不参与用户去重（kind 不同；同文本的真用户消息仍按用户去重）', () => {
+    const store = createMessageStore();
+    store.addUser('hi');
+    store.dispatch(ev('session-user', { text: 'hi' }));
+    store.dispatch(ev('session-user', { text: '【评审哨兵】hi', system: true }));
+    const users = store.snapshot().items.filter((i) => i.kind === 'user');
+    expect(users).toHaveLength(1);
+    expect(store.snapshot().items).toHaveLength(2); // user + sys
+    expect(store.snapshot().systemUser).toBe(1);
+  });
+
+  it('非 system 帧行为零变化：不产生 sys 项；边界重置照旧（去重/新回合）', () => {
+    const store = createMessageStore();
+    store.dispatch(ev('session-user', { text: '第一问' }));
+    store.dispatch(ev('assistant-delta', { text: '答1' }));
+    store.dispatch(ev('assistant-done', { content: '答1', toolCalls: [] }));
+    store.dispatch(ev('session-user', { text: '第一问' })); // 同句回放：去重
+    expect(store.snapshot().items.filter((i) => i.kind === 'user')).toHaveLength(1);
+    // system 缺省（undefined）与显式 false 都不触发 sys 分支
+    store.dispatch(ev('session-user', { text: '【评审哨兵】…', system: false }));
+    expect(store.snapshot().systemUser).toBe(0);
+    expect(store.snapshot().items.every((i) => i.kind !== 'sys')).toBe(true);
+  });
+
+  it('reset 清空 systemUser 计数（切换会话后哨兵计数归零）', () => {
+    const store = createMessageStore();
+    store.dispatch(ev('session-user', { text: 'a' }));
+    store.dispatch(ev('session-user', { text: '【评审哨兵】…', system: true }));
+    expect(store.snapshot().systemUser).toBe(1);
+    store.reset();
+    expect(store.snapshot().systemUser).toBe(0);
+    expect(store.snapshot().items).toEqual([]);
+  });
+
+  it('snapshot 缺省 systemUser 字段恒在（新会话可读，0 = 未注入）', () => {
+    const snap = run([['session-user', { text: '你好' }]]);
+    expect(snap.systemUser).toBe(0);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// 渲染形态分类：msgKind（纯函数；渲染层入口 —— 哨兵归一/非 system 不受影响）
+// ---------------------------------------------------------------------------
+
+describe('msgKind（渲染逻辑纯函数）', () => {
+  it('sys 消息项 → sys（状态机归一后的渲染目标）', () => {
+    expect(msgKind({ id: '1', kind: 'sys', text: 'x' })).toBe('sys');
+  });
+
+  it('原始形状归一：kind user + system:true → sys（防御渲染层双入口）', () => {
+    expect(msgKind({ kind: 'user', system: true, text: 'x' })).toBe('sys');
+  });
+
+  it('非 system 用户项不受影响：user / assistant / compaction / system 原样', () => {
+    expect(msgKind({ kind: 'user', text: 'x' })).toBe('user');
+    expect(msgKind({ kind: 'user', system: false, text: 'x' })).toBe('user');
+    expect(msgKind({ kind: 'assistant', text: 'x' })).toBe('assistant');
+    expect(msgKind({ kind: 'compaction', summary: '' })).toBe('compaction');
+    expect(msgKind({ kind: 'system', text: 'x' })).toBe('system');
+  });
+
+  it('未知/空项 → system（防御兜底：渲染层永不落入空洞分支）', () => {
+    expect(msgKind({ kind: 'wat' })).toBe('system');
+    expect(msgKind(null)).toBe('system');
+    expect(msgKind(undefined)).toBe('system');
+    expect(msgKind('nope' as unknown as { kind: string })).toBe('system');
+  });
+});
+
+describe('评审哨兵去重（R2-S2：重连重放同文本哨兵帧 → 不重复累积）', () => {
+  it('最后一条 sys 同文本 → 跳过且计数不增；不同文本 → 新项', () => {
+    const store = createMessageStore();
+    store.dispatch(ev('session-user', { text: '第一问' }));
+    store.dispatch(ev('session-user', { text: '【评审哨兵】A', system: true }));
+    store.dispatch(ev('session-user', { text: '【评审哨兵】A', system: true })); // 重连重放
+    let snap = store.snapshot();
+    expect(snap.items.filter((i) => i.kind === 'sys')).toHaveLength(1);
+    expect(snap.systemUser).toBe(1);
+    // 哨兵后的新会话重放（B = 另一事件）→ 新项
+    store.dispatch(ev('session-user', { text: '【评审哨兵】B', system: true }));
+    snap = store.snapshot();
+    expect(snap.items.filter((i) => i.kind === 'sys')).toHaveLength(2);
+    expect(snap.systemUser).toBe(2);
   });
 });

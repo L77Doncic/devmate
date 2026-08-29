@@ -17,6 +17,10 @@
  * - session-user    ：追加用户气泡；与最后一条用户气泡文本相同时去重（POST /api/chat
  *                     已在发送端先渲染一条，回放时同句只显示一次）；**无论去重与否都
  *                     重置轮次边界**（run 之间 activeAssistantId 必须重新开始）。
+ *                     哨兵帧（R2-S2：data.system===true = 评审哨兵注入的系统样式消息）
+ *                     作为**独立消息项**（kind 'sys'，系统样式渲染）追加——**不算新用户
+ *                     回合**：不重置轮次边界、不打断 delta 累加、不触碰 runActive；系统
+ *                     样式单行显示在消息流中（服务端自然收尾前注入，锚定上下文有据）。
  * - assistant-delta ：就地累积当前助手气泡文本（流式光标只在此态闪烁）。
  * - assistant-done  ：定稿；content 以其为准（delta 千字万句不如服务端权威值），
  *                     工具调用列表并卡（已存在的不重复）；回合结束（下一轮 delta 由
@@ -62,12 +66,34 @@ import { TERMINAL_STATUSES, methodologyLine } from './format.js';
 /** 长会话 DOM 轻量化（任务书 C）：保留消息数上限，超出裁剪最旧为摘要行。 */
 export const DEFAULT_MAX_ITEMS = 200;
 
+/**
+ * 消息渲染形态裁决（纯函数，渲染层唯一分类入口 —— 单测锚点）：
+ * 快照消息项 → 渲染 kind。哨兵（R2-S2）在状态机侧已归一为 kind 'sys'；
+ * 本函数同时兼容原始形状（kind 'user' + system:true → 'sys'）与未知 kind
+ * 兜底 'system'（防御：渲染层永不因新 kind 落入空洞分支）。
+ * 返回 'user' | 'assistant' | 'sys' | 'compaction' | 'system' 闭集。
+ */
+export function msgKind(item) {
+  if (!item || typeof item !== 'object') return 'system';
+  if (item.kind === 'sys') return 'sys';
+  if (item.kind === 'user' && item.system === true) return 'sys';
+  if (
+    item.kind === 'user' ||
+    item.kind === 'assistant' ||
+    item.kind === 'compaction' ||
+    item.kind === 'system'
+  ) {
+    return item.kind;
+  }
+  return 'system';
+}
+
 export function createMessageStore({ maxItems = DEFAULT_MAX_ITEMS } = {}) {
   const state = {
     sessionId: null,
     title: '',
     seq: 0,
-    items: [], // {id,kind:'user'|'assistant'|'system', text|content…}
+    items: [], // {id,kind:'user'|'assistant'|'sys'|'system'|'compaction', text|content…}
     activeAssistantId: null,
     // 最近一次定稿的助手气泡 id（reasoning 迟到帧归属判定：同 turn 内 done 后到达的
     // 思考并入该气泡；session-user/addUser 开新 turn 即清 —— 绝不跨 turn 归并）。
@@ -92,6 +118,9 @@ export function createMessageStore({ maxItems = DEFAULT_MAX_ITEMS } = {}) {
     // 用户消息/reset 清空；同回合后续助手气泡（工具往返后的下一轮文字）不参与提取。
     methodLine: null,
     methodTrackedId: null, // 当前回合首个助手气泡 id（提取目标；回合边界清空）
+    // R2-S2：评审哨兵系统样式消息（kind 'sys'）计数（本会话累计；reset 清零 ——
+    // 快照暴露 systemUser 供测试锚点与统计；不受长会话裁剪影响）。
+    systemUser: 0,
   };
 
   const listeners = new Set();
@@ -181,6 +210,19 @@ export function createMessageStore({ maxItems = DEFAULT_MAX_ITEMS } = {}) {
     if (!event || typeof event !== 'string') return;
     switch (event) {
       case 'session-user': {
+        // R2-S2：评审哨兵帧（system:true）→ 独立系统样式消息项。与普通用户帧关键差异：
+        // **不算新用户回合** —— 不重置轮次边界 / 方法论线 / usage run 标记、不打断
+        // 当前助手气泡的 delta 累加（哨兵注入发生在自然收尾前，不算用户发言）；
+        // 也从不设置 title（无关于会话首句；哨兵只出现在有实质变更的会话里）。
+        // 去重规则（重连非刷新场景：broker 重放历史帧，哨兵同文本 = 同一事件的重复投递）：
+        // 与用户帧同款「最后一条同文本即跳过」——哨兵不增量（计数也不变）。
+        if (data?.system === true) {
+          const text = String(data?.text ?? '');
+          if (findLastKind('sys')?.text === text) break;
+          state.items.push({ id: nextId(), kind: 'sys', text, at: Date.now() });
+          state.systemUser += 1;
+          break;
+        }
         const text = String(data?.text ?? '');
         const lastUser = findLastKind('user');
         // 轮次边界与去重解耦：无论回放是否去重，新 run 的 delta 必须进新气泡。
@@ -453,6 +495,7 @@ export function createMessageStore({ maxItems = DEFAULT_MAX_ITEMS } = {}) {
     state.usagePrevCost = null;
     state.methodLine = null;
     state.methodTrackedId = null;
+    state.systemUser = 0;
     emit();
   }
 
@@ -553,6 +596,7 @@ export function createMessageStore({ maxItems = DEFAULT_MAX_ITEMS } = {}) {
           };
         }
         if (it.kind === 'user') return { id: it.id, kind: 'user', text: it.text, at: it.at };
+        if (it.kind === 'sys') return { id: it.id, kind: 'sys', text: it.text, at: it.at };
         if (it.kind === 'compaction') {
           return {
             id: it.id,
@@ -571,6 +615,8 @@ export function createMessageStore({ maxItems = DEFAULT_MAX_ITEMS } = {}) {
       runStatus: state.runStatus ? { ...state.runStatus } : null,
       lastError: state.lastError,
       foldedCount: state.foldedCount,
+      // R2-S2：评审哨兵系统样式消息计数（测试锚点；0 = 未注入过）
+      systemUser: state.systemUser,
     };
   }
 

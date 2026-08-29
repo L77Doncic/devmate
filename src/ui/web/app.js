@@ -32,7 +32,7 @@
  * - 用户与模型文本均经 markdown.js / 纯 textContent 路径；链接 href 过 safeHref 白名单。
  * - 只发同源请求；apiKey 只在 saveSettingsForm 读值瞬间存在，POST 后立即丢弃。
  */
-import { createMessageStore } from './messages.js';
+import { createMessageStore, msgKind } from './messages.js';
 import { consumeSSE } from './sse.js';
 import { markdownToDOM } from './markdown.js';
 import {
@@ -47,6 +47,9 @@ import {
   REASONING_DEFAULT,
   METHODFIRST_DEFAULT,
   normalizeMethodFirst,
+  REVIEWMODE_DEFAULT,
+  normalizeReviewMode,
+  saveReviewMode,
 } from './settings.js';
 import {
   PERMISSION_VALUES,
@@ -184,6 +187,8 @@ const ui = {
     permissionConfirmedAt: null,
     // R2-S1：方法论前置门开关（缺省 true；GET /api/settings 权威回显，见设置页常规区）
     methodFirst: METHODFIRST_DEFAULT,
+    // R2-S2：收尾评审哨兵开关（缺省 true；GET /api/settings 权威回显，见设置页常规区）
+    reviewMode: REVIEWMODE_DEFAULT,
   },
   sessionId: null,
   // 内嵌审批卡：currentApproval = 当前呈现项（快照 approvals[0] 的视图模型）；
@@ -228,6 +233,9 @@ const ui = {
   // R2-S1：方法论先行开关同步（change 即防抖 300ms POST /api/settings；失败回滚重读 + toast）
   methodFirstSyncPending: null,
   methodFirstSyncTimer: 0,
+  // R2-S2：收尾评审开关同步（change 即防抖 300ms POST /api/settings；失败回滚重读 + toast）
+  reviewModeSyncPending: null,
+  reviewModeSyncTimer: 0,
   // 「/」命令下拉（commands.js 纯逻辑；DOM 装配与键盘走这里）
   cmdMenuOpen: false,
   cmdHighlight: 0, // 下拉当前高亮项（键盘循环用）
@@ -321,6 +329,8 @@ const el = {
   setSubagentNote: document.getElementById('set-subagent-note'),
   // R2-S1 方法论先行开关（常规区卡片；change 委托 data-methodfirst-field）
   setMethodfirstEnabled: document.getElementById('set-methodfirst-enabled'),
+  // R2-S2 收尾评审开关（常规区卡片；change 委托 data-reviewmode-field）
+  setReviewmodeEnabled: document.getElementById('set-reviewmode-enabled'),
   skillsList: document.getElementById('skills-list'),
   skillsNote: document.getElementById('skills-note'),
   mcpList: document.getElementById('mcp-list'),
@@ -1257,10 +1267,12 @@ function updateThink(think, item) {
 }
 
 function createItemEl(item) {
+  // 渲染形态单一分类入口（纯函数 msgKind，messages.js：哨兵 'sys' 归一/未知兜底）
+  const kind = msgKind(item);
   const row = document.createElement('div');
-  row.className = `msg-row ${item.kind}`;
+  row.className = `msg-row ${kind}`;
   row.dataset.id = item.id;
-  if (item.kind === 'user') {
+  if (kind === 'user') {
     const bubble = document.createElement('div');
     bubble.className = 'bubble';
     const text = document.createElement('span');
@@ -1275,7 +1287,7 @@ function createItemEl(item) {
     row.append(bubble, meta.root);
     row._metaTime = meta.time;
     row._metaRan = meta.ran;
-  } else if (item.kind === 'assistant') {
+  } else if (kind === 'assistant') {
     const bubble = document.createElement('div');
     bubble.className = 'bubble';
     // 思考折叠行（dsh ReasoningRow：先于正文 —— reasoning 常先于 delta 到达）
@@ -1293,7 +1305,7 @@ function createItemEl(item) {
     row._think = think;
     row._metaTime = meta.time;
     row._metaRan = meta.ran;
-  } else if (item.kind === 'compaction') {
+  } else if (kind === 'compaction') {
     // 上下文压缩披露（dsh context-injection-disclosure 理念本地形态）：
     // 折叠小记 —— 默认单行，展开才渲染摘要全文（懒惰；textContent only）
     const note = document.createElement('div');
@@ -1318,6 +1330,14 @@ function createItemEl(item) {
       }
     });
     note.append(toggle, body);
+    row.appendChild(note);
+  } else if (kind === 'sys') {
+    // R2-S2：评审哨兵系统样式消息（data.system===true 的 session-user 帧）——
+    // 独立消息项：侧边居中 · 13/20 secondary · 浅色 elevation 面（无气泡 22px 圆角）、
+    // 内联窄行、无折叠（纯说明行；折叠语义只属于 compaction 披露）。
+    const note = document.createElement('span');
+    note.className = 'sys-note';
+    note.textContent = item.text;
     row.appendChild(note);
   } else {
     const chip = document.createElement('span');
@@ -1395,6 +1415,12 @@ function renderItems(snap) {
       }
     } else if (item.kind === 'compaction') {
       // 披露小记：内容在创建时一次性装配（不可变），此后无增量更新
+    } else if (item.kind === 'sys') {
+      // R2-S2：哨兵行一次性装配（不可变文本；防御性签名同步 —— 与 system 同模式）
+      if (node._sig !== item.text) {
+        node._sig = item.text;
+        node.querySelector('.sys-note').textContent = item.text;
+      }
     } else {
       if (node._sig !== `${item.level}|${item.text}`) {
         node._sig = `${item.level}|${item.text}`;
@@ -2138,6 +2164,57 @@ async function revertMethodFirst() {
   }
 }
 
+// ============================================================== 收尾评审开关（R2-S2）
+
+/** 开关回显（设置页常规区卡片）：GET /api/settings 权威值（缺省 true）→ checkbox。 */
+function syncReviewModeToggle() {
+  el.setReviewmodeEnabled.checked = normalizeReviewMode(ui.settings.reviewMode) === true;
+}
+
+/** change 收口（data-reviewmode-field 委托）：本地即时回显 + 防抖 300ms POST
+ *  （同方法论先行/思考强度纪律：失败回滚重读 + toast，无队列只补发最后一片）。 */
+function applyReviewModeField(checked) {
+  const value = normalizeReviewMode(checked);
+  ui.settings = { ...ui.settings, reviewMode: value };
+  syncReviewModeToggle();
+  scheduleReviewModeSync(value);
+}
+
+function scheduleReviewModeSync(value) {
+  ui.reviewModeSyncPending = value;
+  window.clearTimeout(ui.reviewModeSyncTimer);
+  ui.reviewModeSyncTimer = window.setTimeout(() => {
+    ui.reviewModeSyncTimer = 0;
+    void flushReviewModeSync();
+  }, 300);
+}
+
+async function flushReviewModeSync() {
+  window.clearTimeout(ui.reviewModeSyncTimer);
+  ui.reviewModeSyncTimer = 0;
+  const value = ui.reviewModeSyncPending;
+  ui.reviewModeSyncPending = null;
+  if (value === null || value === undefined) return;
+  try {
+    const saved = await saveReviewMode(value);
+    ui.settings = { ...ui.settings, ...saved }; // 服务端权威回体（含归一）
+  } catch {
+    await revertReviewMode();
+    toast('收尾评审保存失败，已还原', 'warn');
+  }
+  syncReviewModeToggle();
+}
+
+/** POST 失败回滚：GET 服务端态还原（GET 也失败 → 保持现显示，不猜测）。 */
+async function revertReviewMode() {
+  try {
+    const s = await loadSettings();
+    ui.settings = { ...ui.settings, ...s };
+  } catch {
+    // 服务端不可达：保持当前值（下次切换再试）
+  }
+}
+
 // ============================================================== 发送 / 流
 
 function inputUnlocked() {
@@ -2730,6 +2807,7 @@ async function openSettings() {
   syncReasoningSeg(); // 服务端档位权威：回显（含窗口覆盖 —— meter 随之取值）
   syncPermChip(); // 权限档位（含 permissionConfirmedAt 记录 —— 风险门判定依据）
   syncMethodFirstToggle(); // R2-S1：方法论先行开关（GET /api/settings 权威回显）
+  syncReviewModeToggle(); // R2-S2：收尾评审开关（GET /api/settings 权威回显）
   fillSettingsForm();
   // 设置页扩展区：Subagent 工作流（GET /api/workflow 同步；失败/缺端点降级本地）
   // + Skills/MCP 端点清单（缺失各自降级）
@@ -3196,6 +3274,7 @@ function wireEvents() {
     else if (t.dataset.mcpToggle) void toggleMcp(t.dataset.mcpToggle, t.checked);
     else if (t.dataset.subagentField) applySubagentField(t.dataset.subagentField);
     else if (t.dataset.methodfirstField) applyMethodFirstField(t.checked);
+    else if (t.dataset.reviewmodeField) applyReviewModeField(t.checked);
   });
   el.drawer.addEventListener('click', (e) => {
     const action = e.target.closest('[data-set-action]')?.dataset?.setAction;
@@ -3243,12 +3322,13 @@ function wireEvents() {
       scheduleSidebarSettle();
     });
   }
-  // 卸载前 flush Subagent 工作流 / 思考强度 / 访问模式 / 方法论先行挂起同步（best-effort）
+  // 卸载前 flush Subagent 工作流 / 思考强度 / 访问模式 / 方法论先行 / 收尾评审挂起同步（best-effort）
   window.addEventListener('pagehide', () => {
     if (ui.subagentSyncPending) void flushSubagentSync();
     if (ui.reasoningSyncPending !== null) void flushReasoningSync();
     if (ui.permissionSyncPending !== null) void flushPermissionSync();
     if (ui.methodFirstSyncPending !== null) void flushMethodFirstSync();
+    if (ui.reviewModeSyncPending !== null) void flushReviewModeSync();
   });
 }
 
@@ -3287,6 +3367,8 @@ async function boot() {
   syncPermChip();
   // R2-S1：方法论先行开关（启动 GET 回显 —— 设置打开时也随 openSettings 重读）
   syncMethodFirstToggle();
+  // R2-S2：收尾评审开关（启动 GET 回显 —— 设置打开时也随 openSettings 重读）
+  syncReviewModeToggle();
   // 窗口覆盖就绪：上下文环重新取值（首帧可能在 settings 未到前渲染过）
   if (ui.lastSnap) renderMeter();
 

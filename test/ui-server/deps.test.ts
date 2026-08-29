@@ -6,7 +6,7 @@
  * 假依赖级的装配断言：不触发任何真实网络调用（无 chat → LlmClient 不连网），
  * 服务只做 listen/close + 静态页 + settings GET。
  */
-import { mkdtemp, rm } from 'node:fs/promises';
+import { mkdir, mkdtemp, realpath, rm, symlink, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
@@ -148,5 +148,42 @@ describe('ui/server/deps：assembleDeps 一次组装', () => {
   it('devmate 包 shape 防散架：assembleDeps 输入由 DevmateConfig 声明', async () => {
     const config: DevmateConfig = { workspaceRoot: '/tmp', model: 'x' };
     expect(Object.keys(config)).toEqual(['workspaceRoot', 'model']);
+  });
+
+  it('S2 小修：软链工作区——canonical 根一次解析并同源注入 jail/shell（read 放行与 run_command pwd 一致）', async () => {
+    const dir = await tempDir();
+    const real = join(dir, 'real-ws');
+    const link = join(dir, 'link-ws');
+    await mkdir(real, { recursive: true });
+    await writeFile(join(real, 'a.txt'), 'hello s2');
+    await symlink(real, link);
+    const deps = await assembleDeps({ workspaceRoot: link, model: 'm' });
+    try {
+      const registry = deps.createSessionTools!('s-s2');
+      // read_file：路径用软链字面拼写（调用方视角）——jail 以 canonical 为边界，
+      // 软链字面端经 realpath 落点仍在边界内 → 放行且内容可见
+      const read = await registry.execute({
+        id: 'r1',
+        name: 'read_file',
+        arguments: JSON.stringify({ path: join(link, 'a.txt') }),
+      });
+      expect(read.ok).toBe(true);
+      expect(read.content).toBe('hello s2');
+      // run_command pwd：shell 初值 cwd = canonical → pwd 与 realpath(link) 一致（同目录同拼写
+      // ——判定不再因「shell 初值=原字面、jail=realpath」而错位）
+      const pwd = await registry.execute({
+        id: 'p1',
+        name: 'run_command',
+        arguments: JSON.stringify({ command: 'pwd' }),
+      });
+      expect(pwd.ok).toBe(true);
+      expect(String(pwd.content)).toContain('--- exit code: 0 ---');
+      expect(String(pwd.content)).toContain(await realpath(link));
+      expect(String(pwd.content)).toContain(real); // 与真实目录拼写同一目录
+      // 展示层 meta（deps.workspaceRoot）保持调用方字面拼写（不因规范化漂移）
+      expect(deps.workspaceRoot).toBe(link);
+    } finally {
+      await deps.dispose?.();
+    }
   });
 });

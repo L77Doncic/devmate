@@ -17,6 +17,8 @@ import {
   composeSystemPrompt,
   DEFAULT_SYSTEM_PROMPT_BUDGET_TOKENS,
   DEV_BASE_SYSTEM_PROMPT,
+  REVIEW_SENTINEL_SECTION,
+  TASK_DECOMPOSITION_SECTION,
 } from '../../src/ui/server/deps.js';
 import { estimateTokens } from '../../src/core/context/index.js';
 import type { SkillInfo, SkillsIndex } from '../../src/core/tools/skill.js';
@@ -144,7 +146,7 @@ describe('ui/server/deps-prompt：预算估算（base 锚 + 裁剪链覆盖）',
     expect(DEFAULT_SYSTEM_PROMPT_BUDGET_TOKENS).toBe(4096);
   });
 
-  it('P6) 常规形态（技能清单 + 子代理节）合成 ≤ 4096，base 完整在场', async () => {
+  it('P6) 常规形态（技能清单 + 子代理节 + 分解/收尾评审节）合成 ≤ 4096，base 完整在场', async () => {
     const out = await composeSystemPrompt({
       skills: () => normalSkills(),
       workflow: () => ({ subagentsEnabled: true, maxParallel: 4 }),
@@ -153,6 +155,22 @@ describe('ui/server/deps-prompt：预算估算（base 锚 + 裁剪链覆盖）',
     expect(out.includes(DEV_BASE_SYSTEM_PROMPT.trim())).toBe(true);
     expect(out).toContain('## 可用技能');
     expect(out).toContain('## 子代理');
+    // R2-S2 固定小节（任务分解 + 收尾评审）
+    expect(out).toContain('## 任务分解');
+    expect(out).toContain('## 收尾评审');
+  });
+
+  it('P9) 分解/收尾评审节预算：任务分解 ≤150、收尾评审 ≤120；极值清单合成仍 ≤4096 且两节在场（固定小节不裁）', async () => {
+    expect(tokensOf(TASK_DECOMPOSITION_SECTION)).toBeLessThanOrEqual(150);
+    expect(tokensOf(REVIEW_SENTINEL_SECTION)).toBeLessThanOrEqual(120);
+    const out = await composeSystemPrompt({
+      skills: () => extremeSkills(),
+      workflow: () => ({ subagentsEnabled: true, maxParallel: 4 }),
+    });
+    expect(tokensOf(out)).toBeLessThanOrEqual(DEFAULT_SYSTEM_PROMPT_BUDGET_TOKENS);
+    expect(out).toContain('## 任务分解');
+    expect(out).toContain('## 收尾评审');
+    expect(out.includes(DEV_BASE_SYSTEM_PROMPT.trim())).toBe(true); // base 永不裁
   });
 
   it('P7) 极端清单（100 条极限行）裁剪链后 ≤ 4096、base 完整、结果可复现', async () => {

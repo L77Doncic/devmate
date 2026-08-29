@@ -280,6 +280,9 @@ describe('ui/server：权限矩阵真装配决策（assembleDeps + fake llm）',
       workspaceRoot,
       sessionsDir: join(workspaceRoot, 'sessions'),
       model: 'deepseek-v4-flash',
+      // 本组测试聚焦权限矩阵：关掉评审哨兵（实质变更工具会触发注入——另由
+      // test/loop/review-sentinel 与 e2e/s2-methodology 覆盖）
+      reviewMode: false,
     });
     const fake = new FakeLlm(scripts);
     // assembleDeps 无假 LLM 接缝：createDevmateServer 级注入（覆写 llm + createLlm）

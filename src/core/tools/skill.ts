@@ -58,6 +58,12 @@ export interface SkillToolOptions {
   index: () => SkillsIndex | null;
 }
 
+/**
+ * use_skill 参数兼容（S2 小修）：接受 `{skill: id}`（既有形态）或 `{id: id}`（别名形态），
+ * 两者都给以 id 优先；缺一不可（至少一个——两者都缺在运行时判型报错，见 executeSkill）。
+ * 本 schema 子集无法表达「exactly one」（no oneOf/anyOf），故 required 置空、由运行时
+ * 收窄：{} 不触发 schema required 报错而是运行时 skill-not-found（与「缺参」旧行为同判型）。
+ */
 const SCHEMA: JsonSchema = {
   type: 'object',
   properties: {
@@ -66,10 +72,18 @@ const SCHEMA: JsonSchema = {
       description:
         'Skill id of the SKILL.md to load (' +
         'the id is the directory name under the skills assets; available ids are listed ' +
-        'in the system prompt skills section and in the available_skills field of errors).',
+        'in the system prompt skills section and in the available_skills field of errors). ' +
+        'Either "skill" (legacy) or "id" must be given; when both are given, id wins.',
+    },
+    id: {
+      type: 'string',
+      description:
+        'Skill id to load (preferred alias of "skill"; when both are given, id wins). ' +
+        'Available ids are listed in the system prompt skills section and in the ' +
+        'available_skills field of errors.',
     },
   },
-  required: ['skill'],
+  required: [],
 };
 
 /** 构造 use_skill 工具（参数 {skill: id}；id 不存在/disabled → 错误回注带可用清单）。 */
@@ -87,12 +101,18 @@ export function createSkillTool(options: SkillToolOptions): Tool {
 
 async function executeSkill(call: ToolCall, options: SkillToolOptions): Promise<ToolResult> {
   // 主循环已做 schema 校验（loop/tools.ts）；此处仍是防线（与 fs.ts parseArgs 同口径）。
+  // 参数兼容（S2 小修）：{skill} 或 {id} 缺一不可；两者都给以 id 优先（与 skillIdOf 同口径）。
   let skillId = '';
   try {
     const parsed: unknown = JSON.parse(call.arguments);
     if (typeof parsed === 'object' && parsed !== null && !Array.isArray(parsed)) {
-      const raw = (parsed as Record<string, unknown>).skill;
-      if (typeof raw === 'string') skillId = raw;
+      const record = parsed as Record<string, unknown>;
+      const id = record.id;
+      if (typeof id === 'string' && id !== '') skillId = id; // id 优先
+      else {
+        const raw = record.skill;
+        if (typeof raw === 'string') skillId = raw;
+      }
     }
   } catch {
     // fallthrough → 报错（与 fs.ts 一样不在此复述 JSON 错误细节）
@@ -100,7 +120,7 @@ async function executeSkill(call: ToolCall, options: SkillToolOptions): Promise<
   if (skillId === '') {
     return failSkillResult(
       'skill-not-found',
-      'use_skill: "skill" must be a non-empty string id',
+      'use_skill: one of "skill" or "id" must be a non-empty string id',
       [],
     );
   }

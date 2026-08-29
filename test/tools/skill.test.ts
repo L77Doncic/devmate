@@ -1,9 +1,10 @@
 /**
  * # test/tools/skill：use_skill 工具
  *
- * 契约（src/core/tools/skill.ts）：参数 {skill: id}——schema 为 string + 运行时校验
- * （不用 enum：可用 id 随 enabled 开关变化，枚举进 schema = 任何开关变化都要重建工具面；
- * 错误回注带 available_skills 清单收敛，与 E10 同口径）。
+ * 契约（src/core/tools/skill.ts）：参数 {skill: id} 或 {id: id}（S2 兼容；两者都给以 id
+ * 优先；缺一不可）——schema 为 string + 运行时校验（不用 enum：可用 id 随 enabled 开关
+ * 变化，枚举进 schema = 任何开关变化都要重建工具面；错误回注带 available_skills 清单
+ * 收敛，与 E10 同口径）。
  * 成功 → {ok:true, content: 全文（≥4000 字符经 CONTEXT 截断面板重写：头 2000 + 尾 2000
  * + elide 标记 + 收窄建议；<4000 原样）}；不存在 → skill-not-found；
  * disabled → skill-disabled；索引未回填 → skill-index-unavailable；内容恒为普通结果不抛。
@@ -123,10 +124,33 @@ describe('tools/skill：use_skill', () => {
     }
   });
 
-  it('schema 契约：string + 运行时校验（无 enum——工具定义不含可用 id 列表）', async () => {
+  it('schema 契约：skill/id 双参均为 string（无 enum——工具定义不含可用 id 列表）；required 置空（本 schema 子集无 oneOf——运行时收窄）', async () => {
     const tool = createSkillTool({ index: () => fakeIndex() });
     expect(tool.parameters?.properties?.skill).toMatchObject({ type: 'string' });
     expect((tool.parameters?.properties?.skill as Record<string, unknown>).enum).toBeUndefined();
-    expect(tool.parameters?.required).toEqual(['skill']);
+    expect(tool.parameters?.properties?.id).toMatchObject({ type: 'string' });
+    expect(tool.parameters?.required).toEqual([]);
+  });
+
+  it('S2 参数兼容：{id} 等价于 {skill}（成功加载）；两者都给以 id 优先', async () => {
+    // {id} 形态成功
+    const idForm = await run(fakeIndex(), JSON.stringify({ id: 'tdd' }));
+    expect(idForm).toEqual({
+      ok: true,
+      content: '---\nname: TDD\n---\nRed. Green. Refactor.',
+    });
+    // 两者都给：id 优先（skill 写不存在 id 也不受影响——先按 id 命中）
+    const both = await run(
+      fakeIndex(),
+      JSON.stringify({ skill: 'nope', id: 'tdd' }),
+    );
+    expect(both.ok).toBe(true);
+    expect((both as { content: string }).content).toContain('Red. Green. Refactor.');
+    // id 存在而 skill 不存在：命中{id}（id 优先）
+    const idWins = await run(fakeIndex(), JSON.stringify({ id: 'tdd', skill: 'research' }));
+    expect(idWins.ok).toBe(true);
+    // {id} 指向未知 → skill-not-found（与 {skill} 同判型）
+    const idUnknown = await run(fakeIndex(), JSON.stringify({ id: 'nope' }));
+    expect(idUnknown).toMatchObject({ ok: false, error: { type: 'skill-not-found' } });
   });
 });

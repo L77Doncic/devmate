@@ -66,12 +66,15 @@ import type {
   ApprovalDecision,
   Approver,
   LlmAdapter,
+  ReviewGate,
   RunOptions,
   RunResult,
+  RunStats,
   ToolDef,
   ToolRegistry,
+  ToolResult,
 } from '../../core/loop/index.js';
-import { run } from '../../core/loop/index.js';
+import { hasReviewRun, hasSubstantiveWork, run } from '../../core/loop/index.js';
 // 命令安全分类器（S10；本模块只读消费：run_command 的 ask/deny 直拒矩阵输入）
 import { classify, type Verdict } from '../../core/tools/classify.js';
 import type { WorkflowConfig } from '../../shared/workflow.js';
@@ -152,6 +155,8 @@ export interface UiSettings {
   permissionConfirmedAt?: number;
   /** 方法论前置门开关初值（R2-S1：缺省 true；false = 不注入 RunOptions.methodology）。 */
   methodFirst?: boolean;
+  /** 评审哨兵开关初值（R2-S2：缺省 true；false = 不注入 RunOptions.review——哨兵关闭）。 */
+  reviewMode?: boolean;
 }
 
 export interface SettingsSnapshot {
@@ -168,6 +173,8 @@ export interface SettingsSnapshot {
   permissionConfirmedAt?: number;
   /** 方法论前置门（同触碰语义；R2-S1）。 */
   methodFirst?: boolean;
+  /** 评审哨兵（同触碰语义；R2-S2）。 */
+  reviewMode?: boolean;
 }
 
 /** 会话列表摘要（GET /api/sessions 的 sessions[] 元素）。 */
@@ -282,8 +289,10 @@ export interface DevmateServerDeps {
   attachMethodologyIndex?: (index: MethodologyIndex) => void;
   /** 工作流实时配置接缝（晚绑定回填）：workflowState 读取器经此回填——子代理池 config 闭包与提示词合成读取（POST /api/workflow 即时生效）。 */
   attachWorkflowConfig?: (current: () => WorkflowConfig) => void;
-  /** 会话系统提示合成（assembleDeps 提供）：基础提示 + 技能清单节 + 子代理节；startRun 每次运行前合成（技能开关/workflow 变更即时生效）。 */
-  composeSystemPrompt?: () => Promise<string>;
+  /** 会话系统提示合成（assembleDeps 提供）：基础提示 + 技能清单节 + 路由节 + 子代理节 +
+   * 任务分解节 + 收尾评审节；startRun 每次运行前合成（技能开关/workflow 变更即时生效；
+   * includeMethodology:false = 路由节排除——methodFirst:false 时由 startRun 传）。 */
+  composeSystemPrompt?: (opts?: { includeMethodology?: boolean }) => Promise<string>;
   /** MCP 服务器配置（配置层 + P2 协议客户端接线：启用的服务器经 deps 的 launcher 懒连接。 */
   mcpServers?: McpServerConfig[];
   /** MCP 配置持久化（CLI 注入；无则仅内存）。 */
@@ -343,6 +352,9 @@ interface SessionCtx {
   pendingReasoning: string;
   controller: AbortController | null;
   active: boolean;
+  /** 评审哨兵（R2-S2）会话级记帐：实质变更工具计数 + 成功审查 spawn 的 prompt + 一次性注入 flag
+   * （跨 run 保持——session 级；语义纯函数见 loop/types 的 hasSubstantiveWork/hasReviewRun）。 */
+  readonly reviewStats: { counts: Record<string, number>; subagentPrompts: string[]; flagged: boolean };
 }
 
 /** 每会话事件帧缓存上限（帧数；与字节谓词先到先裁，裁最旧）。 */
@@ -605,7 +617,14 @@ function observeStore(inner: SessionStore, ctxFor: (id: string) => SessionCtx): 
       const wide = saved as SessionEvent;
       const ctx = ctxFor(id);
       if (wide.kind === 'user') {
-        ctx.broker.push({ event: 'session-user', data: { text: wide.payload.content } });
+        ctx.broker.push({
+          event: 'session-user',
+          // meta.system=true（评审哨兵注入的系统样式用户消息）→ system:true（前端浅色 chip）
+          data: {
+            text: wide.payload.content,
+            ...(wide.meta?.system === true ? { system: true } : {}),
+          },
+        });
         return saved;
       }
       if (wide.kind === 'tool') {
@@ -640,11 +659,32 @@ function observeStore(inner: SessionStore, ctxFor: (id: string) => SessionCtx): 
   };
 }
 
+/** 评审哨兵记帐（R2-S2）：观察器只见真执行（被审批拒绝/未触达工具层不计——「执行过」语义）；
+ * 成功的 spawn_subagent 顺便记 prompt（审查判定数据源；参数解析失败=畸形调用不落 prompt）。 */
+function recordReviewStats(ctx: SessionCtx, call: ToolCall, result: ToolResult): void {
+  const stats = ctx.reviewStats;
+  stats.counts[call.name] = (stats.counts[call.name] ?? 0) + 1;
+  if (result.ok && call.name === 'spawn_subagent') {
+    let prompt = '';
+    try {
+      const parsed: unknown = JSON.parse(call.arguments);
+      if (typeof parsed === 'object' && parsed !== null && !Array.isArray(parsed)) {
+        const raw = (parsed as Record<string, unknown>).prompt;
+        if (typeof raw === 'string') prompt = raw;
+      }
+    } catch {
+      // 参数不可解析：不算审查 prompt（畸形调用按普通失败，语义不变）
+    }
+    if (prompt !== '') stats.subagentPrompts.push(prompt);
+  }
+}
+
 function observeRegistry(inner: ToolRegistry, ctx: SessionCtx): ToolRegistry {
   return {
     list: () => inner.list(),
     async execute(call: ToolCall) {
       const result = await inner.execute(call);
+      recordReviewStats(ctx, call, result);
       ctx.executed.add(call.id);
       ctx.broker.push({
         event: 'tool-result',
@@ -907,7 +947,16 @@ async function sessionDetailFrames(
   const framesOf = (ev: SessionEvent): SseEventData[] => {
     switch (ev.kind) {
       case 'user':
-        return [{ event: 'session-user', data: { text: ev.payload.content } }];
+        return [
+          {
+            event: 'session-user',
+            // meta.system=true（评审哨兵）→ system:true（与在线流观察器同规）
+            data: {
+              text: ev.payload.content,
+              ...(ev.meta?.system === true ? { system: true } : {}),
+            },
+          },
+        ];
       case 'assistant': {
         const toolCalls = ev.payload.toolCalls.map((call) => ({
           id: call.id,
@@ -1226,6 +1275,7 @@ export function createDevmateServer(deps: DevmateServerDeps): DevmateServer {
         pendingReasoning: '',
         controller: null,
         active: false,
+        reviewStats: { counts: {}, subagentPrompts: [], flagged: false },
       };
       ctxs.set(id, ctx);
     }
@@ -1316,6 +1366,8 @@ export function createDevmateServer(deps: DevmateServerDeps): DevmateServer {
     permissionConfirmedAt?: number;
     /** 方法论前置门（R2-S1：缺省 true；false → 本 run 不注入门 = 从不拦截）。 */
     methodFirst: boolean;
+    /** 评审哨兵（R2-S2：缺省 true；false → 本 run 不注入 review gate = 哨兵关闭）。 */
+    reviewMode: boolean;
   }
   const current: CurrentSettings = {
     baseUrl: deps.settings?.baseUrl ?? '',
@@ -1323,6 +1375,7 @@ export function createDevmateServer(deps: DevmateServerDeps): DevmateServer {
     reasoning: deps.settings?.reasoning ?? 'medium',
     permission: deps.settings?.permission ?? DEFAULT_PERMISSION_PRESET,
     methodFirst: deps.settings?.methodFirst ?? true,
+    reviewMode: deps.settings?.reviewMode ?? true,
     ...(deps.settings?.apiKey !== undefined ? { apiKey: deps.settings.apiKey } : {}),
     ...(deps.settings?.windowTokens !== undefined
       ? { windowTokens: deps.settings.windowTokens }
@@ -1331,6 +1384,23 @@ export function createDevmateServer(deps: DevmateServerDeps): DevmateServer {
       ? { permissionConfirmedAt: deps.settings.permissionConfirmedAt }
       : {}),
   };
+
+  /** 评审哨兵门（R2-S2）语义版装配：hasSubstantiveWork/hasReviewRun 由 ctx 观察器记帐的
+   * RunStats 判定（纯函数 loop/types）；flag 为会话级一次性（注入即置位——护栏即一次）。 */
+  function reviewGateFor(ctx: SessionCtx): ReviewGate {
+    const statsOf = (): RunStats => ({
+      counts: ctx.reviewStats.counts,
+      subagentPrompts: ctx.reviewStats.subagentPrompts,
+    });
+    return {
+      hasSubstantiveWork: () => hasSubstantiveWork(statsOf()),
+      hasReviewRun: () => hasReviewRun(statsOf()),
+      isFlagged: () => ctx.reviewStats.flagged,
+      markFlagged: () => {
+        ctx.reviewStats.flagged = true;
+      },
+    };
+  }
 
   function startRun(sessionId: string, text: string): void {
     const ctx = ctxFor(sessionId);
@@ -1353,13 +1423,23 @@ export function createDevmateServer(deps: DevmateServerDeps): DevmateServer {
         // R2-S1：方法论前置门按开关传递——false → 删除 methodology 键（门不拦）；
         // true 时装配层已注入（gate 只含 route/状态观察，索引内容服务端现读）。
         if (current.methodFirst === false) delete runOptions.methodology;
+        // R2-S2：评审哨兵按开关传递——false → 删除 review 键（哨兵从不注入）；
+        // true = 语义版 gate（RunStats 数据源 = 本会话观察器记帐）。
+        if (current.reviewMode === false) {
+          delete runOptions.review;
+        } else {
+          runOptions.review = reviewGateFor(ctx);
+        }
         if (deps.createSummarizer !== undefined && runOptions.summarizer !== undefined) {
           runOptions.summarizer = deps.createSummarizer(llm, current.model);
         }
         if (deps.composeSystemPrompt !== undefined) {
-          // 系统提示每次运行前合成（基础 + 技能清单节 + 子代理节）：技能开关/workflow
-          // 配置变更（POST /api/skills|workflow）即时作用于后续 run（晚绑定回填已附接）。
-          runOptions.systemPrompt = await deps.composeSystemPrompt();
+          // 系统提示每次运行前合成（基础 + 技能清单节 + 路由节 + 子代理节 + 任务分解节 +
+          // 收尾评审节）：技能开关/workflow 配置变更即时作用（晚绑定回填已附接）；
+          // methodFirst:false → 路由节排除（与门同关——提示词与行为一致）。
+          runOptions.systemPrompt = await deps.composeSystemPrompt(
+            current.methodFirst === false ? { includeMethodology: false } : undefined,
+          );
         }
         const baseTools =
           deps.createSessionTools !== undefined
@@ -1957,6 +2037,7 @@ export function createDevmateServer(deps: DevmateServerDeps): DevmateServer {
     permission: PermissionPreset;
     permissionConfirmedAt?: number;
     methodFirst: boolean;
+    reviewMode: boolean;
   } {
     const response: {
       baseUrl: string;
@@ -1967,12 +2048,14 @@ export function createDevmateServer(deps: DevmateServerDeps): DevmateServer {
       permission: PermissionPreset;
       permissionConfirmedAt?: number;
       methodFirst: boolean;
+      reviewMode: boolean;
     } = {
       baseUrl: current.baseUrl,
       model: current.model,
       reasoning: current.reasoning, // C 档：缺省 'medium'
       permission: current.permission, // 权限预设定案：缺省 'workspace-write'
       methodFirst: current.methodFirst, // R2-S1：方法论前置门（缺省 true）
+      reviewMode: current.reviewMode, // R2-S2：评审哨兵（缺省 true）
     };
     if (current.apiKey !== undefined) {
       const masked = maskApiKey(current.apiKey);
@@ -2058,6 +2141,10 @@ export function createDevmateServer(deps: DevmateServerDeps): DevmateServer {
     if (rawMethodFirst !== undefined && typeof rawMethodFirst !== 'boolean') {
       throw new HttpError(400, 'methodFirst must be a boolean');
     }
+    const rawReviewMode = record.reviewMode;
+    if (rawReviewMode !== undefined && typeof rawReviewMode !== 'boolean') {
+      throw new HttpError(400, 'reviewMode must be a boolean');
+    }
     if (
       baseUrl === undefined &&
       model === undefined &&
@@ -2066,7 +2153,8 @@ export function createDevmateServer(deps: DevmateServerDeps): DevmateServer {
       rawWindowTokens === undefined &&
       rawPermission === undefined &&
       rawConfirmedAt === undefined &&
-      rawMethodFirst === undefined
+      rawMethodFirst === undefined &&
+      rawReviewMode === undefined
     ) {
       throw new HttpError(400, 'no settings fields provided');
     }
@@ -2077,6 +2165,7 @@ export function createDevmateServer(deps: DevmateServerDeps): DevmateServer {
       permission?: boolean;
       permissionConfirmedAt?: boolean;
       methodFirst?: boolean;
+      reviewMode?: boolean;
     } = {};
     if (baseUrl !== undefined) current.baseUrl = baseUrl;
     if (model !== undefined) current.model = model;
@@ -2118,6 +2207,10 @@ export function createDevmateServer(deps: DevmateServerDeps): DevmateServer {
       current.methodFirst = rawMethodFirst;
       touched.methodFirst = true;
     }
+    if (rawReviewMode !== undefined) {
+      current.reviewMode = rawReviewMode;
+      touched.reviewMode = true;
+    }
     if (deps.persistSettings !== undefined) {
       const snapshot: SettingsSnapshot = { baseUrl: current.baseUrl, model: current.model };
       if (current.apiKey !== undefined) snapshot.apiKey = current.apiKey;
@@ -2128,6 +2221,7 @@ export function createDevmateServer(deps: DevmateServerDeps): DevmateServer {
         snapshot.permissionConfirmedAt = current.permissionConfirmedAt as number;
       }
       if (touched.methodFirst === true) snapshot.methodFirst = current.methodFirst;
+      if (touched.reviewMode === true) snapshot.reviewMode = current.reviewMode;
       await deps.persistSettings(snapshot);
     }
     sendJson(res, 200, settingsResponse());

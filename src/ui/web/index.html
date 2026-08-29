@@ -642,6 +642,28 @@
                 关闭：方法技能仅作参考，不自动加载、不拦截。
               </p>
             </div>
+            <!-- 收尾评审（R2-S2）：开关 = 评审哨兵（任务有实质变更且尚无独立审查时，自然收尾前
+                 自动注入系统样式提示帧，要求先派独立审查子代理（spawn_subagent）再收尾；
+                 关 = 仅提示不强制。change 即防抖 300ms POST /api/settings {reviewMode}
+                 （失败回滚重读 + toast） -->
+            <div class="settings-card">
+              <div class="settings-card-head end">
+                <span class="settings-card-title">收尾评审（独立审查）</span>
+                <label class="switch">
+                  <input
+                    type="checkbox"
+                    id="set-reviewmode-enabled"
+                    checked
+                    data-reviewmode-field="enabled"
+                  />
+                  <span class="switch-track"></span>
+                </label>
+              </div>
+              <p class="field-help">
+                开启：任务有实质变更（写入/编辑/命令执行/MCP 调用/子代理）时，收尾自动派独立审查子代理，交付物对照任务目标列出缺陷后收尾。
+                关闭：仅提示不强制，收尾评审不作要求。
+              </p>
+            </div>
           </section>
           <!-- 模型接口：OpenAI 兼容端点三件套（dsh provider 卡同构：gray 面板 + 底部胶囊对） -->
           <section class="settings-panel" data-tab="models">

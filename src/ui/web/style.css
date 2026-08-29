@@ -2008,6 +2008,25 @@ pre {
   color: var(--warn-fg);
 }
 
+/* ---------- 评审哨兵系统样式行（R2-S2：dsh 系统注入窄行 —— 侧边居中 ·
+   13/20 secondary · 浅色 elevation 面（bg-elev 级，无气泡 22px 圆角）·
+   内联窄行、无折叠（折叠语义只属于 compaction 披露）） ---------- */
+.msg-row.sys {
+  justify-content: center;
+}
+.sys-note {
+  display: inline-block;
+  max-width: min(100%, 560px);
+  padding: 6px 10px;
+  border-radius: 8px;
+  background: var(--dsw-alias-markdown-code-block);
+  color: var(--dsw-alias-label-secondary);
+  font-size: var(--dsw-font-size-s);
+  line-height: 20px;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
 /* ---------- 上下文压缩披露（dsh ContextInjectionRow：24px 行 + r8 code 体） ---------- */
 .compaction-note {
   align-self: center;

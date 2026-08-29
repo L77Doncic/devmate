@@ -21,15 +21,16 @@
  *   {baseUrl, apiKey} 每次 run 重建（settingsRef 变更即生效；baseUrl 来自 preset 且可被设置覆盖）；
  * - 摘要器：与 run 同一 llm 的五段式摘要调用（buildSummaryPrompt → chat 纯文本 →
  *   extractSummaryContent）；makeSummarizer 导出供逐 run 重建（settings.model 生效）。
- * - 系统提示合成：composeSystemPrompt（base + 技能清单节 + 子代理节，预算感知估计
- *   estimateTokens）→ deps.composeSystemPrompt 供 startRun 每次运行前合成（配置变更
- *   即时生效）；本装配另有子代理池（池级单例，成本护栏/队列/信号量在池内）。
+ * - 系统提示合成：composeSystemPrompt（base + 技能清单节 + 方法论路由节 + 子代理节 +
+ *   任务分解节 + 收尾评审节，预算感知估计 estimateTokens）→ deps.composeSystemPrompt
+ *   供 startRun 每次运行前合成（配置变更即时生效；methodFirst:false 经 includeMethodology
+ *   排除路由节）；本装配另有子代理池（池级单例，成本护栏/队列/信号量在池内）。
  *
  * 真网络只发生在实际 chat 时（LlmClient 惰性连接）；本模块组装零网络往返。
  */
 import { homedir } from 'node:os';
 import { join, resolve } from 'node:path';
-import { readdir, rm, stat } from 'node:fs/promises';
+import { readdir, realpath, rm, stat } from 'node:fs/promises';
 
 import type { ConversationSummarizer, SummarizeRequest } from '../../core/context/index.js';
 import { estimateTokens, extractSummaryContent } from '../../core/context/index.js';
@@ -111,6 +112,8 @@ export interface DevmateConfig {
   mcpConnect?: ((spec: McpServerConfig) => Promise<McpClient | null>) | undefined;
   /** 方法论前置门（R2-S1）初值：缺省 true；false = 不注入 RunOptions.methodology（关掉前置门）。 */
   methodFirst?: boolean | undefined;
+  /** 评审哨兵（R2-S2）初值：缺省 true；false = startRun 不注入 RunOptions.review（关掉哨兵）。 */
+  reviewMode?: boolean | undefined;
 }
 
 /** 空闲 shell 回收的缺省 TTL（ms；10 分钟——期间不用的会话 shell 释放，懒重启重建）。 */
@@ -663,6 +666,8 @@ export interface ComposeSystemPromptOptions {
   workflow: () => WorkflowConfig;
   /** 方法论索引读取器（R2-S1；null = 未注入 → 本节省略——老装配/纯测试路径）。 */
   methodologies?: (() => MethodologyIndex | null) | undefined;
+  /** 方法论路由节开关（R2-S1：缺省 true；methodFirst:false → 本节省略——节随门同关）。 */
+  includeMethodology?: boolean | undefined;
   /** 系统提示 token 预算；缺省 DEFAULT_SYSTEM_PROMPT_BUDGET_TOKENS。 */
   budgetTokens?: number;
 }
@@ -688,7 +693,9 @@ export async function composeSystemPrompt(options: ComposeSystemPromptOptions): 
   }
 
   let routeLines: string[] = [];
-  const methodology = options.methodologies === undefined ? null : options.methodologies();
+  const includeMethodology = options.includeMethodology ?? true;
+  const methodology =
+    options.methodologies === undefined || !includeMethodology ? null : options.methodologies();
   if (methodology !== null) {
     let entries: readonly MethodologyEntry[] = [];
     try {
@@ -751,9 +758,26 @@ const METHODOLOGY_ROUTE_RULES = [
   '- 收尾按该技能的 done 判据逐条陈述完成情况（与报告口径一致）。',
 ];
 
+/**
+ * 「## 任务分解」节（R2-S2：并行/直连/评审三原则；固定小节——合成期并入，估算 ≤150 tokens）。
+ * 并行上限 2 与子代理节上限（workflow.maxParallel）择一原则——按提示词层常量固定。
+ */
+export const TASK_DECOMPOSITION_SECTION = `## 任务分解
+- 并行原则：独立的事实探索、互不依赖的子任务可并行 spawn_subagent（上限 2）。
+- 直连原则：短链与依赖链顺序直连，一次一步小步闭环，不拆过小。
+- 评审原则：见「收尾评审」节。`;
+
+/**
+ * 「## 收尾评审」节（R2-S2：独立审查前置规则；固定小节——合成期并入，估算 ≤120 tokens）。
+ * 规则一句带四拍（实质变更才需要 → 审查子代理视角 → 先修复或说明 → 报告附注）。
+ */
+export const REVIEW_SENTINEL_SECTION = `## 收尾评审
+实质变更任务（改文件、命令、MCP、子代理）收尾前，除非用户明确说跳过：spawn_subagent 独立审查一次（prompt 含 review 或「审查」），列缺陷与放行理由（≤400 字），先修复或说明再收尾；报告附「独立审查：有/无（原因）」。`;
+
 /** 多节装配：base \\n\\n 技能清单节（有 enabled 技能时）\\n\\n 方法论路由节（method 型命中表时）
- * \\n\\n 子代理节（subagentsEnabled 时）。路由节自身已按 METHODOLOGY_SECTION_TOKEN_BUDGET
- * 裁剪过（超预算删 trigger 最长的行；routeLines 为空 → 整节省略）。 */
+ * \\n\\n 子代理节（subagentsEnabled 时）\\n\\n 任务分解节（常驻）\\n\\n 收尾评审节（常驻）。
+ * 路由节自身已按 METHODOLOGY_SECTION_TOKEN_BUDGET 裁剪过（超预算删 trigger 最长的行；
+ * routeLines 为空 → 整节省略）；任务分解/收尾评审为固定小节（预算裁剪链之外）。 */
 function assembleSystemPrompt(
   base: string,
   skillLines: readonly string[],
@@ -778,6 +802,9 @@ function assembleSystemPrompt(
         `以隔离上下文；报告最多 4k 字符。`,
     );
   }
+  // R2-S2 固定小节（任务分解 + 收尾评审——与 workflow 开关无关：规则是提示词层常驻）
+  sections.push(TASK_DECOMPOSITION_SECTION);
+  sections.push(REVIEW_SENTINEL_SECTION);
   return sections.join('\n\n');
 }
 
@@ -817,7 +844,19 @@ function defaultSessionsDir(): string {
 
 /** 一次性组装（自备依赖测试全部用假；这里只装真件、零网络往返）。 */
 export async function assembleDeps(config: DevmateConfig): Promise<DevmateServerDeps> {
-  const jail = await createJail({ workspaceRoot: config.workspaceRoot });
+  // S2 小修：工作区根一致化——装配时一次 realpath 解析出 canonical 根，jail 与 shell
+  // 初值 cwd 同源注入（软链/大小写拼写差异下 read 放行与 run_command pwd 判定统一；
+  // 会话 meta（deps.workspaceRoot）仍用调用方字面拼写——展示层归属面不因规范化漂移）。
+  // 字面拼写保留：canonical != 原字面（软链工作区）时，把原字面登记为额外别名根——
+  // jail 双端判定对「字面端」与「真实端」都命中边界（与边界根本身即软链的历史语义一致：
+  // 模型按调用方视角给字面路径也不再被「字面越界」拦截）。
+  const canonicalWorkspaceRoot = await realpath(config.workspaceRoot);
+  const jail = await createJail({
+    workspaceRoot: canonicalWorkspaceRoot,
+    ...(config.workspaceRoot !== canonicalWorkspaceRoot
+      ? { extraRoots: [config.workspaceRoot] }
+      : {}),
+  });
   const sessionsDir = config.sessionsDir ?? defaultSessionsDir();
 
   const store = new JsonlFileAdapter({ dir: sessionsDir });
@@ -859,7 +898,7 @@ export async function assembleDeps(config: DevmateConfig): Promise<DevmateServer
   });
 
   const sessionTools = createSessionToolsFactory({
-    workspaceRoot: config.workspaceRoot,
+    workspaceRoot: canonicalWorkspaceRoot,
     jail,
     ...(config.toolTimeoutMs !== undefined ? { toolTimeoutMs: config.toolTimeoutMs } : {}),
     ...(config.idleShellTtlMs !== undefined ? { idleShellTtlMs: config.idleShellTtlMs } : {}),
@@ -892,14 +931,18 @@ export async function assembleDeps(config: DevmateConfig): Promise<DevmateServer
   if (config.methodFirst !== false) runOptions.methodology = methodologyGate;
 
   // 系统提示合成（startRun 每次运行前调用——技能开关/workflow 配置变更即时生效）：
-  // base（config.systemPrompt ?? 中文起草）+ 技能清单节 + 方法论路由节 + 子代理节，
-  // 预算感知（见 composeSystemPrompt）。
-  const compose = (): Promise<string> =>
+  // base（config.systemPrompt ?? 中文起草）+ 技能清单节 + 方法论路由节 + 子代理节 +
+  // 任务分解节 + 收尾评审节，预算感知（见 composeSystemPrompt）。
+  // includeMethodology 由 startRun 按 current.methodFirst 传递（false → 路由节排除）。
+  const compose = (opts?: { includeMethodology?: boolean }): Promise<string> =>
     composeSystemPrompt({
       ...(config.systemPrompt !== undefined ? { basePrompt: config.systemPrompt } : {}),
       skills: () => skillsRef.index,
       methodologies: () => methodologyRef.index,
       workflow: () => (workflowRef.get !== null ? workflowRef.get() : initialWorkflow),
+      ...(opts?.includeMethodology !== undefined
+        ? { includeMethodology: opts.includeMethodology }
+        : {}),
     });
 
   return {
@@ -985,6 +1028,8 @@ export async function assembleDeps(config: DevmateConfig): Promise<DevmateServer
       permission: config.permission ?? 'workspace-write',
       // 方法论前置门初值（R2-S1：缺省开；POST /api/settings 运行时可关）
       methodFirst: config.methodFirst ?? true,
+      // 评审哨兵初值（R2-S2：缺省开；POST /api/settings 运行时可关——false = 不注入 gate）
+      reviewMode: config.reviewMode ?? true,
       ...(config.apiKey !== undefined ? { apiKey: config.apiKey } : {}),
       ...(config.windowTokens !== undefined
         ? { windowTokens: config.windowTokens }

@@ -147,6 +147,66 @@ export type ApprovalDecision =
 export type Approver = (call: ToolCall) => Promise<ApprovalDecision>;
 
 // ---------------------------------------------------------------------------
+// 评审哨兵（R2-S2：收尾评审护栏）
+// ---------------------------------------------------------------------------
+
+/**
+ * 会话级工具运行统计（评审哨兵语义版的数据源）：计数由接线层观察器在每次
+ * 工具真实执行时累积（被审批拒绝 / 未触达工具层的调用不计——「执行过」语义）。
+ * 纯函数 hasSubstantiveWork / hasReviewRun 只消费本形状（测试面板直测函数）。
+ */
+export interface RunStats {
+  /** 工具名 → 已执行次数（含失败结果：失败也是「执行过」）。 */
+  counts: Readonly<Record<string, number>>;
+  /** 成功执行的 spawn_subagent 的 prompt 文本序列（评审判定数据源，按执行序）。 */
+  subagentPrompts: readonly string[];
+}
+
+/** 实质变更工具名（写/编辑/命令/子代理；MCP 按 mcp_ 前缀另行判定）。 */
+const SUBSTANTIVE_TOOL_NAMES = new Set(['write_file', 'edit_file', 'run_command', 'spawn_subagent']);
+
+/** 独立审查 prompt 判定（含「审查」或 "review"——大小写不敏感）。 */
+const REVIEW_PROMPT_PATTERN = /审查|review/i;
+
+/** 实质变更判定：write/edit/shell/mcp 工具/spawn 任一执行过。 */
+export function hasSubstantiveWork(stats: RunStats | undefined): boolean {
+  if (stats === undefined) return false;
+  for (const name of Object.keys(stats.counts)) {
+    if ((stats.counts[name] ?? 0) > 0) {
+      if (SUBSTANTIVE_TOOL_NAMES.has(name) || name.startsWith('mcp_')) return true;
+    }
+  }
+  return false;
+}
+
+/** 独立审查判定：任一次 spawn_subagent 成功且其 prompt 含 /审查|review/i。 */
+export function hasReviewRun(stats: RunStats | undefined): boolean {
+  if (stats === undefined) return false;
+  return stats.subagentPrompts.some((prompt) => REVIEW_PROMPT_PATTERN.test(prompt));
+}
+
+/**
+ * 评审哨兵门（RunOptions.review）：自然收尾点护栏——任务有实质变更（本轮执行过
+ * write / edit / run_command / mcp 工具 / spawn_subagent）且尚无独立审查时，先注入一次
+ * 「请先派独立审查子代理再收尾」的用户消息（事件 meta.system:true，UI 显示为
+ * 系统样式），续跑一轮；flag 为 per-session 一次性——已注入过即置位，之后模型
+ * 若无审查直接自然结束 → 放行（护栏即一次）。
+ * - 纯查询与一次性置位的契约（实现方各自收敛：server 语义版经 RunStats 判定；
+ *   loop 层只消费本接缝，绝不外挂统计）。
+ * - 故障收敛：任一查询/置位抛错按「不干预自然结束」处理（护栏故障不放大为行为故障）。
+ */
+export interface ReviewGate {
+  /** 该会话是否已有实质变更（写/编辑/命令/MCP/子代理任一执行过）。 */
+  hasSubstantiveWork(sessionId: string): boolean;
+  /** 该会话是否已有独立审查（spawn_subagent 成功且 prompt 含 /审查|review/i）。 */
+  hasReviewRun(sessionId: string): boolean;
+  /** 该会话是否已注入过（per-session 一次性护栏）。 */
+  isFlagged(sessionId: string): boolean;
+  /** 注入时置位（一次性护栏的写侧；先置位后注入）。 */
+  markFlagged(sessionId: string): void;
+}
+
+// ---------------------------------------------------------------------------
 // 方法论前置门（R2-S1：方法论内化）
 // ---------------------------------------------------------------------------
 
@@ -218,6 +278,11 @@ export interface RunOptions {
   now?: () => number;
   /** 方法论前置门；缺省 undefined = 关闭（从不拦截——E2E/测试/老配置默认路径）。 */
   methodology?: MethodologyGate;
+  /**
+   * 评审哨兵门（R2-S2）；缺省 undefined = 关闭（从不注入——E2E/测试/老配置默认路径）。
+   * server 语义版：hasSubstantiveWork/hasReviewRun 由接线层观察器记帐的 RunStats 装配。
+   */
+  review?: ReviewGate;
 }
 
 // ---------------------------------------------------------------------------

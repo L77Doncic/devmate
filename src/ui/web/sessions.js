@@ -166,7 +166,15 @@ export function toProtocolEvent(e) {
   const p = e.payload ?? {};
   switch (kind) {
     case 'user':
-      return { event: 'session-user', data: { text: String(p.content ?? '') } };
+      return {
+        event: 'session-user',
+        // R2-S2：评审哨兵存储形态 meta.system=true → 协议帧 data.system=true
+        // （messages.js 渲染为系统样式消息；与在线流/replay 帧同规）
+        data: {
+          text: String(p.content ?? ''),
+          ...(e.meta?.system === true ? { system: true } : {}),
+        },
+      };
     case 'assistant':
       return {
         event: 'assistant-done',

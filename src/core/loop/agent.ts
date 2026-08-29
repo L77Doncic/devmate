@@ -47,6 +47,7 @@ import type {
   LlmAdapter,
   MethodologyGate,
   Pricing,
+  ReviewGate,
   RunInput,
   RunOptions,
   RunResult,
@@ -66,6 +67,16 @@ import {
 // ---------------------------------------------------------------------------
 // run()：唯一入口
 // ---------------------------------------------------------------------------
+
+/**
+ * 评审哨兵注入的用户消息（R2-S2）：在模型自然结束（无工具调用）时由环境注入，
+ * 事件 meta.system=true（UI 显示为系统样式）。
+ * 措辞契约（测试锚点）：以「评审哨兵」标记 + 指出动作（spawn_subagent 独立审查）。
+ */
+export const REVIEW_SENTINEL_USER_CONTENT =
+  '【评审哨兵】本轮任务产生了实质变更（写入/编辑/命令执行/MCP 调用/子代理）。' +
+  '收尾前请先派一次独立审查：调用 spawn_subagent，其 prompt 须含「审查」或 review——' +
+  '以交付物对照任务目标，列出缺陷与放行理由（≤400 字）；对审查结论先修复或说明，再收尾。';
 
 export async function run(input: RunInput, opts: RunOptions): Promise<RunResult> {
   const pricing = opts.pricing ?? DEFAULT_PRICING;
@@ -202,11 +213,16 @@ export async function run(input: RunInput, opts: RunOptions): Promise<RunResult>
           opts.methodology !== undefined && methodologyRoutedId !== null
             ? { gate: opts.methodology, routedId: methodologyRoutedId }
             : null,
+        review: opts.review,
       });
       if (turn.type === 'status') {
         status = turn.status;
         errorMessage = turn.errorMessage;
         break;
+      }
+      if (turn.type === 'continue') {
+        // 评审哨兵续跑（R2-S2）：注入 system-user 后本轮继续——无终止面变化
+        continue;
       }
       if (turn.type === 'natural-end') {
         status = 'completed';
@@ -284,6 +300,8 @@ interface TurnDeps {
   rawEst: number;
   /** 方法论前置门状态（null = 未注入/未命中/路由故障 → 从不拦截）。 */
   methodology: { gate: MethodologyGate; routedId: string } | null;
+  /** 评审哨兵门（undefined = 关闭——从不注入；E2E/测试/老配置默认路径）。 */
+  review: ReviewGate | undefined;
 }
 
 /** 成本护栏计价状态（ADR-0003：计价表 + 上限 + 本轮请求前估算 + 累计账本）。 */
@@ -304,6 +322,8 @@ interface Ledger {
 
 type TurnOutcome =
   | { type: 'natural-end' }
+  /** 评审哨兵注入后继续下一轮（无终止面变化；不计熔断）。 */
+  | { type: 'continue' }
   | { type: 'tool-round'; malformed: boolean }
   | { type: 'status'; status: RunStatus; errorMessage?: string };
 
@@ -400,8 +420,13 @@ async function runTurn(deps: TurnDeps): Promise<TurnOutcome> {
     addEstimateUsage(deps.budget, completionEst.tokens);
   }
 
-  // 自然结束：本轮不再发起任何工具调用即告结束（CONTEXT「自然结束」）
-  if (calls.length === 0) return { type: 'natural-end' };
+  // 自然结束：本轮不再发起任何工具调用即告结束（CONTEXT「自然结束」）。
+  // 评审哨兵（R2-S2）：实质变更 + 无独立审查 + 未注入过 → 注入 system-user 请求一次
+  //（替代该轮收尾），模型续跑；已注入过而无审查 → 直接放行（护栏即一次）。
+  if (calls.length === 0) {
+    const reinjected = await maybeInjectReviewSentinel(deps);
+    return reinjected ? { type: 'continue' } : { type: 'natural-end' };
+  }
 
   // 方法论前置门（R2-S1）：命中未加载且调用组不含 use_skill(<id>) → 整组拦截。
   // 替代执行一次：以 methodology-first 指导性结果回注（普通回注管线，不计熔断）——
@@ -440,6 +465,41 @@ async function runTurn(deps: TurnDeps): Promise<TurnOutcome> {
     return { type: 'status', status: 'user-interrupted' };
   }
   return { type: 'tool-round', malformed };
+}
+
+/**
+ * 评审哨兵判定 + 注入（一次）：
+ * - 门未注入/查询组合不满足 → false（不干预自然结束）；
+ * - 满足：先 markFlagged（per-session 一次性；置位失败 → 不注入——防无限回注），
+ *   再落盘 kind:'user'（payload.content = 哨兵文本；meta.system=true -> 系统样式），
+ *   true = 本轮替代收尾（下一轮模型对该消息 respond，正常计入成本/步数，不计熔断）。
+ * - 故障收敛：任何查询/置位抛错按「门故障 = 关闭」处理（护栏故障不放大为行为故障）。
+ */
+async function maybeInjectReviewSentinel(deps: TurnDeps): Promise<boolean> {
+  const gate = deps.review;
+  if (gate === undefined) return false;
+  let substantive = false;
+  let hasReview = false;
+  let flagged = false;
+  try {
+    substantive = gate.hasSubstantiveWork(deps.sessionId);
+    hasReview = gate.hasReviewRun(deps.sessionId);
+    flagged = gate.isFlagged(deps.sessionId);
+  } catch {
+    return false;
+  }
+  if (!substantive || hasReview || flagged) return false;
+  try {
+    gate.markFlagged(deps.sessionId);
+  } catch {
+    return false;
+  }
+  await deps.store.append(deps.sessionId, {
+    kind: 'user',
+    payload: { content: REVIEW_SENTINEL_USER_CONTENT },
+    meta: { system: true },
+  });
+  return true;
 }
 
 /** 用户中断查询（每次现场读 signal，避免 await 后的残留窄化）。 */
@@ -482,13 +542,20 @@ function methodologyBlockedIds(deps: TurnDeps, calls: readonly ToolCall[]): Set<
   return new Set(calls.map((call) => call.id));
 }
 
-/** 取 use_skill 调用的技能 id（非 use_skill / 参数畸形 → null；畸形走主循环正常回注）。 */
+/**
+ * 取 use_skill 调用的技能 id（非 use_skill / 参数畸形 → null；畸形走主循环正常回注）。
+ * 参数兼容（S2 小修）：{skill} 或 {id}；两者都给以 id 优先——与 skill.ts 运行时同口径
+ * （方法论前置门的「组内含 use_skill(<id>) 放行」与加载观察器都经本函数）。
+ */
 function skillIdOf(call: ToolCall): string | null {
   if (call.name !== 'use_skill') return null;
   try {
     const parsed: unknown = JSON.parse(call.arguments);
     if (typeof parsed === 'object' && parsed !== null && !Array.isArray(parsed)) {
-      const raw = (parsed as Record<string, unknown>).skill;
+      const record = parsed as Record<string, unknown>;
+      const id = record.id;
+      if (typeof id === 'string' && id !== '') return id;
+      const raw = record.skill;
       return typeof raw === 'string' ? raw : null;
     }
   } catch {

@@ -70,6 +70,8 @@ export interface ServerConfig {
   windowTokens?: number;
   /** 方法论前置门持久值（R2-S1 读回键；缺省 true）。 */
   methodFirst?: boolean;
+  /** 评审哨兵持久值（R2-S2 读回键；缺省 true）。 */
+  reviewMode?: boolean;
 }
 
 /** web 子命令生效参数。 */
@@ -206,6 +208,7 @@ export function buildServerConfig(config: {
   permission?: PermissionPreset;
   windowTokens?: number;
   methodFirst?: boolean;
+  reviewMode?: boolean;
 }): ServerConfig {
   const out: ServerConfig = {
     workspaceRoot: config.workspaceRoot,
@@ -219,6 +222,7 @@ export function buildServerConfig(config: {
   if (config.permission !== undefined) out.permission = config.permission;
   if (config.windowTokens !== undefined) out.windowTokens = config.windowTokens;
   if (config.methodFirst !== undefined) out.methodFirst = config.methodFirst;
+  if (config.reviewMode !== undefined) out.reviewMode = config.reviewMode;
   return out;
 }
 
@@ -264,12 +268,13 @@ export async function runWeb(args: string[], io: RunWebIo): Promise<number> {
     ...(config.apiKey !== undefined ? { apiKey: config.apiKey } : {}),
     ...(config.maxSteps !== undefined ? { maxSteps: config.maxSteps } : {}),
     ...(config.costLimitUsd !== undefined ? { costLimitUsd: config.costLimitUsd } : {}),
-    // B 档设置读回：{permission, reasoning, windowTokens, methodFirst} 自 config.json 同键读回
-    // （persistSettings 写出的键；缺省不写 → 缺省字段不传，assembleDeps 回落各自缺省）
+    // B 档设置读回：{permission, reasoning, windowTokens, methodFirst, reviewMode} 自 config.json
+    // 同键读回（persistSettings 写出的键；缺省不写 → 缺省字段不传，assembleDeps 回落各自缺省）
     ...(stored.reasoning !== undefined ? { reasoning: stored.reasoning } : {}),
     ...(stored.permission !== undefined ? { permission: stored.permission } : {}),
     ...(stored.windowTokens !== undefined ? { windowTokens: stored.windowTokens } : {}),
     ...(stored.methodFirst !== undefined ? { methodFirst: stored.methodFirst } : {}),
+    ...(stored.reviewMode !== undefined ? { reviewMode: stored.reviewMode } : {}),
   });
   let deps: unknown;
   try {
@@ -280,9 +285,9 @@ export async function runWeb(args: string[], io: RunWebIo): Promise<number> {
   }
   // 设置持久化：POST /api/settings 落盘（mergeConfig 单点合并写——只覆盖 settings 键，
   // maxSteps/costLimitUsd/skills/workflow/mcp 等既有键全保留；patch 显式 apiKey:undefined
-  // = 删除该键；reasoning/windowTokens/permission/permissionConfirmedAt 只在快照携带时写
-  // ——服务端补丁语义本来就在触碰时才携带）。saveConfig 0600 写 io.configPath 由
-  // mergeConfig 负责（目录/模式纠正）。
+  // = 删除该键；reasoning/windowTokens/permission/permissionConfirmedAt/methodFirst/reviewMode
+  // 只在快照携带时写——服务端补丁语义本来就在触碰时才携带）。saveConfig 0600 写
+  // io.configPath 由 mergeConfig 负责（目录/模式纠正）。
   const persistSettings = (s: {
     baseUrl: string;
     model: string;
@@ -292,6 +297,7 @@ export async function runWeb(args: string[], io: RunWebIo): Promise<number> {
     permission?: PermissionPreset;
     permissionConfirmedAt?: number;
     methodFirst?: boolean;
+    reviewMode?: boolean;
   }): void => {
     mergeConfig(io.configPath, {
       baseUrl: s.baseUrl,
@@ -304,6 +310,7 @@ export async function runWeb(args: string[], io: RunWebIo): Promise<number> {
         ? { permissionConfirmedAt: s.permissionConfirmedAt }
         : {}),
       ...(s.methodFirst !== undefined ? { methodFirst: s.methodFirst } : {}),
+      ...(s.reviewMode !== undefined ? { reviewMode: s.reviewMode } : {}),
     });
   };
   // 三节初值加载（读 config.json 相应节；缺省：skillsRecord {} = 全开、workflow true/2、

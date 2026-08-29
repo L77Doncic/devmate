@@ -66,7 +66,9 @@ export function deriveTitle(firstUserContent: string | undefined): string {
  * 不带键，与 src/ui/web/sessions.js 的 toProtocolEvent 映射同规）。
  */
 export type SseEventData =
-  | { event: 'session-user'; data: { text: string } }
+  // system?: true = 系统样式用户消息（R2-S2 评审哨兵：事件 meta.system=true 映射——
+  // 前端显示为浅色系统 chip；缺省不携带——普通用户消息协议不变）。
+  | { event: 'session-user'; data: { text: string; system?: boolean } }
   | { event: 'assistant-delta'; data: { text: string } }
   | { event: 'reasoning'; data: { text: string } }
   | { event: 'assistant-done'; data: { content: string; toolCalls: ToolCallView[] } }

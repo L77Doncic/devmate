@@ -1,5 +1,9 @@
 // 构建后将 mattpocock-skills 插件工程技能资产复制到 dist/assets/skills（tsc 不处理非 TS 资产）。
-// 来源：~/.claude/plugins/cache/claude-plugins-official/mattpocock-skills/<version>/skills/engineering/
+// 源目录优先级：env DEV_MATE_SKILLS_SRC > 默认插件路径
+//   ~/.claude/plugins/cache/claude-plugins-official/mattpocock-skills/<version>/skills/engineering/
+//   > 空（无源 → WARN 并保证 dist/assets/skills 为空，服务端 GET /api/skills 空列表降级）。
+//   - CI（ubuntu/windows）无 ~/.claude → 走 WARN 分支；构建正常 exit 0；
+//   - 本地构建请安装 mattpocock-skills 或设 DEV_MATE_SKILLS_SRC 指向定制源目录。
 // - 每个 skill 目录整目录保留（SKILL.md + 附注 md/json 等文本；server 端按 <id>/SKILL.md 索引）；
 // - 方法论内化蒸馏（R2-S1）：repo 根 assets/skills-meta.json（Meta 精编产物）合并进每个
 //   SKILL.md 的 frontmatter（原字段 + `methodology: {type,trigger,steps,done}` 行——dist 内为
@@ -8,7 +12,7 @@
 //   - 脚本对缺失 meta 键不崩（sanitizeSkillMeta 全量容错）。
 // - 插件 LICENSE/README 聚合为 dist/assets/skills/LICENSE-mattpocock-skills.txt（第三方资产属性声明）；
 // - src 侧不复制：dev 模式服务端在 dist 上跑——统一 dist 路径（静态 dev 可选）。
-// 插件未安装 → 警告并跳过（dist 无 skills 资产，服务端 GET /api/skills 走空列表降级）。
+// - **不存在任何 process.exit**（vitest 视 process.exit 为崩溃）：无源 or 报错路径一律正常返回。
 import {
   cpSync,
   existsSync,
@@ -19,12 +23,11 @@ import {
   writeFileSync,
 } from 'node:fs';
 import { homedir } from 'node:os';
-import { dirname, join } from 'node:path';
+import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 const root = join(dirname(fileURLToPath(import.meta.url)), '..');
 const dst = join(root, 'dist', 'assets', 'skills');
-const metaPath = join(root, 'assets', 'skills-meta.json');
 
 // ---------------------------------------------------------------------------
 // 蒸馏纯函数（test/build/copy-skills.test.ts 直测；无 meta 缺键不崩）
@@ -88,15 +91,6 @@ export function buildMethodologiesTable(ids, rawMeta) {
 // 复制主流程
 // ---------------------------------------------------------------------------
 
-const pluginBase = join(
-  homedir(),
-  '.claude',
-  'plugins',
-  'cache',
-  'claude-plugins-official',
-  'mattpocock-skills',
-);
-
 /** 插件缓存里存放的可选版本目录（semver 升序取最新；目录名为版本号）。 */
 function latestVersion(base) {
   if (!existsSync(base)) return null;
@@ -121,76 +115,114 @@ function countFiles(dir) {
   return count;
 }
 
-const pluginDir = latestVersion(pluginBase);
-const src = pluginDir !== null ? join(pluginDir, 'skills', 'engineering') : null;
+/**
+ * 主流程（导出供测试直调；直接运行 node scripts/copy-skills.mjs 时由文件底部 gate 触发）。
+ * 源目录优先级：env DEV_MATE_SKILLS_SRC > 默认插件路径 > 空。任何分支都不 process.exit——
+ * 无源 → WARN 并保证 dist/assets/skills 为空（不残留上次构建的资产），正常返回。
+ * meta 源默认 repo 根 assets/skills-meta.json；env DEV_MATE_SKILLS_META 可覆写（确定性 fixture）。
+ */
+export function main() {
+  const envSrc = process.env.DEV_MATE_SKILLS_SRC?.trim() || null;
+  const metaPath =
+    process.env.DEV_MATE_SKILLS_META?.trim() || join(root, 'assets', 'skills-meta.json');
 
-if (src === null || !existsSync(src)) {
-  console.error(`skills assets NOT copied (plugin not installed under ${pluginBase})`);
-  process.exit(0);
-}
+  const pluginBase = join(
+    homedir(),
+    '.claude',
+    'plugins',
+    'cache',
+    'claude-plugins-official',
+    'mattpocock-skills',
+  );
 
-rmSync(dst, { recursive: true, force: true });
-mkdirSync(dst, { recursive: true });
+  const pluginDir = latestVersion(pluginBase);
+  const src = envSrc ?? (pluginDir !== null ? join(pluginDir, 'skills', 'engineering') : null);
 
-// Meta 精编产物：缺失 → {}（所有技能降级 reference；脚本不崩）
-let metaRaw = {};
-if (existsSync(metaPath)) {
-  try {
-    const parsed = JSON.parse(readFileSync(metaPath, 'utf8'));
-    metaRaw = typeof parsed === 'object' && parsed !== null && !Array.isArray(parsed) ? parsed : {};
-  } catch {
-    metaRaw = {};
+  if (src === null || !existsSync(src)) {
+    const reason = envSrc
+      ? `DEV_MATE_SKILLS_SRC=${envSrc} not found`
+      : `plugin not installed under ${pluginBase}`;
+    console.warn(
+      `WARN: no skills source; dist/assets/skills will be empty` +
+        `（本地构建请安装 mattpocock-skills 或设 DEV_MATE_SKILLS_SRC）— ${reason}`,
+    );
+    // 清空产物：避免上次构建的 skills 资产残留（server GET /api/skills 空列表降级）
+    rmSync(dst, { recursive: true, force: true });
+    mkdirSync(dst, { recursive: true });
+    return;
   }
-}
 
-let styleDirs = 0;
-const skillIds = [];
-for (const entry of readdirSync(src, { withFileTypes: true })) {
-  if (!entry.isDirectory() || entry.name.startsWith('.')) continue;
-  cpSync(join(src, entry.name), join(dst, entry.name), { recursive: true });
-  styleDirs += 1;
-  // 蒸馏：SKILL.md 的 frontmatter 合并版（原字段 + methodology 行；dist 内为合并产物）
-  const skillFile = join(dst, entry.name, 'SKILL.md');
-  if (existsSync(skillFile)) {
-    skillIds.push(entry.name);
-    const original = readFileSync(skillFile, 'utf8');
-    writeFileSync(skillFile, mergeSkillFrontmatter(original, metaRaw[entry.name]));
+  rmSync(dst, { recursive: true, force: true });
+  mkdirSync(dst, { recursive: true });
+
+  // Meta 精编产物：缺失 → {}（所有技能降级 reference；脚本不崩）
+  let metaRaw = {};
+  if (existsSync(metaPath)) {
+    try {
+      const parsed = JSON.parse(readFileSync(metaPath, 'utf8'));
+      metaRaw = typeof parsed === 'object' && parsed !== null && !Array.isArray(parsed) ? parsed : {};
+    } catch {
+      metaRaw = {};
+    }
   }
+
+  let styleDirs = 0;
+  const skillIds = [];
+  for (const entry of readdirSync(src, { withFileTypes: true })) {
+    if (!entry.isDirectory() || entry.name.startsWith('.')) continue;
+    cpSync(join(src, entry.name), join(dst, entry.name), { recursive: true });
+    styleDirs += 1;
+    // 蒸馏：SKILL.md 的 frontmatter 合并版（原字段 + methodology 行；dist 内为合并产物）
+    const skillFile = join(dst, entry.name, 'SKILL.md');
+    if (existsSync(skillFile)) {
+      skillIds.push(entry.name);
+      const original = readFileSync(skillFile, 'utf8');
+      writeFileSync(skillFile, mergeSkillFrontmatter(original, metaRaw[entry.name]));
+    }
+  }
+
+  // 路由器表（methodologies.json）：deps compose 的路由节与 loop 前置门 route 的动态读源
+  writeFileSync(
+    join(dst, 'methodologies.json'),
+    `${JSON.stringify(buildMethodologiesTable(skillIds, metaRaw), null, 2)}\n`,
+  );
+
+  // 属性声明：插件 LICENSE + README 聚合单文件（dist 不复制源码仓库，许可与出处须随包声明）；
+  // 源为 env 覆盖时取其父目录（fixture/定制源可在 src 旁放 LICENSE/README.md）
+  const licenseDir = envSrc ? dirname(src) : pluginDir;
+  const licensePath = licenseDir === null ? null : join(licenseDir, 'LICENSE');
+  const readmePath = licenseDir === null ? null : join(licenseDir, 'README.md');
+  if (licensePath !== null && (existsSync(licensePath) || existsSync(readmePath))) {
+    const version = licenseDir.split(/[\\/]/).pop();
+    const parts = [
+      'DevMate 第三方技能资产声明（mattpocock-skills）',
+      `来源: ${src}/（版本 ${version}）`,
+      '以下技能目录（含 SKILL.md 与附注）为第三方资产，许可与出处（README）随本文件一并发布：',
+      '',
+      '============================== LICENSE ==============================',
+    ];
+    if (existsSync(licensePath)) parts.push(readFileSync(licensePath, 'utf8').trim());
+    parts.push('', '============================== README ==============================', '');
+    if (existsSync(readmePath)) parts.push(readFileSync(readmePath, 'utf8').trim());
+    writeFileSync(join(dst, 'LICENSE-mattpocock-skills.txt'), `${parts.join('\n')}\n`);
+  }
+
+  const fileCount = countFiles(dst);
+  const methodCount = Object.values(buildMethodologiesTable(skillIds, metaRaw)).filter(
+    (m) => m.type === 'method',
+  ).length;
+  console.error(
+    `skills assets copied: ${src} -> ${dst} (${styleDirs} skills, ${fileCount} files, ` +
+      `methodologies.json ${existsSync(join(dst, 'methodologies.json')) ? 'ok' : 'MISSING'} ` +
+      `(${methodCount} method / ${skillIds.length - methodCount} reference), ` +
+      `LICENSE-mattpocock-skills.txt ${
+        existsSync(join(dst, 'LICENSE-mattpocock-skills.txt')) ? 'ok' : 'MISSING'
+      })`,
+  );
 }
 
-// 路由器表（methodologies.json）：deps compose 的路由节与 loop 前置门 route 的动态读源
-writeFileSync(
-  join(dst, 'methodologies.json'),
-  `${JSON.stringify(buildMethodologiesTable(skillIds, metaRaw), null, 2)}\n`,
-);
-
-// 属性声明：插件 LICENSE + README 聚合单文件（dist 不复制源码仓库，许可与出处须随包声明）
-const licensePath = join(pluginDir, 'LICENSE');
-const readmePath = join(pluginDir, 'README.md');
-if (existsSync(licensePath) || existsSync(readmePath)) {
-  const version = pluginDir.split('/').pop();
-  const parts = [
-    'DevMate 第三方技能资产声明（mattpocock-skills）',
-    `来源: ${pluginDir}/skills/engineering/（版本 ${version}）`,
-    '以下技能目录（含 SKILL.md 与附注）为第三方资产，许可与出处（README）随本文件一并发布：',
-    '',
-    '============================== LICENSE ==============================',
-  ];
-  if (existsSync(licensePath)) parts.push(readFileSync(licensePath, 'utf8').trim());
-  parts.push('', '============================== README ==============================', '');
-  if (existsSync(readmePath)) parts.push(readFileSync(readmePath, 'utf8').trim());
-  writeFileSync(join(dst, 'LICENSE-mattpocock-skills.txt'), `${parts.join('\n')}\n`);
+// 直接运行（node scripts/copy-skills.mjs）→ 执行主流程；被 import（vitest 直测纯函数/导出 main）→ 仅定义。
+if (resolve(process.argv[1] ?? '') === fileURLToPath(import.meta.url)) {
+  main();
 }
 
-const fileCount = countFiles(dst);
-const methodCount = Object.values(buildMethodologiesTable(skillIds, metaRaw)).filter(
-  (m) => m.type === 'method',
-).length;
-console.error(
-  `skills assets copied: ${src} -> ${dst} (${styleDirs} skills, ${fileCount} files, ` +
-    `methodologies.json ${existsSync(join(dst, 'methodologies.json')) ? 'ok' : 'MISSING'} ` +
-    `(${methodCount} method / ${skillIds.length - methodCount} reference), ` +
-    `LICENSE-mattpocock-skills.txt ${
-      existsSync(join(dst, 'LICENSE-mattpocock-skills.txt')) ? 'ok' : 'MISSING'
-    })`,
-);

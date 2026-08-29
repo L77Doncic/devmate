@@ -242,6 +242,9 @@ describe('E2E-B：工具+审批全链（真实 run_command echo）', () => {
       workspaceRoot: dir,
       sessionsDir: join(dir, 'sessions'),
       model: 'deepseek-v4-flash',
+      // B 组聚焦审批链：关掉评审哨兵（run_command 属实质变更；哨兵路径由
+      // e2e/s2-methodology 的 assembleDeps 同链抽样覆盖）
+      reviewMode: false,
     });
     deps.llm = fake;
     deps.createLlm = () => fake;
@@ -501,6 +504,9 @@ describe('E2E-C：subagent 与技能（假池经 createSessionToolsFactory 注�
       model: 'deepseek-v4-flash',
       llm: fake,
       skillsDir,
+      // C 组聚焦技能/子代理链（测试脚本固定序）：关掉评审哨兵（spawn_subagent
+      // 属实质变更——哨兵注入路径由 e2e/s2-methodology 同链抽样覆盖）
+      settings: { reviewMode: false },
       // C 不是审批场景：直接放行（审批链在 E2E-B 覆盖）
       approvalPolicy: () => false,
       // 与 assembleDeps 同构的懒构建 data source（GET /api/tools 首次访问才建 __fallback__ 壳）

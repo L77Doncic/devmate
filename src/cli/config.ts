@@ -47,6 +47,8 @@ export interface StoredConfig {
   permissionConfirmedAt?: number;
   /** 方法论前置门开关（R2-S1：settings methodFirst 持久化；缺省 true——服务端兜底）。 */
   methodFirst?: boolean;
+  /** 评审哨兵开关（R2-S2：settings reviewMode 持久化；缺省 true——服务端兜底）。 */
+  reviewMode?: boolean;
   /** Skills 运行时开关（id → enabled；缺省空表 = 全开）。 */
   skills?: Record<string, boolean>;
   /** 工作流配置（子代理开关/并行上限；缺省 true/2；maxParallel 消费时夹紧 1-4）。 */

@@ -223,6 +223,40 @@ describe('ui/server/route：提示词路由节', () => {
     expect(wrapPrompt(out)).toBeLessThanOrEqual(4096);
   });
 
+  it('p1b) includeMethodology:false → 路由节整体排除（其余节不受影响）', async () => {
+    const skills: SkillsIndex = {
+      async list() {
+        return [{ id: 'tdd', name: 'tdd', summary: 's', enabled: true }];
+      },
+      async content() {
+        return null;
+      },
+      async setEnabled() {
+        return false;
+      },
+    };
+    const methodologies = () =>
+      indexOf([{ id: 'tdd', type: 'method', trigger: '修复 bug', enabled: true }]);
+    const out = await composeSystemPrompt({
+      skills: () => skills,
+      methodologies,
+      workflow: () => ({ subagentsEnabled: true, maxParallel: 2 }),
+      includeMethodology: false,
+    });
+    expect(out).not.toContain('## 方法论路由');
+    expect(out).not.toContain('- 修复 bug → tdd');
+    // 其余节照常（路由节排除不连带技能/子代理/分解/收尾评审节）
+    expect(out).toContain('## 可用技能');
+    expect(out).toContain('## 子代理');
+    // 缺省（不传）= 节在场
+    const on = await composeSystemPrompt({
+      skills: () => skills,
+      methodologies,
+      workflow: () => ({ subagentsEnabled: true, maxParallel: 2 }),
+    });
+    expect(on).toContain('## 方法论路由');
+  });
+
   it('p2) 节内预算 ≤350：超预算删 trigger 最长的行（短行存活、长行先删）；确定性', async () => {
     const lines = [
       '- 短触 → keep',
@@ -318,12 +352,16 @@ function methodDeps(options: {
       idxRef.index = index;
     },
     runOptions: { methodology: gate },
-    // 系统提示合成（与 assembleDeps 同构；路由节经晚绑定方法论索引）
-    composeSystemPrompt: () =>
+    // 系统提示合成（与 assembleDeps 同构；路由节经晚绑定方法论索引；includeMethodology
+    // 由 startRun 按 methodFirst 传递——C3：false → 路由节排除）
+    composeSystemPrompt: (opts?: { includeMethodology?: boolean }) =>
       composeSystemPrompt({
         skills: () => null,
         methodologies: () => idxRef.index,
         workflow: () => ({ subagentsEnabled: true, maxParallel: 2 }),
+        ...(opts?.includeMethodology !== undefined
+          ? { includeMethodology: opts.includeMethodology }
+          : {}),
       }),
     ...(options.persistSettings !== undefined ? { persistSettings: options.persistSettings } : {}),
   };
@@ -468,5 +506,9 @@ describe('ui/server/route：服务端全链（真实 server × methodologies.jso
     expect(resultFrame.ok).toBe(true);
     expect(resultFrame.contentPreview).toContain('probe:ok');
     expect(executions).toEqual(['probe']);
+    // C3：methodFirst:false → compose 路由节排除（条件断言——提示词与门同关）
+    const prompt = String(llm.requests[0]!.messages[0]!.content);
+    expect(prompt).not.toContain('## 方法论路由');
+    expect(prompt).not.toContain('方法线：<id>');
   });
 });
