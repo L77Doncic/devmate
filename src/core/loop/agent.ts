@@ -37,6 +37,7 @@ import {
   errorResultContent,
   invalidArgumentsResult,
   invalidToolArgumentsResult,
+  methodologyFirstResult,
   unknownToolResult,
   validateToolCall,
 } from './tools.js';
@@ -44,6 +45,7 @@ import type {
   ApprovalDeniedErrorType,
   Approver,
   LlmAdapter,
+  MethodologyGate,
   Pricing,
   RunInput,
   RunOptions,
@@ -86,6 +88,8 @@ export async function run(input: RunInput, opts: RunOptions): Promise<RunResult>
   let steps = 0;
   let status: RunStatus | null = null;
   let errorMessage: string | undefined;
+  // 方法论前置门（R2-S1）：route 一次 run 一次；未注入/路由故障/未命中 → 门关闭（从不拦截）
+  const methodologyRoutedId = await resolveMethodologyRoute(opts.methodology, input.task);
 
   try {
     // 会话引导：新会话 = create + task 落为首个 user 事件；resume = 既有事件流直接继续（不改写）
@@ -194,6 +198,10 @@ export async function run(input: RunInput, opts: RunOptions): Promise<RunResult>
         budget: { pricing, costLimit, promptEst, ledger },
         calibrator,
         rawEst,
+        methodology:
+          opts.methodology !== undefined && methodologyRoutedId !== null
+            ? { gate: opts.methodology, routedId: methodologyRoutedId }
+            : null,
       });
       if (turn.type === 'status') {
         status = turn.status;
@@ -274,6 +282,8 @@ interface TurnDeps {
   calibrator: TokenEstimateCalibrator;
   /** 本轮请求前投影估算（未校正原始值，供 L0 校准与真值对比）。 */
   rawEst: number;
+  /** 方法论前置门状态（null = 未注入/未命中/路由故障 → 从不拦截）。 */
+  methodology: { gate: MethodologyGate; routedId: string } | null;
 }
 
 /** 成本护栏计价状态（ADR-0003：计价表 + 上限 + 本轮请求前估算 + 累计账本）。 */
@@ -302,6 +312,7 @@ type CallOutcome =
   | { kind: 'denied'; call: ToolCall; reason: string; errorType?: ApprovalDeniedErrorType }
   | { kind: 'denied-no-reason'; call: ToolCall }
   | { kind: 'malformed'; call: ToolCall; result: ToolResult }
+  | { kind: 'blocked'; call: ToolCall; result: ToolResult }
   | { kind: 'skipped'; call: ToolCall };
 
 async function runTurn(deps: TurnDeps): Promise<TurnOutcome> {
@@ -392,10 +403,25 @@ async function runTurn(deps: TurnDeps): Promise<TurnOutcome> {
   // 自然结束：本轮不再发起任何工具调用即告结束（CONTEXT「自然结束」）
   if (calls.length === 0) return { type: 'natural-end' };
 
+  // 方法论前置门（R2-S1）：命中未加载且调用组不含 use_skill(<id>) → 整组拦截。
+  // 替代执行一次：以 methodology-first 指导性结果回注（普通回注管线，不计熔断）——
+  // 工具未真执行；模型下一轮先 use_skill（成功即 markLoaded），之后不再拦。
+  const methodologyBlocked = methodologyBlockedIds(deps, calls);
+
   // 工具轮：并行 + 独立超时 + 审批 + 畸形回注（全部并行评估，按发出顺序落盘）。
   // 中断也 settle 全部：已完成的判型照常落盘、未及执行的以 interrupted 占位落盘——
   // 最小缺口只剩「真正没跑完的」，不再留下待 resume 修补的悬空调用。
-  const outcomes = await Promise.all(calls.map((call) => evaluateCall(call, deps)));
+  const outcomes = await Promise.all(
+    calls.map((call) =>
+      methodologyBlocked !== null && methodologyBlocked.has(call.id)
+        ? {
+            kind: 'blocked' as const,
+            call,
+            result: methodologyFirstResult(deps.methodology!.routedId),
+          }
+        : evaluateCall(call, deps),
+    ),
+  );
   let malformed = false;
   let deniedNoReason = false;
   for (const outcome of outcomes) {
@@ -419,6 +445,56 @@ async function runTurn(deps: TurnDeps): Promise<TurnOutcome> {
 /** 用户中断查询（每次现场读 signal，避免 await 后的残留窄化）。 */
 function interruptedMaybe(signal: AbortSignal | undefined): boolean {
   return signal?.aborted === true;
+}
+
+/**
+ * 方法论路由解析（一次 run 一次）：未注入 / route 抛错 / 未命中 → null（门关闭）。
+ * 「已加载」由调用时的 isLoaded 现场判定（同一 run 内多轮也能放开——加载后立即放行）。
+ */
+async function resolveMethodologyRoute(
+  methodology: MethodologyGate | undefined,
+  task: string,
+): Promise<string | null> {
+  if (methodology === undefined) return null;
+  try {
+    return await methodology.route(task);
+  } catch {
+    return null; // 路由故障按关闭处理（本轮不拦截；下次 run 天然重试）
+  }
+}
+
+/**
+ * 拦截判定（每次工具组现算）：未注入/未命中/已加载/组内含 use_skill(<id>) → null；
+ * 否则返回整组 callId（全部替代执行——方法未加载前不做任何动作）。
+ * isLoaded 抛错同样按不拦截收敛（护栏故障不放大为行为故障）。
+ */
+function methodologyBlockedIds(deps: TurnDeps, calls: readonly ToolCall[]): Set<string> | null {
+  if (deps.methodology === null) return null;
+  const { gate, routedId } = deps.methodology;
+  let loaded: boolean;
+  try {
+    loaded = gate.isLoaded(deps.sessionId, routedId);
+  } catch {
+    return null;
+  }
+  if (loaded) return null;
+  if (calls.some((call) => skillIdOf(call) === routedId)) return null; // 组内含加载调用 → 放行
+  return new Set(calls.map((call) => call.id));
+}
+
+/** 取 use_skill 调用的技能 id（非 use_skill / 参数畸形 → null；畸形走主循环正常回注）。 */
+function skillIdOf(call: ToolCall): string | null {
+  if (call.name !== 'use_skill') return null;
+  try {
+    const parsed: unknown = JSON.parse(call.arguments);
+    if (typeof parsed === 'object' && parsed !== null && !Array.isArray(parsed)) {
+      const raw = (parsed as Record<string, unknown>).skill;
+      return typeof raw === 'string' ? raw : null;
+    }
+  } catch {
+    // fallthrough → 畸形视角（null）
+  }
+  return null;
 }
 
 /** 校验先于审批：畸形调用绝不触达工具与审批（E9/E10/E11 → 回注 + 计数）。 */
@@ -483,6 +559,17 @@ async function evaluateCall(call: ToolCall, deps: TurnDeps): Promise<CallOutcome
             },
           };
   }
+  // 方法论观察器：use_skill 执行成功（ok:true）→ markLoaded（加载后该技能不再被拦截）
+  if (result.ok && deps.methodology !== null) {
+    const skillId = skillIdOf(call);
+    if (skillId !== null) {
+      try {
+        deps.methodology.gate.markLoaded(deps.sessionId, skillId);
+      } catch {
+        // mark 故障不改变工具结果（观察器尽力而为）
+      }
+    }
+  }
   return { kind: 'result', call, result };
 }
 
@@ -540,6 +627,14 @@ async function appendToolOutcome(
         payload: { toolCallId: outcome.call.id, content: outcome.result.content },
       });
       return 'malformed';
+    case 'blocked':
+      // 方法论拦截：content 已为合法 JSON 载荷（methodology-first 指导性结果）——
+      // 按普通工具结果落盘；不算畸形（不计熔断计数）、不触达工具层与审批。
+      await deps.store.append(deps.sessionId, {
+        kind: 'tool',
+        payload: { toolCallId: outcome.call.id, content: outcome.result.content },
+      });
+      return undefined;
     case 'result':
       await deps.store.append(deps.sessionId, {
         kind: 'tool',

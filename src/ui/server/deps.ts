@@ -60,6 +60,12 @@ import { createSubagentTool } from '../../core/tools/subagent.js';
 import { connectMcpServer, createMcpTools } from '../../core/mcp/index.js';
 import type { McpClient, McpClientFactory } from '../../core/mcp/index.js';
 import type { Tool } from '../../core/loop/types.js';
+import type { MethodologyGate } from '../../core/loop/types.js';
+import type {
+  MethodologyEntry,
+  MethodologyIndex,
+  SkillMethodology,
+} from '../../shared/methodology.js';
 import { deriveTitle, sessionWorkspaceOf } from './emit.js';
 import type {
   DevmateServerDeps,
@@ -103,6 +109,8 @@ export interface DevmateConfig {
   mcpServers?: McpServerConfig[] | undefined;
   /** 测试接缝：替换 connectMcpServer 的连接实现（真实装配不传；假连接固定工具面）。 */
   mcpConnect?: ((spec: McpServerConfig) => Promise<McpClient | null>) | undefined;
+  /** 方法论前置门（R2-S1）初值：缺省 true；false = 不注入 RunOptions.methodology（关掉前置门）。 */
+  methodFirst?: boolean | undefined;
 }
 
 /** 空闲 shell 回收的缺省 TTL（ms；10 分钟——期间不用的会话 shell 释放，懒重启重建）。 */
@@ -492,7 +500,110 @@ export function mergeMcpTools(
 }
 
 // ---------------------------------------------------------------------------
-// 系统提示词合成（base + 技能清单节 + 子代理节；预算感知）
+// 方法论语义版（R2-S1：keyword 命中路由 + 前置门装配）
+// ---------------------------------------------------------------------------
+
+/** 路由条目（语义版）：id + 触发词集合（meta.trigger 按 / 拆）。entries 顺序 = 优先级。 */
+export interface MethodologyRouteEntry {
+  id: string;
+  triggers: readonly string[];
+}
+
+/** 触发词拆分（meta.trigger：`修复 bug/新增功能` → ['修复 bug','新增功能']；trim/去空）。 */
+export function splitMethodologyTriggers(trigger: string | undefined): string[] {
+  if (trigger === undefined || trigger === '') return [];
+  return trigger
+    .split('/')
+    .map((t) => t.trim())
+    .filter((t) => t !== '');
+}
+
+/**
+ * 纯匹配（单元测试面）：任务文本大小写与空白无关地扫触发词——
+ * 归一化（去全部空白 + lowercase）后任一触发词为子串即命中；多命中按 entries
+ * 顺序先得先回（**优先级 = 数组顺序**）；无命中 → null。
+ */
+export function matchMethodologyTask(
+  task: string,
+  entries: readonly MethodologyRouteEntry[],
+): string | null {
+  const normalizedTask = task.toLowerCase().replace(/\s+/g, '');
+  for (const entry of entries) {
+    for (const trigger of entry.triggers) {
+      const normalizedTrigger = trigger.toLowerCase().replace(/\s+/g, '');
+      if (normalizedTrigger !== '' && normalizedTask.includes(normalizedTrigger)) return entry.id;
+    }
+  }
+  return null;
+}
+
+/** 前置门的缺省容器（过程级；同一服务端实例跨 run 共享——加载状态跨 run 保持）。 */
+export interface MethodologyLoadedStore {
+  of(sessionId: string): Set<string>;
+}
+
+/**
+ * 前置门装配（语义版）：route 从晚绑定 MethodologyIndex 现读（开关变化即时生效；
+ * 索引未回填 → 不命中），匹配用 matchMethodologyTask 关键词命中（纯函数）。
+ * isLoaded/markLoaded 是纯状态查询（观察器由主循环在对 use_skill 成功执行时调用）。
+ */
+export function createMethodologyGate(options: {
+  index: () => MethodologyIndex | null;
+  loaded?: MethodologyLoadedStore;
+}): MethodologyGate {
+  const loaded: MethodologyLoadedStore =
+    options.loaded ??
+    (() => {
+      const sessions = new Map<string, Set<string>>();
+      const store: MethodologyLoadedStore = {
+        of(sessionId) {
+          let set = sessions.get(sessionId);
+          if (set === undefined) {
+            set = new Set();
+            sessions.set(sessionId, set);
+          }
+          return set;
+        },
+      };
+      return store;
+    })();
+  return {
+    async route(task): Promise<string | null> {
+      const index = options.index();
+      if (index === null) return null;
+      let entries: readonly MethodologyEntry[];
+      try {
+        entries = await index.list();
+      } catch {
+        return null; // 索引读取故障 → 不路由（门安静关闭，不干扰 run）
+      }
+      const table: MethodologyRouteEntry[] = entries
+        .filter(
+          (
+            entry,
+          ): entry is MethodologyEntry & { methodology: SkillMethodology & { trigger: string } } =>
+            entry.enabled &&
+            entry.methodology.type === 'method' &&
+            typeof entry.methodology.trigger === 'string' &&
+            entry.methodology.trigger !== '',
+        )
+        .map((entry) => ({
+          id: entry.id,
+          triggers: splitMethodologyTriggers(entry.methodology.trigger),
+        }));
+      return matchMethodologyTask(task, table);
+    },
+    isLoaded(sessionId, id) {
+      return loaded.of(sessionId).has(id);
+    },
+    markLoaded(sessionId, id) {
+      loaded.of(sessionId).add(id);
+    },
+  };
+}
+
+// ---------------------------------------------------------------------------
+// 系统提示词合成（base + 技能清单节 + 方法论路由节 + 子代理节；预算感知）
 // ---------------------------------------------------------------------------
 
 /**
@@ -550,13 +661,17 @@ export interface ComposeSystemPromptOptions {
   skills: () => SkillsIndex | null;
   /** 工作流实时配置读取器（改 workflow 配置后再次合成即生效）。 */
   workflow: () => WorkflowConfig;
+  /** 方法论索引读取器（R2-S1；null = 未注入 → 本节省略——老装配/纯测试路径）。 */
+  methodologies?: (() => MethodologyIndex | null) | undefined;
   /** 系统提示 token 预算；缺省 DEFAULT_SYSTEM_PROMPT_BUDGET_TOKENS。 */
   budgetTokens?: number;
 }
 
 /**
  * 合成系统提示：基础提示 + 技能清单节（enabled skills 一行一条，末尾「需要时
- * use_skill 加载全文」，懒加载语义）+ 子代理节（workflow.subagentsEnabled 时）。
+ * use_skill 加载全文」，懒加载语义）+ 方法论路由节（R2-S1：method 型技能一行一条
+ * `<trigger> → <id>` + 三行规则；≤ METHODOLOGY_SECTION_TOKEN_BUDGET，超出删 trigger
+ * 最长的行）+ 子代理节（workflow.subagentsEnabled 时）。
  * 预算感知：以 estimateTokens（复用核心估算器，system 角色按散文口径）计量合成结果，
  * 超预算逐行裁技能清单尾部（保 base——base 是安全与行为规则，优先于技能列表）。
  */
@@ -572,22 +687,77 @@ export async function composeSystemPrompt(options: ComposeSystemPromptOptions): 
     skillLines = list.filter((skill) => skill.enabled).map(skillListLine);
   }
 
-  let composed = assembleSystemPrompt(base, skillLines, workflow);
+  let routeLines: string[] = [];
+  const methodology = options.methodologies === undefined ? null : options.methodologies();
+  if (methodology !== null) {
+    let entries: readonly MethodologyEntry[] = [];
+    try {
+      entries = await methodology.list();
+    } catch {
+      entries = [];
+    }
+    routeLines = entries
+      .filter(
+        (entry) =>
+          entry.enabled &&
+          entry.methodology.type === 'method' &&
+          entry.methodology.trigger !== undefined &&
+          entry.methodology.trigger !== '',
+      )
+      .map((entry) => `- ${entry.methodology.trigger} → ${entry.id}`);
+  }
+
+  let composed = assembleSystemPrompt(base, skillLines, routeLines, workflow);
   while (
     estimateTokens([{ role: 'system', content: composed }]).tokens > budgetTokens &&
     skillLines.length > 0
   ) {
     // 超出预算：从清单尾部逐行裁（清单 id 序确定性——每次结果可复现）
     skillLines = skillLines.slice(0, -1);
-    composed = assembleSystemPrompt(base, skillLines, workflow);
+    composed = assembleSystemPrompt(base, skillLines, routeLines, workflow);
   }
   return composed;
 }
 
-/** 三节装配：base \\n\\n 技能清单节（有 enabled 技能时）\\n\\n 子代理节（subagentsEnabled 时）。 */
+/** 方法论路由节字符串（节内独立预算：≤ METHODOLOGY_SECTION_TOKEN_BUDGET 时全量，
+ *  超出从 trigger 最长的行开始裁——裁剪策略契约；供 compose 与单测共用）。
+ *  确定性：长度并列时删第一个出现的最长行；其余行相对顺序不变——同输入必同输出。 */
+export function methodologyRouteSection(routeLines: readonly string[]): string {
+  let lines = [...routeLines];
+  const build = (ls: readonly string[]): string =>
+    ls.length === 0 ? '' : ['## 方法论路由', ...ls, ...METHODOLOGY_ROUTE_RULES].join('\n');
+  while (
+    lines.length > 0 &&
+    estimateTokens([{ role: 'system', content: build(lines) }]).tokens >
+      METHODOLOGY_SECTION_TOKEN_BUDGET
+  ) {
+    let longest = 0;
+    for (let i = 1; i < lines.length; i += 1) {
+      if (lines[i]!.length > lines[longest]!.length) longest = i;
+    }
+    lines = [...lines.slice(0, longest), ...lines.slice(longest + 1)];
+  }
+  return build(lines);
+}
+
+/** 路由节内 token 预算（≤350；超出删 trigger 最长的行——裁剪策略见 methodologyRouteSection）。 */
+export const METHODOLOGY_SECTION_TOKEN_BUDGET = 350;
+
+/** 路由节固定规则三行（亮牌 / 先加载 / 收尾判据）。 */
+const METHODOLOGY_ROUTE_RULES = [
+  '规则：',
+  '- 第一步先亮牌：首条回复首行以 `方法线：<id>` 开头（报告口径）。',
+  '- 触发命中时，首个工具调用前先 use_skill 加载该技能全文；组内含 use_skill(<id>) 即放行。',
+  '- 收尾按该技能的 done 判据逐条陈述完成情况（与报告口径一致）。',
+];
+
+/** 多节装配：base \\n\\n 技能清单节（有 enabled 技能时）\\n\\n 方法论路由节（method 型命中表时）
+ * \\n\\n 子代理节（subagentsEnabled 时）。路由节自身已按 METHODOLOGY_SECTION_TOKEN_BUDGET
+ * 裁剪过（超预算删 trigger 最长的行；routeLines 为空 → 整节省略）。 */
 function assembleSystemPrompt(
   base: string,
   skillLines: readonly string[],
+  routeLines: readonly string[],
   workflow: WorkflowConfig,
 ): string {
   const sections: string[] = [base.trim()];
@@ -600,6 +770,8 @@ function assembleSystemPrompt(
       ].join('\n'),
     );
   }
+  const routeSection = methodologyRouteSection(routeLines);
+  if (routeSection !== '') sections.push(routeSection);
   if (workflow.subagentsEnabled) {
     sections.push(
       `## 子代理\n对于可独立处理的子任务，可调用 spawn_subagent（并行上限 ${workflow.maxParallel}）` +
@@ -654,6 +826,10 @@ export async function assembleDeps(config: DevmateConfig): Promise<DevmateServer
   // 工作流配置（POST /api/skills|workflow）在服务端变更，工具/池/提示词合成经此现读。
   const skillsRef: { index: SkillsIndex | null } = { index: null };
   const workflowRef: { get: (() => WorkflowConfig) | null } = { get: null };
+  // 方法论索引晚绑定（R2-S1）：服务端 attachMethodologyIndex 回填（元数据 × 运行时开关的
+  // 单源在服务端缓存）；前置门 route 与提示词路由节经此现读——开关变化即时生效。
+  const methodologyRef: { index: MethodologyIndex | null } = { index: null };
+  const methodologyGate = createMethodologyGate({ index: () => methodologyRef.index });
   const initialWorkflow: WorkflowConfig = {
     subagentsEnabled: config.workflow?.subagentsEnabled ?? DEFAULT_SUBAGENTS_ENABLED,
     maxParallel: clampMaxParallel(config.workflow?.maxParallel),
@@ -711,13 +887,18 @@ export async function assembleDeps(config: DevmateConfig): Promise<DevmateServer
   if (config.windowTokens !== undefined) runOptions.windowTokens = config.windowTokens;
   if (config.systemPrompt !== undefined) runOptions.systemPrompt = config.systemPrompt;
   if (config.toolTimeoutMs !== undefined) runOptions.toolTimeoutMs = config.toolTimeoutMs;
+  // 方法论前置门（R2-S1）：缺省开启（config.methodFirst !== false 才注入）；
+  // 运行中关闭经 startRun 按 current.methodFirst 丢弃（methodology=undefined → 门不拦）。
+  if (config.methodFirst !== false) runOptions.methodology = methodologyGate;
 
   // 系统提示合成（startRun 每次运行前调用——技能开关/workflow 配置变更即时生效）：
-  // base（config.systemPrompt ?? 中文起草）+ 技能清单节 + 子代理节，预算感知（见 composeSystemPrompt）。
+  // base（config.systemPrompt ?? 中文起草）+ 技能清单节 + 方法论路由节 + 子代理节，
+  // 预算感知（见 composeSystemPrompt）。
   const compose = (): Promise<string> =>
     composeSystemPrompt({
       ...(config.systemPrompt !== undefined ? { basePrompt: config.systemPrompt } : {}),
       skills: () => skillsRef.index,
+      methodologies: () => methodologyRef.index,
       workflow: () => (workflowRef.get !== null ? workflowRef.get() : initialWorkflow),
     });
 
@@ -784,6 +965,10 @@ export async function assembleDeps(config: DevmateConfig): Promise<DevmateServer
     attachWorkflowConfig: (current: () => WorkflowConfig) => {
       workflowRef.get = current;
     },
+    // 方法论索引晚绑定回填（R2-S1：服务端从自身缓存构建——前置门与路由节现读）
+    attachMethodologyIndex: (index: MethodologyIndex) => {
+      methodologyRef.index = index;
+    },
     composeSystemPrompt: compose,
     llm: initialLlm,
     createLlm,
@@ -798,6 +983,8 @@ export async function assembleDeps(config: DevmateConfig): Promise<DevmateServer
       // 权限预设定案：缺省 'workspace-write'（与 index 的 DEFAULT_PERMISSION_PRESET 同值——
       // 语义单一来源在该常量与矩阵，此处仅装配初始值）
       permission: config.permission ?? 'workspace-write',
+      // 方法论前置门初值（R2-S1：缺省开；POST /api/settings 运行时可关）
+      methodFirst: config.methodFirst ?? true,
       ...(config.apiKey !== undefined ? { apiKey: config.apiKey } : {}),
       ...(config.windowTokens !== undefined
         ? { windowTokens: config.windowTokens }

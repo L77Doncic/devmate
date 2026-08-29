@@ -29,6 +29,7 @@ export type {
   Approver,
   JsonSchema,
   LlmAdapter,
+  MethodologyGate,
   Pricing,
   RunInput,
   RunOptions,

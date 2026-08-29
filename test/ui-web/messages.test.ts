@@ -699,3 +699,104 @@ describe('Wave 2：reasoning 思考帧与行 meta 数据（Think Disclosure / Ra
     expect(store.snapshot().items[1]?.at).toEqual(expect.any(Number));
   });
 });
+
+// ---------------------------------------------------------------------------
+// R2-S1：方法论线（模型首条回复「方法线：<skillId>」→ snap.methodLine；run-strip 小牌数据源）
+// ---------------------------------------------------------------------------
+
+describe('方法论线（R2-S1：回合首条 assistant 提取；用户回合/reset 清空）', () => {
+  it('增量命中：delta 到达即提取（运行中即显示）；快照暴露 methodLine', () => {
+    const snap = run([
+      ['assistant-delta', { text: '方法线：tdd\n我先复现这个 bug。' }],
+    ]);
+    expect(snap.methodLine).toBe('tdd');
+  });
+
+  it('流式校正：半截值随 delta 增长校正为全量（t → td → tdd）', () => {
+    const store = createMessageStore();
+    store.dispatch(ev('assistant-delta', { text: '方法线：t' }));
+    expect(store.snapshot().methodLine).toBe('t');
+    store.dispatch(ev('assistant-delta', { text: 'd' }));
+    expect(store.snapshot().methodLine).toBe('td');
+    store.dispatch(ev('assistant-delta', { text: 'd' }));
+    expect(store.snapshot().methodLine).toBe('tdd');
+  });
+
+  it('assistant-done 以定稿权威 content 定值（delta 半截/缺行排版漂移的最终修正）', () => {
+    const store = createMessageStore();
+    store.dispatch(ev('assistant-delta', { text: '方法线：t' }));
+    store.dispatch(ev('assistant-done', { content: '方法线：tdd\n开始', toolCalls: [] }));
+    expect(store.snapshot().methodLine).toBe('tdd');
+  });
+
+  it('无命中 → null（小牌不显示；定稿后仍 null）', () => {
+    const store = createMessageStore();
+    store.dispatch(ev('assistant-delta', { text: '直接动手。' }));
+    store.dispatch(ev('assistant-done', { content: '直接动手。', toolCalls: [] }));
+    expect(store.snapshot().methodLine).toBeNull();
+  });
+
+  it('methodLine 缺省 null（新会话快照字段稳定可读）', () => {
+    expect(run([]).methodLine).toBeNull();
+  });
+
+  it('新用户回合清空（session-user）：旧 run 的小牌不跨回合持续', () => {
+    const snap = run([
+      ['session-user', { text: '问我' }],
+      ['assistant-delta', { text: '方法线：tdd' }],
+      ['session-user', { text: '再问' }],
+    ]);
+    expect(snap.methodLine).toBeNull();
+  });
+
+  it('新用户回合清空（去重回放同样重置边界 —— 与 turn 边界语义对齐）', () => {
+    const store = createMessageStore();
+    store.addUser('问');
+    store.dispatch(ev('assistant-delta', { text: '方法线：tdd' }));
+    expect(store.snapshot().methodLine).toBe('tdd');
+    store.dispatch(ev('session-user', { text: '问' })); // 回声去重；边界仍重置
+    expect(store.snapshot().methodLine).toBeNull();
+  });
+
+  it('addUser（乐观渲染）同边界清空', () => {
+    const store = createMessageStore();
+    store.dispatch(ev('assistant-delta', { text: '方法线：tdd' }));
+    store.addUser('新问题');
+    expect(store.snapshot().methodLine).toBeNull();
+  });
+
+  it('reset（切换会话）清空', () => {
+    const store = createMessageStore();
+    store.dispatch(ev('assistant-delta', { text: '方法线：tdd' }));
+    store.reset();
+    expect(store.snapshot().methodLine).toBeNull();
+  });
+
+  it('只采本轮首个气泡：首气泡无命中 → 后续气泡出现方法线也不采（不回退）', () => {
+    const store = createMessageStore();
+    store.dispatch(ev('assistant-delta', { text: '好的。' }));
+    store.dispatch(ev('assistant-done', { content: '好的。', toolCalls: [] }));
+    // 同 run 工具往返后的下一段文字（新气泡）：方法线属首条回复语义，此处不复采
+    store.dispatch(ev('assistant-delta', { text: '参考 方法线：random 的说法' }));
+    expect(store.snapshot().methodLine).toBeNull();
+  });
+
+  it('已命中后后续气泡的再出现不覆盖（首命中即钉住）', () => {
+    const store = createMessageStore();
+    store.dispatch(ev('assistant-delta', { text: '方法线：tdd' }));
+    store.dispatch(ev('assistant-done', { content: '方法线：tdd', toolCalls: [] }));
+    store.dispatch(ev('assistant-delta', { text: '方法线：other\n等等' }));
+    expect(store.snapshot().methodLine).toBe('tdd');
+  });
+
+  it('多轮回放：最终 = 最后一个用户回合的值（session-user 逐轮清空重采）', () => {
+    const snap = run([
+      ['session-user', { text: '第一问' }],
+      ['assistant-delta', { text: '方法线：tdd' }],
+      ['assistant-done', { content: '方法线：tdd', toolCalls: [] }],
+      ['session-user', { text: '第二问' }],
+      ['assistant-delta', { text: '方法线：domain-modeling' }],
+    ]);
+    expect(snap.methodLine).toBe('domain-modeling');
+  });
+});

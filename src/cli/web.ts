@@ -68,6 +68,8 @@ export interface ServerConfig {
   permission?: PermissionPreset;
   /** 上下文窗口覆盖持久值（读回键；缺省 = 供应商 preset 估算）。 */
   windowTokens?: number;
+  /** 方法论前置门持久值（R2-S1 读回键；缺省 true）。 */
+  methodFirst?: boolean;
 }
 
 /** web 子命令生效参数。 */
@@ -203,6 +205,7 @@ export function buildServerConfig(config: {
   reasoning?: ReasoningEffort;
   permission?: PermissionPreset;
   windowTokens?: number;
+  methodFirst?: boolean;
 }): ServerConfig {
   const out: ServerConfig = {
     workspaceRoot: config.workspaceRoot,
@@ -215,6 +218,7 @@ export function buildServerConfig(config: {
   if (config.reasoning !== undefined) out.reasoning = config.reasoning;
   if (config.permission !== undefined) out.permission = config.permission;
   if (config.windowTokens !== undefined) out.windowTokens = config.windowTokens;
+  if (config.methodFirst !== undefined) out.methodFirst = config.methodFirst;
   return out;
 }
 
@@ -260,11 +264,12 @@ export async function runWeb(args: string[], io: RunWebIo): Promise<number> {
     ...(config.apiKey !== undefined ? { apiKey: config.apiKey } : {}),
     ...(config.maxSteps !== undefined ? { maxSteps: config.maxSteps } : {}),
     ...(config.costLimitUsd !== undefined ? { costLimitUsd: config.costLimitUsd } : {}),
-    // B 档设置读回：{permission, reasoning, windowTokens} 自 config.json 同键读回
+    // B 档设置读回：{permission, reasoning, windowTokens, methodFirst} 自 config.json 同键读回
     // （persistSettings 写出的键；缺省不写 → 缺省字段不传，assembleDeps 回落各自缺省）
     ...(stored.reasoning !== undefined ? { reasoning: stored.reasoning } : {}),
     ...(stored.permission !== undefined ? { permission: stored.permission } : {}),
     ...(stored.windowTokens !== undefined ? { windowTokens: stored.windowTokens } : {}),
+    ...(stored.methodFirst !== undefined ? { methodFirst: stored.methodFirst } : {}),
   });
   let deps: unknown;
   try {
@@ -286,6 +291,7 @@ export async function runWeb(args: string[], io: RunWebIo): Promise<number> {
     windowTokens?: number;
     permission?: PermissionPreset;
     permissionConfirmedAt?: number;
+    methodFirst?: boolean;
   }): void => {
     mergeConfig(io.configPath, {
       baseUrl: s.baseUrl,
@@ -297,6 +303,7 @@ export async function runWeb(args: string[], io: RunWebIo): Promise<number> {
       ...(s.permissionConfirmedAt !== undefined
         ? { permissionConfirmedAt: s.permissionConfirmedAt }
         : {}),
+      ...(s.methodFirst !== undefined ? { methodFirst: s.methodFirst } : {}),
     });
   };
   // 三节初值加载（读 config.json 相应节；缺省：skillsRecord {} = 全开、workflow true/2、

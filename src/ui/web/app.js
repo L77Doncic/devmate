@@ -41,9 +41,12 @@ import {
   saveSettings,
   saveReasoning,
   savePermission,
+  saveMethodFirst,
   REASONING_VALUES,
   REASONING_LABELS,
   REASONING_DEFAULT,
+  METHODFIRST_DEFAULT,
+  normalizeMethodFirst,
 } from './settings.js';
 import {
   PERMISSION_VALUES,
@@ -145,6 +148,8 @@ import {
   buildSearchLines,
   parseToolArguments,
   BLOCK_MAX_CHARS,
+  // R2-S1：方法线小牌文本（run-strip「方法线 tdd」；提取纯逻辑 = messages.js 侧）
+  methodologyBadgeText,
 } from './format.js';
 
 // ============================================================== 常量
@@ -177,6 +182,8 @@ const ui = {
     // 权限预设（缺省 workspace-write）与 full-access 风险确认记录（GET 返回才非 null）
     permission: PERMISSION_DEFAULT,
     permissionConfirmedAt: null,
+    // R2-S1：方法论前置门开关（缺省 true；GET /api/settings 权威回显，见设置页常规区）
+    methodFirst: METHODFIRST_DEFAULT,
   },
   sessionId: null,
   // 内嵌审批卡：currentApproval = 当前呈现项（快照 approvals[0] 的视图模型）；
@@ -218,6 +225,9 @@ const ui = {
   // pending = 待提交档位（null = 无挂起）
   reasoningSyncPending: null,
   reasoningSyncTimer: 0,
+  // R2-S1：方法论先行开关同步（change 即防抖 300ms POST /api/settings；失败回滚重读 + toast）
+  methodFirstSyncPending: null,
+  methodFirstSyncTimer: 0,
   // 「/」命令下拉（commands.js 纯逻辑；DOM 装配与键盘走这里）
   cmdMenuOpen: false,
   cmdHighlight: 0, // 下拉当前高亮项（键盘循环用）
@@ -309,6 +319,8 @@ const el = {
   setSubagentEnabled: document.getElementById('set-subagent-enabled'),
   setSubagentParallel: document.getElementById('set-subagent-parallel'),
   setSubagentNote: document.getElementById('set-subagent-note'),
+  // R2-S1 方法论先行开关（常规区卡片；change 委托 data-methodfirst-field）
+  setMethodfirstEnabled: document.getElementById('set-methodfirst-enabled'),
   skillsList: document.getElementById('skills-list'),
   skillsNote: document.getElementById('skills-note'),
   mcpList: document.getElementById('mcp-list'),
@@ -1743,6 +1755,10 @@ function runStageWord(snap) {
 
 function ensureStripParts() {
   if (el.runStrip._parts) return;
+  // R2-S1：方法线小牌 = 条内最左元素（位于状态点同行、条起点侧）
+  const badge = document.createElement('span');
+  badge.className = 'run-method';
+  badge.hidden = true;
   const dot = document.createElement('span');
   dot.className = 'rs-dot';
   dot.setAttribute('aria-hidden', 'true');
@@ -1750,8 +1766,21 @@ function ensureStripParts() {
   label.className = 'rs-label';
   const meta = document.createElement('span');
   meta.className = 'rs-meta';
-  el.runStrip.replaceChildren(dot, label, meta);
-  el.runStrip._parts = { dot, label, meta };
+  el.runStrip.replaceChildren(badge, dot, label, meta);
+  el.runStrip._parts = { badge, dot, label, meta };
+}
+
+/** 方法线小牌（R2-S1）：有 methodLine → 显示「方法线 <id>」（mono chip）；无则隐藏。
+ *  语义：运行中即显示、完成态保留（快照 methodLine 在新用户回合/reset 前恒在）。 */
+function setMethodBadge(methodLine) {
+  const badge = el.runStrip._parts.badge;
+  if (methodLine) {
+    badge.hidden = false;
+    badge.textContent = methodologyBadgeText(methodLine);
+  } else {
+    badge.hidden = true;
+    badge.textContent = '';
+  }
 }
 
 /**
@@ -1772,6 +1801,7 @@ function setStrip(mode, { tone, text, meta = '', err = false }) {
 
 function renderStrip(snap) {
   ensureStripParts();
+  setMethodBadge(snap.methodLine);
   const live = snap.runActive;
 
   if (live && snap.lastError) {
@@ -2049,6 +2079,57 @@ async function flushPermissionSync() {
 
 /** POST 失败回滚：GET 服务端态还原（GET 也失败 → 保持现显示，不猜测）。 */
 async function revertPermission() {
+  try {
+    const s = await loadSettings();
+    ui.settings = { ...ui.settings, ...s };
+  } catch {
+    // 服务端不可达：保持当前值（下次切换再试）
+  }
+}
+
+// ============================================================== 方法论先行开关（R2-S1）
+
+/** 开关回显（设置页常规区卡片）：GET /api/settings 权威值（缺省 true）→ checkbox。 */
+function syncMethodFirstToggle() {
+  el.setMethodfirstEnabled.checked = normalizeMethodFirst(ui.settings.methodFirst) === true;
+}
+
+/** change 收口（data-methodfirst-field 委托）：本地即时回显 + 防抖 300ms POST
+ *  （同思考强度/访问模式纪律：失败回滚重读 + toast，无队列只补发最后一片）。 */
+function applyMethodFirstField(checked) {
+  const value = normalizeMethodFirst(checked);
+  ui.settings = { ...ui.settings, methodFirst: value };
+  syncMethodFirstToggle();
+  scheduleMethodFirstSync(value);
+}
+
+function scheduleMethodFirstSync(value) {
+  ui.methodFirstSyncPending = value;
+  window.clearTimeout(ui.methodFirstSyncTimer);
+  ui.methodFirstSyncTimer = window.setTimeout(() => {
+    ui.methodFirstSyncTimer = 0;
+    void flushMethodFirstSync();
+  }, 300);
+}
+
+async function flushMethodFirstSync() {
+  window.clearTimeout(ui.methodFirstSyncTimer);
+  ui.methodFirstSyncTimer = 0;
+  const value = ui.methodFirstSyncPending;
+  ui.methodFirstSyncPending = null;
+  if (value === null || value === undefined) return;
+  try {
+    const saved = await saveMethodFirst(value);
+    ui.settings = { ...ui.settings, ...saved }; // 服务端权威回体（含归一）
+  } catch {
+    await revertMethodFirst();
+    toast('方法论先行保存失败，已还原', 'warn');
+  }
+  syncMethodFirstToggle();
+}
+
+/** POST 失败回滚：GET 服务端态还原（GET 也失败 → 保持现显示，不猜测）。 */
+async function revertMethodFirst() {
   try {
     const s = await loadSettings();
     ui.settings = { ...ui.settings, ...s };
@@ -2648,6 +2729,7 @@ async function openSettings() {
   }
   syncReasoningSeg(); // 服务端档位权威：回显（含窗口覆盖 —— meter 随之取值）
   syncPermChip(); // 权限档位（含 permissionConfirmedAt 记录 —— 风险门判定依据）
+  syncMethodFirstToggle(); // R2-S1：方法论先行开关（GET /api/settings 权威回显）
   fillSettingsForm();
   // 设置页扩展区：Subagent 工作流（GET /api/workflow 同步；失败/缺端点降级本地）
   // + Skills/MCP 端点清单（缺失各自降级）
@@ -3113,6 +3195,7 @@ function wireEvents() {
     if (t.dataset.skillToggle) void toggleSkill(t.dataset.skillToggle, t.checked);
     else if (t.dataset.mcpToggle) void toggleMcp(t.dataset.mcpToggle, t.checked);
     else if (t.dataset.subagentField) applySubagentField(t.dataset.subagentField);
+    else if (t.dataset.methodfirstField) applyMethodFirstField(t.checked);
   });
   el.drawer.addEventListener('click', (e) => {
     const action = e.target.closest('[data-set-action]')?.dataset?.setAction;
@@ -3160,11 +3243,12 @@ function wireEvents() {
       scheduleSidebarSettle();
     });
   }
-  // 卸载前 flush Subagent 工作流 / 思考强度 / 访问模式挂起同步（best-effort）
+  // 卸载前 flush Subagent 工作流 / 思考强度 / 访问模式 / 方法论先行挂起同步（best-effort）
   window.addEventListener('pagehide', () => {
     if (ui.subagentSyncPending) void flushSubagentSync();
     if (ui.reasoningSyncPending !== null) void flushReasoningSync();
     if (ui.permissionSyncPending !== null) void flushPermissionSync();
+    if (ui.methodFirstSyncPending !== null) void flushMethodFirstSync();
   });
 }
 
@@ -3201,6 +3285,8 @@ async function boot() {
   // 访问模式 chip（选项 = permissions.js 常量；回显当前档位 + 盾形 glyph）
   buildPermMenu();
   syncPermChip();
+  // R2-S1：方法论先行开关（启动 GET 回显 —— 设置打开时也随 openSettings 重读）
+  syncMethodFirstToggle();
   // 窗口覆盖就绪：上下文环重新取值（首帧可能在 settings 未到前渲染过）
   if (ui.lastSnap) renderMeter();
 

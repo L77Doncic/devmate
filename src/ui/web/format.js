@@ -514,3 +514,31 @@ export function buildSearchLines(content, pattern, cap = BLOCK_MAX_CHARS) {
   if (truncated) lines.push({ text: '…（截断）', hit: false });
   return { lines, hits: lines.filter((l) => l.hit).length, truncated };
 }
+
+// ---------------------------------------------------------------------------
+// R2-S1：方法论线（模型首条回复声明的方法技能；run-strip 小牌数据源）
+// ---------------------------------------------------------------------------
+
+/**
+ * 方法论线提取：从模型首条回复文本中提取 `方法线：<skillId>` 的 skill id。
+ * 契约（服务端提示词）：agent 首条回复第一行为 `方法线：<skillId>`（中英文冒号均可）。
+ * - 行首锚定（^ + /m 多行）：防止正文中段出现「方法线：」字样被误采；
+ * - /m 允许任意行首（首行非首也命中 —— 模型排版漂移宽容）；
+ * - 流式友好：delta 渐进到达时增量重提取，值会从半截（'t'）校正到全量（'tdd'）；
+ * - 同一文本多个命中（如后续行引用）取首个（行程顺序第一命中）。
+ * @param {unknown} text 文本串（delta 累积或 assistant-done 权威全文）
+ * @returns {string|null} 技能 id（[A-Za-z0-9_-]+），无命中 → null
+ */
+export function methodologyLine(text) {
+  const m = /^方法线[:：]\s*([A-Za-z0-9_-]+)/m.exec(String(text ?? ''));
+  return m ? m[1] : null;
+}
+
+/**
+ * 方法线徽章文本（run-strip 小牌：`方法线 tdd`；单一来源防漂移）。
+ * id 缺失/空 → ''（调用方仅在 methodLine 非空时调用；防御返回空串不输出裸词）。
+ */
+export function methodologyBadgeText(id) {
+  const s = String(id ?? '');
+  return s ? `方法线 ${s}` : '';
+}

@@ -46,6 +46,10 @@
  *                     插入折叠小记（kind 'compaction'）。服务端已下发该帧（emit.ts 序列化
  *                     + 流内观察器/历史回放同一合成规则），本帧天然点亮。
  * - 未知事件        ：防御性忽略（协议演进上层可自行扩展）。
+ * - 方法论线（R2-S1）：用户回合后首个助手气泡文本按行首提取 `方法线：<skillId>`
+ *                     （format.js methodologyLine，纯函数）；delta 流式增量提取、
+ *                     assistant-done 以权威定稿再提取一次；用户消息（session-user/
+ *                     addUser）与 reset 清空 —— run-strip 小牌「方法线 tdd」数据源。
  *
  * 纯函数边界：所有变更经 dispatch/actions 汇入；无 setTimeout、无 DOM、无 fetch。
  */
@@ -53,7 +57,7 @@
 /** run-status 终态清单（S12 RunStatus 八值；terminal 后 runActive=false），
  *  由 format.js 的 RUN_STATUS_SEMANTICS 导出（终态/标签/tone 三处镜像已合并为这一份表；
  *  dispatch 用它判定「run 落幕」，防漂移测试见 format.test.ts）。 */
-import { TERMINAL_STATUSES } from './format.js';
+import { TERMINAL_STATUSES, methodologyLine } from './format.js';
 
 /** 长会话 DOM 轻量化（任务书 C）：保留消息数上限，超出裁剪最旧为摘要行。 */
 export const DEFAULT_MAX_ITEMS = 200;
@@ -83,6 +87,11 @@ export function createMessageStore({ maxItems = DEFAULT_MAX_ITEMS } = {}) {
     costUsdCum: 0,
     usageRunStarted: false, // 当前 run 是否已收到第一条 usage（run 边界标记）
     usagePrevCost: null, // 上一条 usage 的成本（增量基准）
+    // R2-S1：方法论线（当前用户回合声明的方法技能 id；run-strip 小牌「方法线 tdd」数据源）。
+    // 时机 = 用户回合后**首个**助手气泡（delta 流式增量提取，done 时以定稿全文本定值）；
+    // 用户消息/reset 清空；同回合后续助手气泡（工具往返后的下一轮文字）不参与提取。
+    methodLine: null,
+    methodTrackedId: null, // 当前回合首个助手气泡 id（提取目标；回合边界清空）
   };
 
   const listeners = new Set();
@@ -176,9 +185,12 @@ export function createMessageStore({ maxItems = DEFAULT_MAX_ITEMS } = {}) {
         const lastUser = findLastKind('user');
         // 轮次边界与去重解耦：无论回放是否去重，新 run 的 delta 必须进新气泡。
         // 同时置 run 边界标记（下一条 usage = 新 run 全额 —— /cost 累计正确性前提）。
+        // R2-S1 方法论线同边界：新回合清空（旧 run 的小牌不再持续显示）。
         state.activeAssistantId = null;
         state.lastDoneAssistantId = null;
         state.usageRunStarted = false;
+        state.methodLine = null;
+        state.methodTrackedId = null;
         if (lastUser && lastUser.text === text) break; // 去重（见头注释）
         state.items.push({ id: nextId(), kind: 'user', text, at: Date.now() });
         if (!state.title) state.title = text.slice(0, 24);
@@ -189,12 +201,18 @@ export function createMessageStore({ maxItems = DEFAULT_MAX_ITEMS } = {}) {
         a.text += String(data?.text ?? '');
         a.done = false;
         state.streaming = true;
+        // R2-S1：方法论线增量提取（流式期间值随 delta 校正，如 't' → 'tdd'；
+        // 只认本轮首个助手气泡 —— 后续气泡（工具往返后的文字）不复采）
+        if (state.methodTrackedId === null) state.methodTrackedId = a.id;
+        if (state.methodTrackedId === a.id) state.methodLine = methodologyLine(a.text);
         break;
       }
       case 'assistant-done': {
         const a = activeAssistant();
         if (typeof data?.content === 'string' && data.content !== '') a.text = data.content;
         a.done = true;
+        // R2-S1：定稿后以服务端权威 content 再提取一次（delta 半截/回放契约的最终修正）
+        if (a.id === state.methodTrackedId) state.methodLine = methodologyLine(a.text);
         // 思考收尾（dsh ReasoningRow 定稿态）：首行摘要 + 行收起（app.js 消费 thinkDone）
         a.thinkDone = true;
         // Ran-for 钟差：done 时刻 = 本气泡首事件时刻（首 delta/reasoning/tool 已设 startedAt）
@@ -388,9 +406,12 @@ export function createMessageStore({ maxItems = DEFAULT_MAX_ITEMS } = {}) {
     if (!state.title) state.title = String(text).slice(0, 24);
     // 轮次边界：乐观渲染的用户消息也是新 run 的起点（下一轮 delta 开新气泡）；
     // 并置 run 边界标记（同上 —— 本次发送产出的 usage 按新 run 全额累计）。
+    // R2-S1 方法论线同边界清空（新用户回合即清小牌 —— 与 session-user 对称）。
     state.activeAssistantId = null;
     state.lastDoneAssistantId = null;
     state.usageRunStarted = false;
+    state.methodLine = null;
+    state.methodTrackedId = null;
     trim();
     emit();
   }
@@ -430,6 +451,8 @@ export function createMessageStore({ maxItems = DEFAULT_MAX_ITEMS } = {}) {
     state.costUsdCum = 0;
     state.usageRunStarted = false;
     state.usagePrevCost = null;
+    state.methodLine = null;
+    state.methodTrackedId = null;
     emit();
   }
 
@@ -507,6 +530,7 @@ export function createMessageStore({ maxItems = DEFAULT_MAX_ITEMS } = {}) {
       streaming: state.streaming,
       runActive: state.runActive,
       runStartedAt: state.runStartedAt,
+      methodLine: state.methodLine,
       items: state.items.map((it) => {
         if (it.kind === 'assistant') {
           return {

@@ -1645,6 +1645,20 @@ pre {
   border-radius: 50%;
   background: currentColor;
 }
+/* R2-S1 方法线小牌（run-strip 左端，与状态点同行）：mono chip = perm-chip 胶囊几何
+   + badge-mono 蓝底族（accent-dim 底 / accent 字），运行中即显、完成态保留 */
+.run-strip .run-method {
+  flex: 0 0 auto;
+  padding: 2px 8px 1px;
+  border: 1px solid var(--accent-border);
+  border-radius: 999px;
+  background: var(--accent-dim);
+  color: var(--accent);
+  font-family: var(--font-mono);
+  font-size: var(--dsw-font-size-xs);
+  line-height: 14px;
+  white-space: nowrap;
+}
 .run-strip.live .rs-dot {
   background: var(--dsw-alias-state-business-primary);
   animation: pulse 1.2s ease-in-out infinite;

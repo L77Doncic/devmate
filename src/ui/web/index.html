@@ -621,6 +621,27 @@
                 <p class="field-help dim" id="set-subagent-note" hidden></p>
               </div>
             </div>
+            <!-- 方法论先行（R2-S1）：开关 = 方法论前置门（首工具调用前自动加载命中的
+                 方法技能 use_skill；关 = 方法技能仅作参考，不自动加载、不拦截）。
+                 change 即防抖 300ms POST /api/settings {methodFirst}（失败回滚重读 + toast） -->
+            <div class="settings-card">
+              <div class="settings-card-head end">
+                <span class="settings-card-title">方法论先行</span>
+                <label class="switch">
+                  <input
+                    type="checkbox"
+                    id="set-methodfirst-enabled"
+                    checked
+                    data-methodfirst-field="enabled"
+                  />
+                  <span class="switch-track"></span>
+                </label>
+              </div>
+              <p class="field-help">
+                开启：本轮第一个工具调用前自动加载命中的方法技能（use_skill）；未加载的方法技能调用将被拦截并提示。
+                关闭：方法技能仅作参考，不自动加载、不拦截。
+              </p>
+            </div>
           </section>
           <!-- 模型接口：OpenAI 兼容端点三件套（dsh provider 卡同构：gray 面板 + 底部胶囊对） -->
           <section class="settings-panel" data-tab="models">

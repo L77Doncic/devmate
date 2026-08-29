@@ -26,6 +26,8 @@ import {
   RUN_STAGE_WORDS,
   CONN_VISIBLE,
   TOOL_STATE_LABEL,
+  methodologyLine,
+  methodologyBadgeText,
 } from '../../src/ui/web/format.js';
 
 describe('truncate', () => {
@@ -395,5 +397,78 @@ describe('compactionSummary（披露摘要全文安全护栏：超 20k 截断并
   });
   it('自定义上限（护栏可调）', () => {
     expect(compactionSummary('abcdef', 3)).toBe('abc…（截断）');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// R2-S1：方法论线提取（模型首条回复行首 `方法线：<skillId>`；run-strip 小牌数据源）
+// ---------------------------------------------------------------------------
+
+describe('methodologyLine（方法论线提取：行首锚定 /m、中英文冒号、流式校正）', () => {
+  it('命中（中文冒号、首行、无空格）', () => {
+    expect(methodologyLine('方法线：tdd')).toBe('tdd');
+  });
+
+  it('命中（英文冒号 + 空格）', () => {
+    expect(methodologyLine('方法线: tdd')).toBe('tdd');
+  });
+
+  it('命中（首行带贴线正文：正文在换行之后）', () => {
+    expect(methodologyLine('方法线：tdd\n我先复现这个 bug……')).toBe('tdd');
+  });
+
+  it('多行：方法线不在首行（模型排版漂移宽容 —— /m 任意行首命中）', () => {
+    expect(methodologyLine('我先看一下……\n方法线：tdd\n好的，开始。')).toBe('tdd');
+  });
+
+  it('首行非首：首行只是普通文字，方法线出现在后行仍命中', () => {
+    expect(methodologyLine('好的\n方法线：tdd\n开始')).toBe('tdd');
+  });
+
+  it('无命中：正文不含方法线', () => {
+    expect(methodologyLine('好的，我来处理这个 bug。')).toBeNull();
+  });
+
+  it('正文中段出现「方法线：」但不处于行首 → 不命中（行首锚定）', () => {
+    expect(methodologyLine('参考 方法线：tdd 的做法')).toBeNull();
+    expect(methodologyLine('x方法线：tdd')).toBeNull();
+  });
+
+  it('流式半截校正：增量提取值随 delta 从半截校正到全量', () => {
+    expect(methodologyLine('方法线：t')).toBe('t');
+    expect(methodologyLine('方法线：td')).toBe('td');
+    expect(methodologyLine('方法线：tdd')).toBe('tdd');
+  });
+
+  it('多命中取首个（行程顺序第一命中行）', () => {
+    expect(methodologyLine('方法线：tdd\n方法线：random')).toBe('tdd');
+  });
+
+  it('id 字符集：字母数字下划线连字符', () => {
+    expect(methodologyLine('方法线：mattpocock-skills:tdd')).toBe('mattpocock-skills');
+    expect(methodologyLine('方法线：tdd_v2')).toBe('tdd_v2');
+  });
+
+  it('CRLF 行尾宽容；行首空白不宽容（^ 锚定：前导空白把「方法线」推出行首 → 不命中）', () => {
+    expect(methodologyLine('你好\r\n方法线：tdd\r\n继续')).toBe('tdd');
+    expect(methodologyLine('\t方法线：tdd')).toBeNull();
+    expect(methodologyLine('\n方法线：tdd')).toBe('tdd'); // 空首行后的下一行仍行首命中
+  });
+
+  it('空/非法输入 → null（不抛）', () => {
+    expect(methodologyLine('')).toBeNull();
+    expect(methodologyLine(null)).toBeNull();
+    expect(methodologyLine(undefined)).toBeNull();
+    expect(methodologyLine(42)).toBeNull();
+  });
+});
+
+describe('methodologyBadgeText（方法线小牌文本「方法线 tdd」单一来源）', () => {
+  it('id 非空 → 「方法线 <id>」', () => {
+    expect(methodologyBadgeText('tdd')).toBe('方法线 tdd');
+  });
+  it('缺失/空 → 空串（调用方仅在 methodLine 非空时渲染）', () => {
+    expect(methodologyBadgeText('')).toBe('');
+    expect(methodologyBadgeText(null)).toBe('');
   });
 });

@@ -1,6 +1,11 @@
 // 构建后将 mattpocock-skills 插件工程技能资产复制到 dist/assets/skills（tsc 不处理非 TS 资产）。
 // 来源：~/.claude/plugins/cache/claude-plugins-official/mattpocock-skills/<version>/skills/engineering/
 // - 每个 skill 目录整目录保留（SKILL.md + 附注 md/json 等文本；server 端按 <id>/SKILL.md 索引）；
+// - 方法论内化蒸馏（R2-S1）：repo 根 assets/skills-meta.json（Meta 精编产物）合并进每个
+//   SKILL.md 的 frontmatter（原字段 + `methodology: {type,trigger,steps,done}` 行——dist 内为
+//   合并产物），并生成 dist/assets/skills/methodologies.json（路由器表源；deps 动态读）。
+//   - 无 meta 的技能（B 线或用户未来自装）→ 仅生成 {type:'reference'} 缺省；
+//   - 脚本对缺失 meta 键不崩（sanitizeSkillMeta 全量容错）。
 // - 插件 LICENSE/README 聚合为 dist/assets/skills/LICENSE-mattpocock-skills.txt（第三方资产属性声明）；
 // - src 侧不复制：dev 模式服务端在 dist 上跑——统一 dist 路径（静态 dev 可选）。
 // 插件未安装 → 警告并跳过（dist 无 skills 资产，服务端 GET /api/skills 走空列表降级）。
@@ -19,6 +24,69 @@ import { fileURLToPath } from 'node:url';
 
 const root = join(dirname(fileURLToPath(import.meta.url)), '..');
 const dst = join(root, 'dist', 'assets', 'skills');
+const metaPath = join(root, 'assets', 'skills-meta.json');
+
+// ---------------------------------------------------------------------------
+// 蒸馏纯函数（test/build/copy-skills.test.ts 直测；无 meta 缺键不崩）
+// ---------------------------------------------------------------------------
+
+/** 单条 meta 容错清洗：非对象 → null；type 非 'method'|'reference' → 'reference' 缺省；
+ *  trigger/steps/done 只收非空字符串。 */
+export function sanitizeSkillMeta(raw) {
+  if (typeof raw !== 'object' || raw === null || Array.isArray(raw)) return null;
+  const record = raw;
+  const type = record.type === 'method' || record.type === 'reference' ? record.type : 'reference';
+  const meta = { type };
+  for (const key of ['trigger', 'steps', 'done']) {
+    if (typeof record[key] === 'string' && record[key] !== '') meta[key] = record[key];
+  }
+  return meta;
+}
+
+/** 有 meta 缺省（B 线/未来自装）：sanitizeSkillMeta(undefined) 的缺省形态 {type:'reference'}。 */
+export function defaultSkillMeta() {
+  return { type: 'reference' };
+}
+
+/**
+ * frontmatter 合并：原 frontmatter 字段原样保留，追加一行 `methodology: {json}`（块整体为
+ * YAML flow mapping 写法）；无 frontmatter → 生成首行块。body 逐字保存（换行不重排）。
+ */
+export function mergeSkillFrontmatter(content, rawMeta) {
+  const meta = sanitizeSkillMeta(rawMeta) ?? defaultSkillMeta();
+  const line = `methodology: ${JSON.stringify(meta)}`;
+  const rest = content;
+  const m = /^---\r?\n([\s\S]*?)\r?\n---(?:\r?\n|$)/.exec(rest);
+  if (m === null) {
+    return `---\n${line}\n---\n${content}`;
+  }
+  const eol = m[1].includes('\r\n') ? '\r\n' : '\n';
+  const body = rest.slice(m[0].length);
+  return `---${eol}${m[1]}${eol}${line}${eol}---${eol}${body}`;
+}
+
+/**
+ * 路由器表（methodologies.json 的形状）：给定技能 id 清单与 meta 图 →
+ * id → 清洗后 meta（缺失/坏键 → {type:'reference'} 缺省；不崩）。
+ * 键序 = Meta 精编撰写序（**路由优先级**——服务端按本文件键序排优先）；未收录技能
+ * 按 id 序兜底。
+ */
+export function buildMethodologiesTable(ids, rawMeta) {
+  const map =
+    typeof rawMeta === 'object' && rawMeta !== null && !Array.isArray(rawMeta) ? rawMeta : {};
+  const known = new Set(ids);
+  const ordered = [
+    ...Object.keys(map).filter((id) => known.has(id)),
+    ...[...new Set(ids)].filter((id) => !(id in map)).sort(),
+  ];
+  const table = {};
+  for (const id of ordered) table[id] = sanitizeSkillMeta(map[id]) ?? defaultSkillMeta();
+  return table;
+}
+
+// ---------------------------------------------------------------------------
+// 复制主流程
+// ---------------------------------------------------------------------------
 
 const pluginBase = join(
   homedir(),
@@ -64,12 +132,37 @@ if (src === null || !existsSync(src)) {
 rmSync(dst, { recursive: true, force: true });
 mkdirSync(dst, { recursive: true });
 
+// Meta 精编产物：缺失 → {}（所有技能降级 reference；脚本不崩）
+let metaRaw = {};
+if (existsSync(metaPath)) {
+  try {
+    const parsed = JSON.parse(readFileSync(metaPath, 'utf8'));
+    metaRaw = typeof parsed === 'object' && parsed !== null && !Array.isArray(parsed) ? parsed : {};
+  } catch {
+    metaRaw = {};
+  }
+}
+
 let styleDirs = 0;
+const skillIds = [];
 for (const entry of readdirSync(src, { withFileTypes: true })) {
   if (!entry.isDirectory() || entry.name.startsWith('.')) continue;
   cpSync(join(src, entry.name), join(dst, entry.name), { recursive: true });
   styleDirs += 1;
+  // 蒸馏：SKILL.md 的 frontmatter 合并版（原字段 + methodology 行；dist 内为合并产物）
+  const skillFile = join(dst, entry.name, 'SKILL.md');
+  if (existsSync(skillFile)) {
+    skillIds.push(entry.name);
+    const original = readFileSync(skillFile, 'utf8');
+    writeFileSync(skillFile, mergeSkillFrontmatter(original, metaRaw[entry.name]));
+  }
 }
+
+// 路由器表（methodologies.json）：deps compose 的路由节与 loop 前置门 route 的动态读源
+writeFileSync(
+  join(dst, 'methodologies.json'),
+  `${JSON.stringify(buildMethodologiesTable(skillIds, metaRaw), null, 2)}\n`,
+);
 
 // 属性声明：插件 LICENSE + README 聚合单文件（dist 不复制源码仓库，许可与出处须随包声明）
 const licensePath = join(pluginDir, 'LICENSE');
@@ -90,8 +183,14 @@ if (existsSync(licensePath) || existsSync(readmePath)) {
 }
 
 const fileCount = countFiles(dst);
+const methodCount = Object.values(buildMethodologiesTable(skillIds, metaRaw)).filter(
+  (m) => m.type === 'method',
+).length;
 console.error(
-  `skills assets copied: ${src} -> ${dst} (${styleDirs} skills, ${fileCount} files, LICENSE-mattpocock-skills.txt ${
-    existsSync(join(dst, 'LICENSE-mattpocock-skills.txt')) ? 'ok' : 'MISSING'
-  })`,
+  `skills assets copied: ${src} -> ${dst} (${styleDirs} skills, ${fileCount} files, ` +
+    `methodologies.json ${existsSync(join(dst, 'methodologies.json')) ? 'ok' : 'MISSING'} ` +
+    `(${methodCount} method / ${skillIds.length - methodCount} reference), ` +
+    `LICENSE-mattpocock-skills.txt ${
+      existsSync(join(dst, 'LICENSE-mattpocock-skills.txt')) ? 'ok' : 'MISSING'
+    })`,
 );

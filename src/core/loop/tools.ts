@@ -242,3 +242,21 @@ export function errorResultContent(result: ToolResult): string {
     message: result.error?.message ?? 'tool failed',
   });
 }
+
+/**
+ * 方法论前置门回注（R2-S1）：替代执行的唯一构造入口——引导模型先 use_skill 加载
+ * 命中的方法技能（复用 errorContentJson 单一实现；available_tools 带 use_skill 收敛抓手）。
+ */
+export function methodologyFirstResult(id: string): ToolResult {
+  const message = `先加载方法：use_skill(${id})；加载技能全文后再执行本调用`;
+  return {
+    ok: false,
+    content: errorContentJson({
+      type: 'methodology-first',
+      message,
+      human_hint: `Call the use_skill tool with skill id "${id}" before any other tool call.`,
+      available_tools: ['use_skill'],
+    }),
+    error: { type: 'methodology-first', message },
+  };
+}

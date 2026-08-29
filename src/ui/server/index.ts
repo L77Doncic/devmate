@@ -77,6 +77,12 @@ import { classify, type Verdict } from '../../core/tools/classify.js';
 import type { WorkflowConfig } from '../../shared/workflow.js';
 import { clampMaxParallel, DEFAULT_SUBAGENTS_ENABLED } from '../../shared/workflow.js';
 import type { SkillsIndex } from '../../core/tools/skill.js';
+import type {
+  MethodologyEntry,
+  MethodologyIndex,
+  MethodologyMap,
+} from '../../shared/methodology.js';
+import { parseMethodologyMap } from '../../shared/methodology.js';
 import { assertValidSessionId } from '../../core/session/base.js';
 import { SessionExistsError, SessionNotFoundError } from '../../core/session/errors.js';
 import type { SessionStore } from '../../core/session/index.js';
@@ -144,6 +150,8 @@ export interface UiSettings {
   permission?: PermissionPreset;
   /** full-access 风险确认记录（epoch ms；前端二次确认后写入——纯记录、不强制）。 */
   permissionConfirmedAt?: number;
+  /** 方法论前置门开关初值（R2-S1：缺省 true；false = 不注入 RunOptions.methodology）。 */
+  methodFirst?: boolean;
 }
 
 export interface SettingsSnapshot {
@@ -158,6 +166,8 @@ export interface SettingsSnapshot {
   permission?: PermissionPreset;
   /** full-access 风险确认记录（同触碰语义）。 */
   permissionConfirmedAt?: number;
+  /** 方法论前置门（同触碰语义；R2-S1）。 */
+  methodFirst?: boolean;
 }
 
 /** 会话列表摘要（GET /api/sessions 的 sessions[] 元素）。 */
@@ -268,6 +278,8 @@ export interface DevmateServerDeps {
   }) => void | Promise<void>;
   /** 技能索引接缝（晚绑定回填）：服务端启动时从自身索引缓存组装 SkillsIndex 经此回填——use_skill 工具读；扫描单一来源仍是服务端（本模块 skillsCache）。 */
   attachSkillsIndex?: (index: SkillsIndex) => void;
+  /** 方法论索引接缝（晚绑定回填；R2-S1）：服务端从自身缓存（元数据 × 运行时开关）组装经此回填——loop 前置门 route 与提示词路由节现读。 */
+  attachMethodologyIndex?: (index: MethodologyIndex) => void;
   /** 工作流实时配置接缝（晚绑定回填）：workflowState 读取器经此回填——子代理池 config 闭包与提示词合成读取（POST /api/workflow 即时生效）。 */
   attachWorkflowConfig?: (current: () => WorkflowConfig) => void;
   /** 会话系统提示合成（assembleDeps 提供）：基础提示 + 技能清单节 + 子代理节；startRun 每次运行前合成（技能开关/workflow 变更即时生效）。 */
@@ -1061,6 +1073,46 @@ function defaultSkillsDir(): string {
   return resolve(process.cwd(), 'dist', 'assets', 'skills');
 }
 
+/**
+ * 方法论元数据（dist/assets/skills/methodologies.json——copy-skills.mjs 构建时蒸馏的
+ * 路由器表；单一来源，本层只读）。容错读：缺失/损坏/坏键 → 空表（parseMethodologyMap
+ * 对缺失键不崩）；索引缓存（打包资产静态不变）。
+ */
+async function loadMethodologies(skillsDir: string): Promise<MethodologyMap> {
+  try {
+    const data = await readFile(join(skillsDir, 'methodologies.json'), 'utf8');
+    return parseMethodologyMap(JSON.parse(data));
+  } catch {
+    return {};
+  }
+}
+
+/**
+ * 方法论索引构建（服务端缓存单源：meta × 运行时开关 → 路由优先级序）。
+ * 排序：assets/skills-meta.json 键序优先（**路由优先级 = Meta 精编撰写序**——
+ * tdd/diagnosing-bugs/code-review 靠前），未收录技能按 id 序兜底（确定性）。
+ */
+function methodologyEntriesFrom(
+  index: readonly SkillDescriptor[],
+  methodology: MethodologyMap,
+  enabledOf: (id: string) => boolean,
+): MethodologyEntry[] {
+  const order = new Map<string, number>(Object.keys(methodology).map((id, i) => [id, i]));
+  const entries = index.map((skill) => ({
+    id: skill.id,
+    methodology:
+      methodology[skill.id] !== undefined ? methodology[skill.id]! : { type: 'reference' as const },
+    enabled: enabledOf(skill.id),
+  }));
+  entries.sort((a, b) => {
+    const oa = order.get(a.id) ?? Number.POSITIVE_INFINITY;
+    const ob = order.get(b.id) ?? Number.POSITIVE_INFINITY;
+    if (oa !== ob) return oa - ob;
+    return a.id < b.id ? -1 : a.id > b.id ? 1 : 0;
+  });
+  return entries;
+}
+
 // ---------------------------------------------------------------------------
 // HTTP 层
 // ---------------------------------------------------------------------------
@@ -1262,12 +1314,15 @@ export function createDevmateServer(deps: DevmateServerDeps): DevmateServer {
     permission: PermissionPreset;
     /** full-access 风险确认记录（epoch ms；前端风险门后写入——纯记录、不强制）。 */
     permissionConfirmedAt?: number;
+    /** 方法论前置门（R2-S1：缺省 true；false → 本 run 不注入门 = 从不拦截）。 */
+    methodFirst: boolean;
   }
   const current: CurrentSettings = {
     baseUrl: deps.settings?.baseUrl ?? '',
     model: deps.settings?.model ?? deps.model,
     reasoning: deps.settings?.reasoning ?? 'medium',
     permission: deps.settings?.permission ?? DEFAULT_PERMISSION_PRESET,
+    methodFirst: deps.settings?.methodFirst ?? true,
     ...(deps.settings?.apiKey !== undefined ? { apiKey: deps.settings.apiKey } : {}),
     ...(deps.settings?.windowTokens !== undefined
       ? { windowTokens: deps.settings.windowTokens }
@@ -1295,6 +1350,9 @@ export function createDevmateServer(deps: DevmateServerDeps): DevmateServer {
         // C 档：设置侧思考强度 / 窗口覆盖每次 run 现读（POST /api/settings 即时生效）
         runOptions.reasoning = current.reasoning;
         if (current.windowTokens !== undefined) runOptions.windowTokens = current.windowTokens;
+        // R2-S1：方法论前置门按开关传递——false → 删除 methodology 键（门不拦）；
+        // true 时装配层已注入（gate 只含 route/状态观察，索引内容服务端现读）。
+        if (current.methodFirst === false) delete runOptions.methodology;
         if (deps.createSummarizer !== undefined && runOptions.summarizer !== undefined) {
           runOptions.summarizer = deps.createSummarizer(llm, current.model);
         }
@@ -1702,6 +1760,23 @@ export function createDevmateServer(deps: DevmateServerDeps): DevmateServer {
       },
     });
   }
+  // 方法论索引（R2-S1）：元数据表（methodologies.json 动态读一次 + 缓存——打包资产静态）
+  // × skillsSwitches（运行时开关现读）——前置门 route 与提示词路由节经晚绑定回填现读。
+  let methodologyCache: MethodologyMap | null = null;
+  const loadMethodologyMeta = async (): Promise<MethodologyMap> => {
+    if (methodologyCache === null) methodologyCache = await loadMethodologies(skillsDir);
+    return methodologyCache;
+  };
+  if (deps.attachMethodologyIndex !== undefined) {
+    deps.attachMethodologyIndex({
+      async list() {
+        const index = await ensureSkillsIndex();
+        const methodology = await loadMethodologyMeta();
+        return methodologyEntriesFrom(index, methodology, (id) => skillsSwitches.get(id) ?? true);
+      },
+    });
+  }
+
   if (deps.attachWorkflowConfig !== undefined) {
     deps.attachWorkflowConfig(() => ({
       subagentsEnabled: workflowState.subagentsEnabled,
@@ -1881,6 +1956,7 @@ export function createDevmateServer(deps: DevmateServerDeps): DevmateServer {
     window?: number;
     permission: PermissionPreset;
     permissionConfirmedAt?: number;
+    methodFirst: boolean;
   } {
     const response: {
       baseUrl: string;
@@ -1890,11 +1966,13 @@ export function createDevmateServer(deps: DevmateServerDeps): DevmateServer {
       window?: number;
       permission: PermissionPreset;
       permissionConfirmedAt?: number;
+      methodFirst: boolean;
     } = {
       baseUrl: current.baseUrl,
       model: current.model,
       reasoning: current.reasoning, // C 档：缺省 'medium'
       permission: current.permission, // 权限预设定案：缺省 'workspace-write'
+      methodFirst: current.methodFirst, // R2-S1：方法论前置门（缺省 true）
     };
     if (current.apiKey !== undefined) {
       const masked = maskApiKey(current.apiKey);
@@ -1976,6 +2054,10 @@ export function createDevmateServer(deps: DevmateServerDeps): DevmateServer {
       }
       permissionConfirmedAt = rawConfirmedAt;
     }
+    const rawMethodFirst = record.methodFirst;
+    if (rawMethodFirst !== undefined && typeof rawMethodFirst !== 'boolean') {
+      throw new HttpError(400, 'methodFirst must be a boolean');
+    }
     if (
       baseUrl === undefined &&
       model === undefined &&
@@ -1983,7 +2065,8 @@ export function createDevmateServer(deps: DevmateServerDeps): DevmateServer {
       reasoning === undefined &&
       rawWindowTokens === undefined &&
       rawPermission === undefined &&
-      rawConfirmedAt === undefined
+      rawConfirmedAt === undefined &&
+      rawMethodFirst === undefined
     ) {
       throw new HttpError(400, 'no settings fields provided');
     }
@@ -1993,6 +2076,7 @@ export function createDevmateServer(deps: DevmateServerDeps): DevmateServer {
       windowTokens?: boolean;
       permission?: boolean;
       permissionConfirmedAt?: boolean;
+      methodFirst?: boolean;
     } = {};
     if (baseUrl !== undefined) current.baseUrl = baseUrl;
     if (model !== undefined) current.model = model;
@@ -2030,6 +2114,10 @@ export function createDevmateServer(deps: DevmateServerDeps): DevmateServer {
       current.permissionConfirmedAt = permissionConfirmedAt;
       touched.permissionConfirmedAt = true;
     }
+    if (rawMethodFirst !== undefined) {
+      current.methodFirst = rawMethodFirst;
+      touched.methodFirst = true;
+    }
     if (deps.persistSettings !== undefined) {
       const snapshot: SettingsSnapshot = { baseUrl: current.baseUrl, model: current.model };
       if (current.apiKey !== undefined) snapshot.apiKey = current.apiKey;
@@ -2039,6 +2127,7 @@ export function createDevmateServer(deps: DevmateServerDeps): DevmateServer {
       if (touched.permissionConfirmedAt === true) {
         snapshot.permissionConfirmedAt = current.permissionConfirmedAt as number;
       }
+      if (touched.methodFirst === true) snapshot.methodFirst = current.methodFirst;
       await deps.persistSettings(snapshot);
     }
     sendJson(res, 200, settingsResponse());

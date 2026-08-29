@@ -45,6 +45,8 @@ export interface StoredConfig {
   permission?: PermissionPreset;
   /** full-access 风险确认记录（epoch ms；前端风险门后写入——纯记录、不强制）。 */
   permissionConfirmedAt?: number;
+  /** 方法论前置门开关（R2-S1：settings methodFirst 持久化；缺省 true——服务端兜底）。 */
+  methodFirst?: boolean;
   /** Skills 运行时开关（id → enabled；缺省空表 = 全开）。 */
   skills?: Record<string, boolean>;
   /** 工作流配置（子代理开关/并行上限；缺省 true/2；maxParallel 消费时夹紧 1-4）。 */

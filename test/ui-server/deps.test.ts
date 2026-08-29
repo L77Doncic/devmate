@@ -109,11 +109,12 @@ describe('ui/server/deps：assembleDeps 一次组装', () => {
     expect(JSON.stringify(settings)).not.toContain('0123456789');
   });
 
-  it('config 缺省项兜底：无 sessionsDir → 组装即创建会话目录（不抛错），runOptions 缺省只含 summarizer', async () => {
+  it('config 缺省项兜底：无 sessionsDir → 组装即创建会话目录（不抛错），runOptions 缺省只含 summarizer + methodology（R2-S1：前置门缺省开）', async () => {
     const dir = await tempDir();
     const deps = await assembleDeps({ workspaceRoot: dir, model: 'deepseek-v4-flash' });
-    // 摘要器恒注入（与 llm 同一调用面）；未配置的 run 键不出现
-    expect(Object.keys(deps.runOptions ?? {})).toEqual(['summarizer']);
+    // 摘要器恒注入（与 llm 同一调用面）；R2-S1 方法论前置门缺省注入（config.methodFirst !== false）；
+    // 未配置的 run 键不出现
+    expect(Object.keys(deps.runOptions ?? {}).sort()).toEqual(['methodology', 'summarizer']);
     expect(deps.settings?.apiKey).toBeUndefined();
     expect(deps.llm).toBeTypeOf('object');
   });

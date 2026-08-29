@@ -18,6 +18,9 @@ import {
   REASONING_DEFAULT,
   normalizeReasoning,
   normalizeWindow,
+  METHODFIRST_DEFAULT,
+  normalizeMethodFirst,
+  saveMethodFirst,
 } from '../../src/ui/web/settings.js';
 
 /** 测试用自己的「极简 Response 假件」，类型上视为 fetch 使用（运行时不依赖 DOM）。 */
@@ -407,5 +410,88 @@ describe('normalizeBaseUrl / matchProvider', () => {
     expect(matchProvider('https://my-proxy.example.com/v1')).toBeNull();
     expect(matchProvider('')).toBeNull();
     expect(matchProvider(null as unknown as string)).toBeNull();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// R2-S1：方法论先行开关（settings.methodFirst —— 前置门；缺省 true；补丁契约）
+// ---------------------------------------------------------------------------
+
+describe('methodFirst（R2-S1 方法论前置门开关：缺省 true / 布尔补丁 / 失败上抛）', () => {
+  it('常量：缺省 true（服务端无键兜底 —— 旧服务端 GET 回退语义）', () => {
+    expect(METHODFIRST_DEFAULT).toBe(true);
+  });
+
+  it('normalizeMethodFirst：boolean 原样；非布尔（缺失/字符串/0/1）→ 缺省 true', () => {
+    expect(normalizeMethodFirst(true)).toBe(true);
+    expect(normalizeMethodFirst(false)).toBe(false);
+    expect(normalizeMethodFirst(undefined)).toBe(true);
+    expect(normalizeMethodFirst(null)).toBe(true);
+    expect(normalizeMethodFirst('true' as unknown as boolean)).toBe(true);
+    expect(normalizeMethodFirst(0 as unknown as boolean)).toBe(true);
+  });
+
+  it('loadSettings：GET 布尔透传；服务端无该键 → 缺省 true（回显基线）', async () => {
+    const off = await loadSettings({
+      fetchImpl: asFetch(async () =>
+        okResponse({ baseUrl: 'https://x', model: 'm', methodFirst: false }),
+      ),
+    });
+    expect(off.methodFirst).toBe(false);
+    const on = await loadSettings({
+      fetchImpl: asFetch(async () =>
+        okResponse({ baseUrl: 'https://x', model: 'm', methodFirst: true }),
+      ),
+    });
+    expect(on.methodFirst).toBe(true);
+    // 旧服务端（未实现 R2-S1）不回该键 → 缺省 true（服务端自身也缺省 true，双兜底一致）
+    const legacy = await loadSettings({ fetchImpl: asFetch(async () => okResponse({})) });
+    expect(legacy.methodFirst).toBe(true);
+  });
+
+  it('saveMethodFirst：POST 恰一个 {methodFirst} 布尔补丁；返回归一快照回显', async () => {
+    let posted: unknown = null;
+    const saved = await saveMethodFirst(false, {
+      fetchImpl: asFetch(async (_url: string, opts: any) => {
+        posted = JSON.parse(opts.body);
+        return okResponse({
+          baseUrl: 'https://api.deepseek.com',
+          model: 'deepseek-v4-flash',
+          methodFirst: false,
+        });
+      }),
+    });
+    expect(posted).toEqual({ methodFirst: false });
+    expect(saved.methodFirst).toBe(false);
+    // 未触碰字段不下行（补丁语义：不动 baseUrl/model/apiKey）
+    const rec = posted as Record<string, unknown>;
+    expect('apiKey' in rec).toBe(false);
+    expect('baseUrl' in rec).toBe(false);
+  });
+
+  it('saveMethodFirst：值先归一（坏值 → true）再上行', async () => {
+    let posted: unknown = null;
+    await saveMethodFirst('off' as unknown as boolean, {
+      fetchImpl: asFetch(async (_url: string, opts: any) => {
+        posted = JSON.parse(opts.body);
+        return okResponse({ baseUrl: 'x', model: 'm', methodFirst: true });
+      }),
+    });
+    expect(posted).toEqual({ methodFirst: true });
+  });
+
+  it('saveMethodFirst：非 2xx 上抛 —— 调用方回滚（重读 GET + toast「已还原」）前提', async () => {
+    await expect(
+      saveMethodFirst(true, {
+        fetchImpl: asFetch(async () => ({ ok: false, status: 500, json: async () => ({}) })),
+      }),
+    ).rejects.toThrow(/500/);
+    // 回滚 = 失败后再 loadSettings（服务端态还原）；GET 能回到旧值即回滚成立
+    const after = await loadSettings({
+      fetchImpl: asFetch(async () =>
+        okResponse({ baseUrl: 'x', model: 'm', methodFirst: true }),
+      ),
+    });
+    expect(after.methodFirst).toBe(true);
   });
 });

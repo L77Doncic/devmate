@@ -147,6 +147,24 @@ export type ApprovalDecision =
 export type Approver = (call: ToolCall) => Promise<ApprovalDecision>;
 
 // ---------------------------------------------------------------------------
+// 方法论前置门（R2-S1：方法论内化）
+// ---------------------------------------------------------------------------
+
+/**
+ * 方法论前置门（RunOptions.methodology）：route 命中 method 型技能且该会话尚未加载
+ * 时，拦截工具调用组（**组内不含 use_skill(<id>) 时**），回注 guidance 型结果
+ * （{ok:false, error:{type:'methodology-first'}}，普通回注管线，不计熔断）。
+ * - route(task)：把任务文本匹配到技能 id（语义版按触发词关键词命中；未命中/无表 → null）；
+ * - isLoaded / markLoaded：会话级加载状态（use_skill 执行成功由主循环观察并 mark）；
+ * - 不注入（undefined）= 关闭：从不拦截（老配置/E2E/test 默认路径）。
+ */
+export interface MethodologyGate {
+  route(task: string): Promise<string | null>;
+  isLoaded(sessionId: string, id: string): boolean;
+  markLoaded(sessionId: string, id: string): void;
+}
+
+// ---------------------------------------------------------------------------
 // 成本计价（ADR-0003：单价表缺失期以占位价近似）
 // ---------------------------------------------------------------------------
 
@@ -198,6 +216,8 @@ export interface RunOptions {
   signal?: AbortSignal;
   /** 时钟注入（墙钟测试）。 */
   now?: () => number;
+  /** 方法论前置门；缺省 undefined = 关闭（从不拦截——E2E/测试/老配置默认路径）。 */
+  methodology?: MethodologyGate;
 }
 
 // ---------------------------------------------------------------------------

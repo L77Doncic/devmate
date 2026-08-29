@@ -1,0 +1,110 @@
+{
+  "tdd": {
+    "type": "method",
+    "trigger": "修复 bug/新增功能/行为变化/test-first/red-green/集成测试",
+    "steps": "红先绿|一次一切片|先定接缝|重构归审查",
+    "done": "每个切片红→绿→验证（公开接口即接缝，预期值独立来源）；重构不混入循环——归 code-review 阶段。"
+  },
+  "code-review": {
+    "type": "method",
+    "trigger": "评审变更/代码质量审查/review a branch/review since X/PR 审查",
+    "steps": "钉住锚点|定 spec 源|双轴并行子代理|聚合报告",
+    "done": "Standards 与 Spec 双轴分别报告（并行子代理、互不污染）；结尾一行每轴总数与最差项；两轴不合并、不跨轴排序。"
+  },
+  "diagnosing-bugs": {
+    "type": "method",
+    "trigger": "bug 定位/异常/报错/调试/diagnose/debug this/性能变慢",
+    "steps": "建红线环|复现最小化|假设分选|探针验证|回归测试|清理",
+    "done": "先有已跑过且红判据的回环（确定、快、agent 可自跑）再入假设；修复后原场景不复现、回归测试过（或记录无接缝结论）；[DEBUG-] 仪器与弃用原型清理干净，正确假设写入提交信息。"
+  },
+  "codebase-design": {
+    "type": "reference",
+    "trigger": "设计模块/接口改进/深模块/接缝/seam/deep module",
+    "steps": "词汇表即产物|按名引用|删除测试|接口即测试面",
+    "done": "术语与源一致（module/interface/depth/seam/adapter/leverage/locality）；本技能是词汇参考——不是要运行的会话，无自身流程判据。"
+  },
+  "domain-modeling": {
+    "type": "reference",
+    "trigger": "术语/词汇/写 CONTEXT/记 ADR/域模型",
+    "steps": "挑战词汇|锐化模糊语|场景压力测试|当场合档",
+    "done": "采用术语与代码相互印证；CONTEXT.md 只收词汇且即时更新；ADR 仅在难逆+无背景下难懂+真权衡三者皆真时提出。"
+  },
+  "grill-with-docs": {
+    "type": "reference",
+    "trigger": "压紧设计/提问访谈/sharpening a plan",
+    "steps": "连调 grilling+domain-modeling（路由器型，无自含步骤）",
+    "done": "正文恰为路由指令：两次 Skill 调用（grilling+domain-modeling），被路由技能留痕 CONTEXT/ADR；无自身方法可执行。"
+  },
+  "implement": {
+    "type": "method",
+    "trigger": "按 spec 实现/实施工单/implement the work/落地票",
+    "steps": "逐项实现|tdd 优先|常跑类型与测试|code-review|提交",
+    "done": "按 spec/票组逐项实现（tdd 优先、既定接缝）；typecheck 常跑、单测常跑、尾端全量 suite 通过；code-review 后提交当前分支。"
+  },
+  "improve-codebase-architecture": {
+    "type": "method",
+    "trigger": "架构改进/扫描深化机会/architecture review/improve codebase",
+    "steps": "热点扫描|候选 HTML 报告|选一处|grilling 深化",
+    "done": "自包含 HTML 报告落系统临时目录（不进 repo）且给 Top recommendation；用户选定后进入 grilling 循环（codebase-design 词汇+domain-modeling 随时跟进）。"
+  },
+  "prototype": {
+    "type": "method",
+    "trigger": "原型验证/一次性原型/does this feel right/UI 长什么样",
+    "steps": "先分逻辑/UI 支|弃用式构建|表面状态|折回并留档",
+    "done": "原型明标弃用、可一键运行、缺省无持久化与打磨；结论折回真实代码；原型留 throwaway 分支并附实施 issue 上下文指针。"
+  },
+  "research": {
+    "type": "method",
+    "trigger": "查证/资料调研/API 用法/委托阅读/primary sources",
+    "steps": "起后台代理|一手来源|逐条引源|单文件落盘",
+    "done": "由后台代理按一手来源（官方文档/源码/spec）核实；每个主张标注来源；单 Markdown 文件落 repo 既有约定处并说明去处。"
+  },
+  "resolving-merge-conflicts": {
+    "type": "method",
+    "trigger": "合并冲突/解决冲突/merge conflict/rebase conflict",
+    "steps": "看现场|找双方一手来源|逐 hunk 按意图解决|跑自动检查|完成合并",
+    "done": "绝不 --abort；每个冲突按双方意图解决（不发明新行为）；typecheck/tests/format 后 merge/rebase 完成并提交。"
+  },
+  "setup-matt-pocock-skills": {
+    "type": "method",
+    "trigger": "初始化技能环境/配置 issue tracker/setup skills",
+    "steps": "探索|逐节提案|确认|写入 docs/agents",
+    "done": "docs/agents 三件（issue-tracker/triage-labels/domain）就位；CLAUDE.md/AGENTS.md 技能块存在则原位更新、不重复添加。"
+  },
+  "to-spec": {
+    "type": "method",
+    "trigger": "总结成 spec/发布 spec/publish the spec/ready-for-agent",
+    "steps": "定接缝并确认|模板起草|发布并加标",
+    "done": "spec 按模板（问题/方案/用户故事/实现与测试决策/范围外/附注）发布到 tracker 并打 ready-for-agent；只合成、不访谈。"
+  },
+  "to-tickets": {
+    "type": "method",
+    "trigger": "拆票/计划转票/拆成 tickets/tracer-bullet 切片",
+    "steps": "起草垂直切片|标阻塞边|用户校验|发布",
+    "done": "每票为窄而完整的垂直切片（可演示/自验证）、带阻塞边、尺寸适单个新上下文；宽重构按 expand–contract 排序；与用户核过后发布（本地=每票一文件）。"
+  },
+  "triage": {
+    "type": "method",
+    "trigger": "triage/分类 issue/处理 PR 队列/状态迁移",
+    "steps": "归因分类|核实主张|grill|落 state 角色与 brief",
+    "done": "每个 issue 恰一个分类角色加一个状态角色（冲突先问）；主张先核实（复现/验 diff）；agent brief 或需求清单已贴（评论以 AI 免责句起始）。"
+  },
+  "wayfinder": {
+    "type": "method",
+    "trigger": "超大任务/迷雾大工程/wayfinder/绿地规划/map 决策票",
+    "steps": "命名目的地|画雾区|建 map 票|打阻塞|逐票推进|交接",
+    "done": "map（wayfinder:map 标注）含目的地/笔记/已决/未定/范围外；一次会话最多解一票（研究票除外）；路清时交接 to-spec 而非直接实现。"
+  },
+  "wizard": {
+    "type": "method",
+    "trigger": "引导 wizard/手动步骤/配置凭据/迁移 cutover/只有人能做",
+    "steps": "划分阶段|逐阶段判渠道|author 阶段|静态验证交还",
+    "done": "阶段次序与每个捕获值（出处/去处/是否秘密）与用户确认；脚本经 bash -n（可行则 shellcheck）；模板库（STAGES 标记以上）未改动；不端到端自跑。"
+  },
+  "ask-matt": {
+    "type": "reference",
+    "trigger": "不知道该用哪个技能/技能路由/which skill fits",
+    "steps": "路由：主流程|入口|词汇层|standalone（路由器型，无自身方法论）",
+    "done": "为当前情境定位本仓库技能路径（主流程/入口/词汇层/standalone 之一）；路由器型——不代行被路由技能的内容。"
+  }
+}

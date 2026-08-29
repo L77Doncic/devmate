@@ -8,4 +8,11 @@
  *
  * 命名一律遵循 CONTEXT.md 术语，禁止引入对话（conversation）与轨迹（trajectory）混用。
  */
-export {};
+export type {
+  MethodologyEntry,
+  MethodologyIndex,
+  MethodologyKind,
+  MethodologyMap,
+  SkillMethodology,
+} from './methodology.js';
+export { parseMethodologyMap, sanitizeMethodology } from './methodology.js';

@@ -2,13 +2,15 @@
  * # settings.js — 设置读写（get/post /api/settings）与密钥掩码（纯逻辑可注入 fetch）
  *
  * 协议（S12/C 档）：GET /api/settings → {baseUrl, model, apiKey?: string|null, reasoning?,
- * window?: number, permission?, permissionConfirmedAt?}（apiKey **掩码**，服务端永不回明文；
- * reasoning = off/low/medium/high 缺省 medium；window = 上下文窗口覆盖，未配置 → 缺省
- * 不带键 = 估算模式；permission = read-only/workspace-write/full-access 缺省
+ * window?: number, permission?, permissionConfirmedAt?, methodFirst?}（apiKey **掩码**，
+ * 服务端永不回明文；reasoning = off/low/medium/high 缺省 medium；window = 上下文窗口覆盖，
+ * 未配置 → 缺省不带键 = 估算模式；permission = read-only/workspace-write/full-access 缺省
  * workspace-write —— 枚举/标签/风险门的单一权威源 = permissions.js；permissionConfirmedAt
- * = full-access 风险确认记录（epoch ms），无记录不带键）；
- * POST /api/settings {baseUrl, model, apiKey?, reasoning?, windowTokens?, permission?} →
- * 同形状（同样只回掩码；reasoning/windowTokens/permission 为补丁字段，未触碰保持现值）。
+ * = full-access 风险确认记录（epoch ms），无记录不带键；methodFirst = R2-S1 方法论前置门
+ * 开关，缺省 true（布尔；旧服务端无该键 → 前端归一为缺省 true））；
+ * POST /api/settings {baseUrl, model, apiKey?, reasoning?, windowTokens?, permission?,
+ * methodFirst?} → 同形状（同样只回掩码；reasoning/windowTokens/permission/methodFirst
+ * 为补丁字段，未触碰保持现值）。
  *
  * ## 密钥纪律
  * - api_key 只允许**保存时**单向上行（用户输入 → POST）；响应到达后立即丢弃明文，
@@ -49,6 +51,18 @@ export const REASONING_DEFAULT = 'medium';
 /** 非法/缺失值归一为 REASONING_DEFAULT（闭集；未知值按缺省处理，不抛）。 */
 export function normalizeReasoning(value) {
   return REASONING_VALUES.includes(value) ? value : REASONING_DEFAULT;
+}
+
+// ---------------------------------------------------------------------------
+// 方法论先行（R2-S1：settings.methodFirst —— 前置门开关，缺省 true）
+// ---------------------------------------------------------------------------
+
+/** 缺省值（服务端同值兜底：旧服务端 GET 无该键 / 坏值 → 缺省 true = 注入前置门）。 */
+export const METHODFIRST_DEFAULT = true;
+
+/** 开关归一：boolean 原样；缺失/坏值 → 缺省 true。 */
+export function normalizeMethodFirst(value) {
+  return typeof value === 'boolean' ? value : METHODFIRST_DEFAULT;
 }
 
 /** 上下文窗口覆盖归一：正整数 number 原样；其它（null/非数字/非整数/≤0/字符串）→ null
@@ -147,6 +161,8 @@ function normalize(json) {
     // （无记录 → null —— 前端只在 full-access 且已确认时跳过风险门）
     permission: normalizePermission(j.permission),
     permissionConfirmedAt: normalizeConfirmedAt(j.permissionConfirmedAt),
+    // R2-S1：方法论前置门开关（缺省 true；旧服务端无该键/坏值 → 兜底 true）
+    methodFirst: normalizeMethodFirst(j.methodFirst),
   };
 }
 
@@ -214,6 +230,23 @@ export async function savePermission(permission, { fetchImpl = globalThis.fetch 
     headers: { 'content-type': 'application/json' },
     credentials: 'same-origin',
     body: JSON.stringify({ permission: value }),
+  });
+  if (!res.ok) throw new Error(`HTTP ${res.status}`);
+  return normalize(await res.json());
+}
+
+/**
+ * 方法论先行开关单独提交（设置页开关：change 即 POST，防抖在 app.js）：
+ * 只上行 {methodFirst} 一个字段（服务端补丁语义）。值先归一（缺省 true 兜底）。
+ * 返回归一化后的完整设置快照。失败抛错（调用方回滚重读 + toast）。
+ */
+export async function saveMethodFirst(methodFirst, { fetchImpl = globalThis.fetch } = {}) {
+  const value = normalizeMethodFirst(methodFirst);
+  const res = await fetchImpl('/api/settings', {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    credentials: 'same-origin',
+    body: JSON.stringify({ methodFirst: value }),
   });
   if (!res.ok) throw new Error(`HTTP ${res.status}`);
   return normalize(await res.json());
