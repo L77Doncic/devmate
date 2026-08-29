@@ -35,15 +35,19 @@
  * 真连接）；shell 只跑 echo 类命令（真实 spawn 仅限本机）。测试时长：每场景独立
  * server 实例（beforeEach 起 / afterEach close + tmp 清理），无 sleep 等待（帧驱动）。
  */
+import { existsSync } from 'node:fs';
 import { mkdtemp, rm, writeFile, mkdir } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
+import { mergeConfig } from '../../src/cli/config.js';
+import { runWeb } from '../../src/cli/web.js';
 import { createJail } from '../../src/core/jail/index.js';
 import type { ToolRegistry } from '../../src/core/loop/index.js';
 import { MemorySessionAdapter } from '../../src/core/session/index.js';
 import type { SubagentPool, SubagentResult, SubagentTask } from '../../src/core/loop/subagent.js';
 import type { SkillsIndex } from '../../src/core/tools/skill.js';
+import { createDevmateServer } from '../../src/ui/server/index.js';
 import type { DevmateServerDeps } from '../../src/ui/server/index.js';
 import { assembleDeps, createSessionToolsFactory } from '../../src/ui/server/deps.js';
 import type { WorkflowConfig } from '../../src/shared/workflow.js';
@@ -750,5 +754,102 @@ describe('E2E-D：全程无泄漏（api key 掩码 · 内存统计字段）', ()
       servers: unknown[];
     };
     expect(mcp.servers).toEqual([]);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// E2E-F：CLI web 读回种子（settings 三键：写 → 重启同文件重读 → GET /api/settings）
+// ---------------------------------------------------------------------------
+
+describe('E2E-F：CLI web 设置读回（permission/reasoning/windowTokens）', () => {
+  const closes: Array<() => Promise<void>> = [];
+
+  afterEach(async () => {
+    for (const close of closes.splice(0)) await close();
+  });
+
+  it('F1) 三键持久写盘 → runWeb 重启（同文件重读）→ GET /api/settings 反映持久值；清键 → 缺省保持', async () => {
+    const dir = await mkdtemp(join(tmpdir(), 'devmate-e2e-f-'));
+    const configPath = join(dir, '.devmate', 'config.json');
+    // 模拟上一进程 Write 路径（POST /api/settings → persistSettings → mergeConfig 单点合并写）
+    mergeConfig(configPath, {
+      baseUrl: 'https://persist.example/v1',
+      model: 'deepseek-v4-flash',
+      reasoning: 'high',
+      permission: 'full-access',
+      windowTokens: 24_000,
+    });
+    try {
+      const start = async (): Promise<{ base: string; close: () => Promise<void> }> => {
+        const printed: string[] = [];
+        let signal: (() => void | Promise<void>) | undefined;
+        const code = await runWeb(['--no-open'], {
+          cwd: dir,
+          env: {},
+          configPath,
+          platform: 'linux',
+          isDir: (p) => existsSync(p),
+          findOnPath: () => true,
+          openBrowser: () => undefined,
+          loadServerModule: async () => ({ assembleDeps, createDevmateServer }),
+          println: (line) => {
+            printed.push(line);
+          },
+          printErr: (line) => {
+            printed.push(`ERR:${line}`);
+          },
+          setSignalHandler: (cb) => {
+            signal = cb;
+          },
+        });
+        expect(code).toBe(0);
+        expect(signal).toBeTypeOf('function');
+        const match = /http:\/\/127\.0\.0\.1:(\d+)\//.exec(printed.join('\n'));
+        expect(match).not.toBeNull();
+        return {
+          base: `http://127.0.0.1:${match![1]!}`,
+          close: async () => {
+            await signal!();
+          },
+        };
+      };
+
+      // 重启 #1：同文件（configPath）重读 → 持久三键进入 assembleDeps settings → GET 同值
+      const first = await start();
+      closes.push(first.close);
+      const settings1 = (await (await fetch(new URL('/api/settings', first.base))).json()) as {
+        reasoning: string;
+        permission: string;
+        window?: number;
+      };
+      expect(settings1).toMatchObject({
+        reasoning: 'high',
+        permission: 'full-access',
+        window: 24_000,
+      });
+      await first.close();
+
+      // 重启 #2：清键（mergeConfig undefined = 删除键）→ 缺省保持（medium/workspace-write/preset 估算）
+      mergeConfig(configPath, {
+        reasoning: undefined,
+        permission: undefined,
+        windowTokens: undefined,
+      });
+      const second = await start();
+      closes.push(second.close);
+      const settings2 = (await (await fetch(new URL('/api/settings', second.base))).json()) as {
+        reasoning: string;
+        permission: string;
+        window: number;
+      };
+      expect(settings2).toMatchObject({
+        reasoning: 'medium',
+        permission: 'workspace-write',
+        window: 64_000, // deepseek preset contextWindowTokens 估算（settings 未覆盖）
+      });
+      await second.close();
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
   });
 });

@@ -2,10 +2,13 @@
  * # settings.js — 设置读写（get/post /api/settings）与密钥掩码（纯逻辑可注入 fetch）
  *
  * 协议（S12/C 档）：GET /api/settings → {baseUrl, model, apiKey?: string|null, reasoning?,
- * window?: number}（apiKey **掩码**，服务端永不回明文；reasoning = off/low/medium/high
- * 缺省 medium；window = 上下文窗口覆盖，未配置 → 缺省不带键 = 估算模式）；
- * POST /api/settings {baseUrl, model, apiKey?, reasoning?, windowTokens?} → 同形状
- * （同样只回掩码；reasoning/windowTokens 为补丁字段，未触碰保持现值）。
+ * window?: number, permission?, permissionConfirmedAt?}（apiKey **掩码**，服务端永不回明文；
+ * reasoning = off/low/medium/high 缺省 medium；window = 上下文窗口覆盖，未配置 → 缺省
+ * 不带键 = 估算模式；permission = read-only/workspace-write/full-access 缺省
+ * workspace-write —— 枚举/标签/风险门的单一权威源 = permissions.js；permissionConfirmedAt
+ * = full-access 风险确认记录（epoch ms），无记录不带键）；
+ * POST /api/settings {baseUrl, model, apiKey?, reasoning?, windowTokens?, permission?} →
+ * 同形状（同样只回掩码；reasoning/windowTokens/permission 为补丁字段，未触碰保持现值）。
  *
  * ## 密钥纪律
  * - api_key 只允许**保存时**单向上行（用户输入 → POST）；响应到达后立即丢弃明文，
@@ -17,6 +20,8 @@
  * src/core/llm/presets.ts（S2 权威）：主默认 Preset = deepseek，
  * baseUrl https://api.deepseek.com、defaultModel deepseek-v4-flash。
  */
+
+import { normalizePermission, normalizeConfirmedAt } from './permissions.js';
 
 export const DEFAULT_SETTINGS = Object.freeze({
   baseUrl: 'https://api.deepseek.com',
@@ -138,6 +143,10 @@ function normalize(json) {
     // （服务端 GET 回 `window` 键；容错 accept `windowTokens` —— 双名兜底）。
     reasoning: normalizeReasoning(j.reasoning),
     windowTokens: normalizeWindow(j.window ?? j.windowTokens),
+    // 权限预设（缺省 workspace-write；枚举/标签权威 = permissions.js）与风险确认记录
+    // （无记录 → null —— 前端只在 full-access 且已确认时跳过风险门）
+    permission: normalizePermission(j.permission),
+    permissionConfirmedAt: normalizeConfirmedAt(j.permissionConfirmedAt),
   };
 }
 
@@ -186,6 +195,25 @@ export async function saveReasoning(reasoning, { fetchImpl = globalThis.fetch } 
     headers: { 'content-type': 'application/json' },
     credentials: 'same-origin',
     body: JSON.stringify({ reasoning: value }),
+  });
+  if (!res.ok) throw new Error(`HTTP ${res.status}`);
+  return normalize(await res.json());
+}
+
+/**
+ * 权限预设单独提交（PermissionSelect chip：切档即 POST，防抖在 app.js；风险确认门在
+ * app.js —— full-access 且无确认记录时先过 modal 再到这里）：
+ * 只上行 {permission} 一个字段（服务端补丁语义；切到 full-access 时服务端记录
+ * permissionConfirmedAt —— 后端记录、不强制，前端只消费回读值）。
+ * 返回归一化后的完整设置快照（含掩码/窗口/权限字段）。失败抛错（调用方回滚重读+toast）。
+ */
+export async function savePermission(permission, { fetchImpl = globalThis.fetch } = {}) {
+  const value = normalizePermission(permission);
+  const res = await fetchImpl('/api/settings', {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    credentials: 'same-origin',
+    body: JSON.stringify({ permission: value }),
   });
   if (!res.ok) throw new Error(`HTTP ${res.status}`);
   return normalize(await res.json());

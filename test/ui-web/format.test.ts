@@ -338,7 +338,7 @@ describe('composerStatsLine（composer 输入卡 footer 用量统计行：步骤
           estimated: true,
         },
       ),
-    ).toBe('3 步 · 2.5s · 入 1.2k · 出 340 · 总 1.5k · ≈$0.0012');
+    ).toBe('3 步 | 2.5s | 入 1.2k · 出 340 · 总 1.5k | ≈$0.0012');
   });
   it('estimated=false 不标 ≈；0 值也显示（沿用五项全显）', () => {
     expect(
@@ -352,9 +352,9 @@ describe('composerStatsLine（composer 输入卡 footer 用量统计行：步骤
           estimated: false,
         },
       ),
-    ).toBe('0 步 · 0ms · 入 0 · 出 0 · 总 0 · $0');
+    ).toBe('0 步 | 0ms | 入 0 · 出 0 · 总 0 | $0');
   });
-  it('无 runStatus（usage 单独到达）：仍显示 token/成本段', () => {
+  it('无 runStatus（usage 单独到达）：仍显示 token/成本段（单组无竖杠）', () => {
     expect(
       composerStatsLine(null, {
         promptTokens: 100,
@@ -363,7 +363,7 @@ describe('composerStatsLine（composer 输入卡 footer 用量统计行：步骤
         costUsd: 0.0001,
         estimated: true,
       }),
-    ).toBe('入 100 · 出 50 · 总 150 · ≈$1.0e-04');
+    ).toBe('入 100 · 出 50 · 总 150 | ≈$1.0e-04');
   });
   it('运行中帧（steps/durationMs 缺省）：省略步骤与耗时；成本缺失不输出成本段', () => {
     expect(

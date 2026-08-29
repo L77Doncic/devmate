@@ -9,6 +9,7 @@ import {
   loadSettings,
   saveSettings,
   saveReasoning,
+  savePermission,
   PROVIDER_PRESETS,
   matchProvider,
   normalizeBaseUrl,
@@ -311,6 +312,87 @@ describe('reasoning 常量与 saveReasoning（分段 pill 提交）', () => {
         fetchImpl: asFetch(async () => ({ ok: false, status: 500, json: async () => ({}) })),
       }),
     ).rejects.toThrow(/500/);
+  });
+});
+
+describe('permission 预设（chip 提交/回滚契约；枚举权威 = permissions.js）', () => {
+  it('loadSettings：permission 三档透传；缺失/非法 → 缺省 workspace-write', async () => {
+    const full = await loadSettings({
+      fetchImpl: asFetch(async () =>
+        okResponse({ baseUrl: 'x', model: 'm', permission: 'full-access' }),
+      ),
+    });
+    expect(full.permission).toBe('full-access');
+    const missing = await loadSettings({ fetchImpl: asFetch(async () => okResponse({})) });
+    expect(missing.permission).toBe('workspace-write');
+    const bad = await loadSettings({
+      fetchImpl: asFetch(async () =>
+        okResponse({ baseUrl: 'x', model: 'm', permission: 'danger-full-access' }),
+      ),
+    });
+    expect(bad.permission).toBe('workspace-write');
+  });
+
+  it('loadSettings：permissionConfirmedAt 透传；无记录/非数 → null（风险门判定依据）', async () => {
+    const confirmed = await loadSettings({
+      fetchImpl: asFetch(async () =>
+        okResponse({ baseUrl: 'x', model: 'm', permissionConfirmedAt: 1_728_000_000_000 }),
+      ),
+    });
+    expect(confirmed.permissionConfirmedAt).toBe(1_728_000_000_000);
+    const none = await loadSettings({ fetchImpl: asFetch(async () => okResponse({})) });
+    expect(none.permissionConfirmedAt).toBeNull();
+    const bad = await loadSettings({
+      fetchImpl: asFetch(async () =>
+        okResponse({ baseUrl: 'x', model: 'm', permissionConfirmedAt: 'now' }),
+      ),
+    });
+    expect(bad.permissionConfirmedAt).toBeNull();
+  });
+
+  it('savePermission：POST 恰一个 {permission} 补丁字段；返回归一快照（确认后服务端回 confirmedAt）', async () => {
+    let posted: unknown = null;
+    const saved = await savePermission('full-access', {
+      fetchImpl: asFetch(async (_url: string, opts: any) => {
+        posted = JSON.parse(opts.body);
+        return okResponse({
+          baseUrl: 'https://api.deepseek.com',
+          model: 'deepseek-v4-flash',
+          permission: 'full-access',
+          permissionConfirmedAt: 1_728_000_000_000,
+        });
+      }),
+    });
+    expect(posted).toEqual({ permission: 'full-access' });
+    expect(saved.permission).toBe('full-access');
+    expect(saved.permissionConfirmedAt).toBe(1_728_000_000_000);
+    expect('apiKey' in (posted as Record<string, unknown>)).toBe(false);
+  });
+
+  it('savePermission：非法档位先归一（如大写/未知 → workspace-write 上行）', async () => {
+    let posted: unknown = null;
+    await savePermission('FULL-ACCESS', {
+      fetchImpl: asFetch(async (_url: string, opts: any) => {
+        posted = JSON.parse(opts.body);
+        return okResponse({ baseUrl: 'x', model: 'm', permission: 'workspace-write' });
+      }),
+    });
+    expect(posted).toEqual({ permission: 'workspace-write' });
+  });
+
+  it('savePermission：非 2xx 上抛 —— 调用方回滚路径（重读 GET + toast）的失败前提', async () => {
+    await expect(
+      savePermission('read-only', {
+        fetchImpl: asFetch(async () => ({ ok: false, status: 400, json: async () => ({}) })),
+      }),
+    ).rejects.toThrow(/400/);
+    // 回滚 = 失败后再 loadSettings（服务端态还原）；GET 能回到旧档即回滚成立
+    const after = await loadSettings({
+      fetchImpl: asFetch(async () =>
+        okResponse({ baseUrl: 'x', model: 'm', permission: 'workspace-write' }),
+      ),
+    });
+    expect(after.permission).toBe('workspace-write');
   });
 });
 

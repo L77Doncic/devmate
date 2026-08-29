@@ -228,28 +228,32 @@ export function compactionSummary(summary, cap = COMPACTION_SUMMARY_CAP) {
 
 /**
  * composer 输入卡 footer 用量统计行（dsh InputBar footer 哲学本地形态：
- * 对话级统计属于输入框上下文，随每一步 run 汇总到同一行）。
- * 内容 = 步骤数 · 耗时 · 入/出/总 tokens · ≈成本（estimated 标 ≈；五项全显沿用）。
- * 只输出存在项；runStatus 与 usage 均无值 → 返回 ''（UI 隐藏整行，
- * 暂停/无数据时不显示假值「—」。runStatus 步骤/耗时只认 number（非 0 兜底）。）
+ * 对话级统计属于输入框上下文，随每一步 run 汇总到同一行；**dsh StatsLine 分组重排**：
+ * 组之间用 ` | ` 分隔、组内用 ` · ` 点号 —— 见 B 节 statsline 分组细节）。
+ * 分组：组1 步数（turns 协议字段未提供 → 只出 {steps} 步，注明）；组2 耗时；
+ *       组3 用量（入/出/总，= dsh tokenUsage 投影剔除缓存命中后可得项）；
+ *       组4 ≈成本（estimated 标 ≈）。
+ * 只输出存在组；runStatus 与 usage 均无值 → 返回 ''；单组时无 ` | `（自然形态）。
+ * runStatus 步骤/耗时只认 number（非 0 兜底）。
  */
 export function composerStatsLine(runStatus, usage) {
-  const parts = [];
-  if (runStatus && Number.isFinite(runStatus?.steps)) parts.push(`${runStatus.steps} 步`);
+  const groups = [];
+  if (runStatus && Number.isFinite(runStatus?.steps)) groups.push([`${runStatus.steps} 步`]);
   if (runStatus && Number.isFinite(runStatus?.durationMs)) {
-    parts.push(formatDurationMs(runStatus.durationMs));
+    groups.push([formatDurationMs(runStatus.durationMs)]);
   }
   if (usage) {
-    if (Number.isFinite(usage.promptTokens)) parts.push(`入 ${formatTokens(usage.promptTokens)}`);
-    if (Number.isFinite(usage.completionTokens)) {
-      parts.push(`出 ${formatTokens(usage.completionTokens)}`);
-    }
-    if (Number.isFinite(usage.totalTokens)) parts.push(`总 ${formatTokens(usage.totalTokens)}`);
+    const u = [];
+    if (Number.isFinite(usage.promptTokens)) u.push(`入 ${formatTokens(usage.promptTokens)}`);
+    if (Number.isFinite(usage.completionTokens))
+      u.push(`出 ${formatTokens(usage.completionTokens)}`);
+    if (Number.isFinite(usage.totalTokens)) u.push(`总 ${formatTokens(usage.totalTokens)}`);
+    if (u.length > 0) groups.push(u);
     if (Number.isFinite(usage.costUsd)) {
-      parts.push(`${usage.estimated ? '≈' : ''}${formatCostUsd(usage.costUsd)}`);
+      groups.push([`${usage.estimated ? '≈' : ''}${formatCostUsd(usage.costUsd)}`]);
     }
   }
-  return parts.join(' · ');
+  return groups.map((g) => g.join(' · ')).join(' | ');
 }
 
 /** 运行中墙钟耗时文本（展示层推算；开始时间缺失/非法/未到返回 ''）。
@@ -269,4 +273,244 @@ export function timeAgo(ts) {
   if (diff < 60_000) return '刚刚';
   if (diff < 3_600_000) return `${Math.floor(diff / 60_000)} 分钟前`;
   return formatTime(t);
+}
+
+// ---------------------------------------------------------------------------
+// Wave 2：消息行 chrome（dsh MessageItem / MessageIconActions 纯逻辑）
+// ---------------------------------------------------------------------------
+
+function pad2(n) {
+  return String(n).padStart(2, '0');
+}
+
+/**
+ * 消息时钟（dsh formatMessageClock zh 模板）：同日 → `HH:mm`；今年内 →
+ * `M月d日 HH:mm`（clock.md 模板）；跨年 → `yyyy/M/d HH:mm`。
+ * 只认 number（Number(null)=0 会把缺失误判成 epoch；非法/缺失 → ''）。
+ */
+export function formatMessageClock(ts, now = Date.now()) {
+  const t = typeof ts === 'number' ? ts : ts instanceof Date ? ts.getTime() : NaN;
+  const ref = typeof now === 'number' ? now : now instanceof Date ? now.getTime() : NaN;
+  if (!Number.isFinite(t) || !Number.isFinite(ref)) return '';
+  const d = new Date(t);
+  const r = new Date(ref);
+  const hm = `${pad2(d.getHours())}:${pad2(d.getMinutes())}`;
+  const sameDay =
+    d.getFullYear() === r.getFullYear() &&
+    d.getMonth() === r.getMonth() &&
+    d.getDate() === r.getDate();
+  if (sameDay) return hm;
+  if (d.getFullYear() === r.getFullYear()) return `${d.getMonth() + 1}月${d.getDate()}日 ${hm}`;
+  return `${d.getFullYear()}/${d.getMonth() + 1}/${d.getDate()} ${hm}`;
+}
+
+/**
+ * 消息行 icon-actions 的时钟追加（dsh turn-tail 同款）：`· Ran for 15s`。
+ * 用时数据 = 事件 duration（run-status.durationMs）或钟差（messages.js 的 startedAt→doneAt）；
+ * 缺失/非法（< 0）→ ''（Meta 行不追加）。
+ */
+export function ranForCaption(ms) {
+  if (typeof ms !== 'number') return '';
+  if (!Number.isFinite(ms) || ms < 0) return '';
+  return `· Ran for ${formatDurationMs(ms)}`;
+}
+
+/** 复制反馈时长（icon-actions 复制成功换对勾的 1s —— dsh 同值；纯常量可测）。 */
+export const CLIPBOARD_FEEDBACK_MS = 1000;
+
+/**
+ * 复制载荷：消息行复制目标 = 正文纯文本（user/assistant 均抄正文，
+ * 不抄工具卡/元信息 —— dsh MessageIconActions 复制语义）。
+ */
+export function messageCopyText(item) {
+  if (!item || typeof item !== 'object') return '';
+  return String(item.text ?? '');
+}
+
+/** 思考折叠行全文的安全护栏（与 compactionSummary 同类）：展开时懒写入上限。 */
+export const THINK_TEXT_CAP = 20_000;
+
+/** 思考折叠行全文（展开时渲染）：≤ cap 原样；超出截断 + 「…（截断）」。 */
+export function thinkBodyText(reasoning, cap = THINK_TEXT_CAP) {
+  const s = String(reasoning ?? '');
+  if (s.length <= cap) return s;
+  return s.slice(0, Math.max(0, cap)) + '…（截断）';
+}
+
+/**
+ * 思考折叠行摘要（dsh ReasoningRow summary）：定稿 = 第一行；运行中（未定稿）= 最新
+ * 一行（跟随流）；截断 n（默认 120）。空/全空白 → ''（行不显示）。
+ */
+export function thinkSummary(reasoning, done, n = 120) {
+  const s = String(reasoning ?? '');
+  const lines = s.split('\n');
+  const pick = done ? lines[0] : lines[lines.length - 1];
+  const line = String(pick ?? '').trim();
+  return line ? truncate(line, n) : '';
+}
+
+// ---------------------------------------------------------------------------
+// Wave 2：ToolRow 变体（dsh classifyTool 语义本地形态）
+// ---------------------------------------------------------------------------
+
+/**
+ * 工具卡变体（dsh classifyTool 子集：bash/read/write/edit/search/generic）：
+ * run_command → bash；read_file/list_dir → read；write_file → write；
+ * edit_file → edit；grep/glob/web_search → search；其余 → generic（现形态兜底）。
+ */
+export function classifyTool(name) {
+  switch (String(name ?? '')) {
+    case 'run_command':
+    case 'bash':
+    case 'pwsh':
+      return 'bash';
+    case 'read_file':
+    case 'list_dir':
+      return 'read';
+    case 'write_file':
+      return 'write';
+    case 'edit_file':
+      return 'edit';
+    case 'grep':
+    case 'glob':
+    case 'web_search':
+      return 'search';
+    default:
+      return 'generic';
+  }
+}
+
+/** 变体标题（dsh tool.title.* locale 键的中文等价；标题非 mono —— 非原始工具名）。 */
+export const TOOL_VARIANT_TITLES = Object.freeze({
+  bash: '运行命令',
+  read: '读取文件',
+  write: '写入文件',
+  edit: '编辑文件',
+  search: '检索',
+  generic: '工具调用',
+});
+
+/** 尽力解析工具参数 JSON 对象；非对象/非 JSON → null（摘要/块函数各自兜底）。 */
+export function parseToolArguments(raw) {
+  const s = String(raw ?? '');
+  if (!s.trim()) return null;
+  try {
+    const parsed = JSON.parse(s);
+    return parsed && typeof parsed === 'object' && !Array.isArray(parsed) ? parsed : null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * 工具行折叠摘要（ToolRow summary 变体选择）：
+ * - bash：args.description（模型为工具写的 5-10 词描述）?? command 首 60；
+ * - read/write/edit：文件路径；
+ * - search：pattern；
+ * - generic：argSummary 压平（原形态）。
+ * 统一截断 n（默认 60）字符。
+ */
+export function toolSummaryArgs(raw, variant = 'generic', n = 60) {
+  const args = parseToolArguments(raw);
+  if (!args) return argSummary(raw, n);
+  switch (variant) {
+    case 'bash': {
+      const desc = typeof args.description === 'string' ? args.description.trim() : '';
+      if (desc) return truncate(desc, n);
+      return truncate(
+        String(args.command ?? '')
+          .replace(/\s+/g, ' ')
+          .trim(),
+        n,
+      );
+    }
+    case 'read':
+    case 'write':
+    case 'edit':
+      return truncate(String(args.path ?? ''), n);
+    case 'search':
+      return truncate(String(args.pattern ?? ''), n);
+    default:
+      return argSummary(raw, n);
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Wave 2：工具卡展开块（dsh toolviews：Diff/Read/Search 卡；全惰性 + 块上限）
+// ---------------------------------------------------------------------------
+
+/** 展开块字符上限（dsh CHAT_DIFF/READ/SEARCH_MAX_LINES 哲学的本地形态：
+ *  单块 ≤ 2000 字符，超出截断 + 「…（截断）」注记；折叠态永不渲染块内容）。 */
+export const BLOCK_MAX_CHARS = 2000;
+
+function intoLines(text) {
+  return String(text ?? '').split(/\r?\n/);
+}
+
+/**
+ * DiffBlock 行（dsh DiffBlock 粗版：红-删 / 绿+加 两色 mono）：
+ * edit_file：search → '-' 行，replace → '+' 行（空 replace = 纯删除）；
+ * write_file：content → 全 '+' 行。
+ * 上限 cap（默认 BLOCK_MAX_CHARS）字符；超限落 note 行「…（截断）」。
+ * 返回 { lines: [{type:'del'|'add'|'note', text}], truncated, removed, added }。
+ */
+export function buildDiffLines(raw, cap = BLOCK_MAX_CHARS) {
+  const args = parseToolArguments(raw);
+  if (!args) return { lines: [], truncated: false, removed: 0, added: 0 };
+  let delText = '';
+  let addText = '';
+  if (typeof args.search === 'string') delText = args.search;
+  if (typeof args.replace === 'string') addText = args.replace;
+  else if (typeof args.content === 'string') addText = args.content;
+  const delLines = delText ? intoLines(delText) : [];
+  const addLines = addText ? intoLines(addText) : [];
+  const lines = [];
+  let chars = 0;
+  let truncated = false;
+  const push = (type, text) => {
+    chars += text.length + 1;
+    if (chars > cap) {
+      truncated = true;
+      return false;
+    }
+    lines.push({ type, text });
+    return true;
+  };
+  for (const t of delLines) if (!push('del', t)) break;
+  if (!truncated) for (const t of addLines) if (!push('add', t)) break;
+  if (truncated) lines.push({ type: 'note', text: '…（截断）' });
+  return { lines, truncated, removed: delLines.length, added: addLines.length };
+}
+
+/** ReadBlock 正文（read_file/list_dir 输出）：≤ cap 原样；超出截断 + 注记行。 */
+export function buildReadBlock(content, cap = BLOCK_MAX_CHARS) {
+  const s = String(content ?? '');
+  if (s.length <= cap) return { text: s, truncated: false };
+  return { text: s.slice(0, Math.max(0, cap)) + '\n…（截断）', truncated: true };
+}
+
+/**
+ * SearchBlock 行（grep/glob 结果）：命中行（含 pattern，大小写不敏感）→ hit 标记
+ * （明黄高亮）；`--` 分组行/上下文行不标记。上限 cap；截断 + 注记行。
+ * 返回 { lines: [{text, hit}], hits, truncated }。
+ */
+export function buildSearchLines(content, pattern, cap = BLOCK_MAX_CHARS) {
+  const s = String(content ?? '');
+  const needle = String(pattern ?? '')
+    .trim()
+    .toLowerCase();
+  const lines = [];
+  let chars = 0;
+  let truncated = false;
+  for (const raw of s.split('\n')) {
+    if (chars + raw.length + 1 > cap) {
+      truncated = true;
+      break;
+    }
+    const hit = needle !== '' && raw.toLowerCase().includes(needle);
+    lines.push({ text: raw, hit });
+    chars += raw.length + 1;
+  }
+  if (truncated) lines.push({ text: '…（截断）', hit: false });
+  return { lines, hits: lines.filter((l) => l.hit).length, truncated };
 }

@@ -21,6 +21,7 @@ import { dirname, join } from 'node:path';
 import { defaultProviderPreset } from '../core/llm/presets.js';
 import { maskApiKey } from '../shared/masking.js';
 import type { ReasoningEffort } from '../shared/llm-types.js';
+import type { PermissionPreset } from '../ui/server/index.js';
 
 export const CONFIG_DIR_NAME = '.devmate';
 export const CONFIG_FILE_NAME = 'config.json';
@@ -40,6 +41,10 @@ export interface StoredConfig {
   reasoning?: ReasoningEffort;
   /** 上下文窗口覆盖（C 档：settings windowTokens 持久化；缺省 = 供应商 preset 估算）。 */
   windowTokens?: number;
+  /** 权限预设（settings permission 持久化；缺省 'workspace-write'——服务端兜底）。 */
+  permission?: PermissionPreset;
+  /** full-access 风险确认记录（epoch ms；前端风险门后写入——纯记录、不强制）。 */
+  permissionConfirmedAt?: number;
   /** Skills 运行时开关（id → enabled；缺省空表 = 全开）。 */
   skills?: Record<string, boolean>;
   /** 工作流配置（子代理开关/并行上限；缺省 true/2；maxParallel 消费时夹紧 1-4）。 */

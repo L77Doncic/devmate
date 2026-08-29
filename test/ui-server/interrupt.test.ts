@@ -12,16 +12,17 @@ import { MemorySessionAdapter } from '../../src/core/session/index.js';
 import type { SessionStore } from '../../src/core/session/index.js';
 import type { SessionEvent } from '../../src/shared/session-types.js';
 import type { DevmateServerDeps } from '../../src/ui/server/index.js';
-import { echoTool, FakeLlm } from '../loop/support.js';
+import { FakeLlm, runCommandTool } from '../loop/support.js';
 import { postJson, SseClient, startServer, waitForFrames } from './support.js';
 
-const ECHO_CALL = { id: 'call-1', name: 'echo', arguments: '{"text":"hi"}' };
+// ask 级命令（echo=未知→ask）：默认档下触发 approval-request（矩阵判定见 server）
+const ASK_CALL = { id: 'call-1', name: 'run_command', arguments: '{"command":"echo hi"}' };
 
 function askAllDeps(): DevmateServerDeps {
   return {
     store: new MemorySessionAdapter(),
-    tools: defineRegistry([echoTool()], { sessionId: 's1' }),
-    llm: new FakeLlm([{ content: 'need tool', toolCalls: [ECHO_CALL] }]),
+    tools: defineRegistry([runCommandTool()], { sessionId: 's1' }),
+    llm: new FakeLlm([{ content: 'need tool', toolCalls: [ASK_CALL] }]),
     model: 'test-model',
   };
 }

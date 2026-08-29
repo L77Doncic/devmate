@@ -3,7 +3,7 @@
  *
  * 权威协议（CTO 定义，S13 前端逐字实现；本文件是服务端唯一序列化点）：
  * 下行 /api/stream 每帧两行——`event: <name>` + `data: <JSON>`（data 恒为单行 JSON），
- * 以空行结束；连接保活为注释行 `: ping`（默认每 30s 一发）。帧清单（10 类）与
+ * 以空行结束；连接保活为注释行 `: ping`（默认每 30s 一发）。帧清单（11 类）与
  * payload 字段名全部钉死在 SseEventData 判别联合里，禁止改名/加嵌套/re-encode。
  * 术语遵循 CONTEXT.md：ToolCall（工具调用请求）与 ToolResult（工具执行结果）按调用 ID 配对。
  */
@@ -53,9 +53,13 @@ export function deriveTitle(firstUserContent: string | undefined): string {
 }
 
 /**
- * 10 类协议帧（event 名与 data 字段逐字遵守 CTO 协议）：
- * session-user / assistant-delta / assistant-done / tool-start / tool-result /
- * approval-request / usage / run-status / run-error / compaction。
+ * 11 类协议帧（event 名与 data 字段逐字遵守 CTO 协议）：
+ * session-user / assistant-delta / reasoning / assistant-done / tool-start /
+ * tool-result / approval-request / usage / run-status / run-error / compaction。
+ *
+ * reasoning（思考增量帧；Wave 2）：text 为**增量**（delta）——在线流逐段推送，
+ * 前端就地累积到当前回合助手气泡的思考折叠行；历史回放为非增量单帧（完整正文，
+ * 见 index.ts 的 REASONING_TEXT_CAP 截断注记）。
  *
  * compaction（上下文压缩披露折叠记）：summary 为摘要全文（无值给空串——前端只兜底显示
  * 「上下文已压缩」）；tokensBefore/tokensAfter 为可选 token 估算（缺省/非 number 时
@@ -64,6 +68,7 @@ export function deriveTitle(firstUserContent: string | undefined): string {
 export type SseEventData =
   | { event: 'session-user'; data: { text: string } }
   | { event: 'assistant-delta'; data: { text: string } }
+  | { event: 'reasoning'; data: { text: string } }
   | { event: 'assistant-done'; data: { content: string; toolCalls: ToolCallView[] } }
   | { event: 'tool-start'; data: { id: string; name: string; arguments: string } }
   | {

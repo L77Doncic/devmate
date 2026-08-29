@@ -213,6 +213,56 @@ describe('loop：错误回注与熔断（接缝 S5）', () => {
       expect(String(toolMsg?.content)).toContain('user-denied');
     });
 
+    it('approver deny 带 errorType=permission-denied：工具结果错误类型逐字 permission-denied、循环继续（权限预设直拒语义）', async () => {
+      const store = readyStore();
+      const { registry, executions } = makeRegistry();
+      const llm = new FakeLlm([
+        { toolCalls: [{ id: 'call_2', name: 'echo', arguments: '{"text":"hi"}' }] },
+        { content: 'ok' },
+      ]);
+      const approver = async (call: ToolCall) => {
+        void call;
+        return {
+          deny: true,
+          reason: '[permission: denied under workspace-write mode]',
+          errorType: 'permission-denied' as const,
+        };
+      };
+
+      const result = await run(
+        { sessionId: 's1', task: TASK },
+        opts({ store, tools: registry, llm, model: 'm', approver }),
+      );
+
+      expect(result.status).toBe('completed'); // 普通回注——不暂停、不换手
+      expect(executions).toEqual([]);
+      const events = await collectEvents(store, 's1');
+      expect(kindsOf(events)).toEqual([
+        'user',
+        'assistant(1tc)',
+        'event(approval_denied)',
+        'tool(call_2)',
+        'assistant(0tc)',
+        'event(run_result)',
+      ]);
+      const injected = events.find((ev) => ev.kind === 'tool');
+      const parsed = JSON.parse(toolPayload(injected)?.content ?? '{}') as {
+        ok: boolean;
+        error: { type: string; message: string };
+      };
+      expect(parsed.ok).toBe(false);
+      expect(parsed.error.type).toBe('permission-denied');
+      expect(parsed.error.message).toContain('[permission: denied under workspace-write mode]');
+      // 审计事件带 errorType（区分策略直拒与用户弹窗拒绝）
+      expect((eventPayload(events[2])?.data as { errorType?: string } | undefined)?.errorType).toBe(
+        'permission-denied',
+      );
+      // 第二轮请求带拒因回注（配对 call_2）
+      const toolMsg = llm.requests[1]?.messages.find((m) => m.role === 'tool');
+      expect(toolMsg?.toolCallId).toBe('call_2');
+      expect(String(toolMsg?.content)).toContain('permission-denied');
+    });
+
     it('approver deny 无理由：用户中止本轮（user-interrupted；无工具结果 → 悬空，resume 时补 interrupted 占位）', async () => {
       const store = readyStore();
       const { registry, executions } = makeRegistry();

@@ -1770,6 +1770,7 @@ pre {
 
 .msg-row {
   display: flex;
+  flex-wrap: wrap; /* 行 meta 换到气泡**下方**（dsh 行尾；不横排占据气泡右缘） */
   width: 100%;
 }
 .msg-row.user {
@@ -1803,35 +1804,140 @@ pre {
   border: none;
   color: var(--dsw-alias-label-primary);
 }
-/* 消息元信息行（dsh caption 系 13/20：作者/状态/时刻同一 caption 排，不动主气泡节奏） */
+/* 行级 meta（dsh MessageIconActions：**正文下/行尾 hover 显现** —— 时钟 + icon-actions；
+   无作者标题行（dsh 无；DevMate 旧「DevMate · 工作中 + 时间」作者 meta 已删 —— meta 精简去重）。
+   恒占位（opacity 显隐）：hover 显现零布局跳变；:focus-within 键盘可达。 */
 .msg-meta {
   display: flex;
   align-items: center;
-  gap: 8px;
-  margin: 0 2px 4px;
+  gap: 10px;
+  flex: 1 1 100%;
+  margin: 6px 4px 0;
   font-size: var(--dsw-font-size-s);
   line-height: var(--dsw-font-line-s);
   font-variant-numeric: tabular-nums;
   color: var(--dsw-alias-label-caption);
+  opacity: 0;
+  transition:
+    opacity var(--t),
+    color var(--t);
+  user-select: none;
 }
 .msg-row.user .msg-meta {
   justify-content: flex-end;
 }
-.msg-row.assistant .msg-meta {
-  color: var(--dsw-alias-label-caption);
-  margin: 0 2px 6px;
+.msg-row:hover .msg-meta,
+.msg-row:focus-within .msg-meta {
+  opacity: 1;
 }
-.msg-author {
-  font-size: inherit; /* meta 行整排 = caption 13/20（.msg-meta 单一排源） */
-  line-height: inherit;
-  font-weight: 500;
-  color: var(--dsw-alias-label-secondary);
-}
-.msg-time {
+.msg-meta .msg-time {
   font-size: inherit;
   line-height: inherit;
   font-variant-numeric: tabular-nums;
   color: var(--dsw-alias-label-caption);
+}
+.icon-actions {
+  display: inline-flex;
+  align-items: center;
+  gap: 2px;
+}
+.icon-action {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 20px;
+  height: 20px;
+  padding: 0;
+  border: none;
+  border-radius: 5px;
+  background: none;
+  color: var(--dsw-alias-label-caption);
+  cursor: pointer;
+  transition:
+    background var(--t),
+    color var(--t);
+}
+.icon-action:hover {
+  background: var(--dsw-alias-interactive-bg-hover);
+  color: var(--dsw-alias-label-secondary);
+}
+.icon-action svg {
+  width: 14px;
+  height: 14px;
+}
+.icon-action .ic-check {
+  display: none;
+}
+.icon-action.copied .ic-copy {
+  display: none;
+}
+.icon-action.copied .ic-check {
+  display: block;
+  color: var(--dsw-alias-state-success-primary);
+}
+
+/* 思考折叠行（dsh ReasoningRow：24px Disclosure 行；default 收起；摘要 = 定稿首行/流式末行） */
+.think-row {
+  margin: 0 0 6px;
+}
+.think-toggle {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  width: 100%;
+  min-width: 0;
+  height: 24px;
+  padding: 0 6px;
+  border: none;
+  border-radius: 6px;
+  background: none;
+  color: var(--dsw-alias-label-primary-dimmed);
+  font-size: var(--dsw-font-size-s);
+  line-height: 24px;
+  text-align: left;
+  white-space: nowrap;
+  transition:
+    background var(--t),
+    color var(--t);
+}
+.think-toggle:hover {
+  background: var(--dsw-alias-interactive-bg-hover);
+  color: var(--dsw-alias-label-secondary);
+}
+.think-toggle[aria-expanded='true'] {
+  color: var(--dsw-alias-label-secondary);
+}
+.think-icon {
+  flex: none;
+  width: 14px;
+  height: 14px;
+  color: var(--dsw-alias-state-business-primary);
+}
+.think-caption {
+  flex: none;
+  font-weight: 500;
+}
+.think-summary {
+  flex: 1 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  color: var(--dsw-alias-label-tertiary);
+  font-size: var(--dsw-font-size-xs);
+  line-height: 24px;
+}
+.think-body {
+  margin: 2px 0 6px 22px;
+  padding: 10px 16px 12px 12px;
+  background: var(--dsw-alias-markdown-code-block);
+  border-radius: 8px;
+  color: var(--dsw-alias-label-tertiary);
+  font-size: var(--dsw-font-size-s);
+  line-height: 22px;
+  max-height: 260px;
+  overflow: auto;
+  white-space: pre-wrap;
+  word-break: break-word;
 }
 
 .bubble-body {
@@ -2000,11 +2106,23 @@ pre {
 .tool-dot.interrupted {
   color: var(--dsw-alias-state-warn-primary);
 }
-.tool-name {
+.tool-leading {
+  flex: none;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+}
+.tool-icon {
+  width: 14px;
+  height: 14px;
+  color: var(--dsw-alias-label-secondary);
+}
+/* 变体标题（dsh tool.title.*：非 mono、13px caption 韵；原始工具名悬浮在 title 属性） */
+.tool-title {
   flex: 0 0 auto;
-  font-family: var(--font-mono);
   font-size: var(--dsw-font-size-xs);
   line-height: 24px;
+  font-weight: 500;
   color: var(--dsw-alias-label-secondary);
 }
 .tool-state {
@@ -2120,6 +2238,73 @@ pre {
 }
 .tool-result.err {
   color: var(--err-fg);
+}
+
+/* ToolRow 变体展开块（dsh toolviews：Terminal/ReadBlock 单块、DiffBlock 两色、SearchBlock 明黄）：
+   全部惰性（折叠零正文 DOM）+ 单块 2000 字符上限（format.js BLOCK_MAX_CHARS 截断注记） */
+.tool-block {
+  margin: 6px 0 8px 22px;
+  padding: 10px 16px 12px 12px;
+  background: var(--dsw-alias-markdown-code-block);
+  border: none;
+  border-radius: 8px;
+  color: var(--dsw-alias-label-secondary);
+  font: var(--dsw-font-markdown-code-block-small);
+  white-space: pre-wrap;
+  word-break: break-word;
+  max-height: 260px;
+  overflow: auto;
+}
+.tool-block.err {
+  color: var(--err-fg);
+}
+.tool-diff {
+  margin: 6px 0 8px 22px;
+  padding: 6px 0;
+  background: var(--dsw-alias-markdown-code-block);
+  border: none;
+  border-radius: 8px;
+  overflow: auto;
+  max-height: 260px;
+  font: var(--dsw-font-markdown-code-block-small);
+  white-space: pre;
+  tab-size: 2;
+}
+.tool-diff-line {
+  padding: 0 14px;
+  color: var(--dsw-alias-label-secondary);
+}
+.tool-diff-line.del {
+  background: color-mix(in srgb, var(--err-fg) 14%, transparent);
+  color: var(--err-fg);
+}
+.tool-diff-line.add {
+  background: color-mix(in srgb, var(--dsw-alias-state-success-primary) 13%, transparent);
+  color: var(--dsw-alias-state-success-primary);
+}
+.tool-diff-line.note {
+  color: var(--dsw-alias-label-caption);
+}
+.tool-search {
+  margin: 6px 0 8px 22px;
+  padding: 6px 0;
+  background: var(--dsw-alias-markdown-code-block);
+  border: none;
+  border-radius: 8px;
+  overflow: auto;
+  max-height: 260px;
+  font: var(--dsw-font-markdown-code-block-small);
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+.tool-search-line {
+  padding: 0 14px;
+  color: var(--dsw-alias-label-tertiary);
+}
+.tool-search-line.hit {
+  padding: 1px 14px;
+  background: var(--warn-dim);
+  color: var(--warn-fg, var(--dsw-alias-label-primary));
 }
 
 /* ---------- markdown 渲染（模型文本；dsh markdown token 系） ---------- */
@@ -2280,6 +2465,20 @@ pre {
   font-weight: 500;
   line-height: 32px;
   letter-spacing: 0;
+}
+/* 「预览版」badge（dsh EmptyHero 徽章；r6 实底小字，非交互） */
+.hero-badge {
+  display: inline-block;
+  margin-left: 10px;
+  padding: 3px 8px;
+  border-radius: 6px;
+  background: var(--dsw-alias-markdown-code-block);
+  color: var(--dsw-alias-state-business-primary);
+  font-size: var(--dsw-font-size-xs);
+  font-weight: 500;
+  line-height: 18px;
+  vertical-align: middle;
+  letter-spacing: 0.5px;
 }
 .empty-sub {
   color: var(--dsw-alias-label-secondary);
@@ -2464,7 +2663,7 @@ pre {
   text-align: left;
 }
 
-/* ---------- 审批面板（dsh ApprovalPanel：warn 条 + r20 卡 + 右下 ghost/primary） ---------- */
+/* ---------- 遮罩（删除确认 / 风险确认 / 设置抽屉共用） ---------- */
 .scrim {
   position: fixed;
   inset: 0;
@@ -2472,18 +2671,20 @@ pre {
   background: var(--dsw-alias-bg-mask-1);
   backdrop-filter: var(--dsw-mask-blur);
 }
-.approval {
-  position: fixed;
-  z-index: 61;
-  left: 50%;
-  top: 50%;
-  transform: translate(-50%, -50%);
-  width: min(640px, calc(100vw - 28px));
+/* ---------- 内嵌审批卡（dsh ApprovalPanel 本地形态：composer 上方 dock 停靠，
+   —— 非 modal：等待审批 strip + 理由 headline + 命令预览 mono 卡 + 右下 拒绝/允许 双钮
+     （无附注框：dsh 并无 —— 拒绝=无备注拒绝=用户终止本轮）） ---------- */
+.approval-dock {
+  width: 100%;
+  max-width: var(--dsh-composer-card-max-width);
+  margin: 0 auto 6px;
+}
+.approval-banner {
   overflow: hidden;
   border: 1px solid var(--dsw-alias-state-warn-secondary);
   border-radius: 20px;
   background: var(--dsw-specific-input-major);
-  box-shadow: var(--dsw-shadow-lv3);
+  box-shadow: var(--dsw-shadow-lv2);
 }
 .ap-strip {
   display: flex;
@@ -2515,19 +2716,6 @@ pre {
   font-weight: 500;
   line-height: 24px;
 }
-.ap-sub {
-  margin: 0;
-  color: var(--dsw-alias-label-secondary);
-  font-size: var(--dsw-font-size-s);
-  line-height: 20px;
-}
-.ap-command {
-  color: var(--dsw-alias-label-tertiary);
-  font-family: var(--font-mono);
-  font-size: var(--dsw-font-size-xs);
-  line-height: 20px;
-  word-break: break-all;
-}
 .ap-args {
   margin: 0;
   padding: 10px 16px 12px 12px;
@@ -2545,6 +2733,10 @@ pre {
   justify-content: flex-end;
   gap: 8px;
   padding: 10px 16px 14px;
+}
+.ap-actions button:disabled {
+  opacity: 0.4;
+  cursor: default;
 }
 .ap-reject:hover:not(:disabled) {
   background: var(--dsw-alias-interactive-bg-hover-danger);
@@ -2759,9 +2951,6 @@ pre {
   justify-content: flex-end;
   gap: 8px;
   padding: 6px 0 12px;
-}
-.field-row {
-  display: block;
 }
 .field-group {
   display: block;
@@ -3224,6 +3413,140 @@ pre {
 .btn-stop-circ svg {
   width: 16px;
   height: 16px;
+}
+
+/* ---------- PermissionSelect 访问模式 chip（composer-foot 左置；dsh InputBar .tools） ---------- */
+.composer-tools {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  flex: 0 1 auto;
+  min-width: 0;
+}
+/* chip：盾形 glyph 16 + 档标签 + chevron（dsh PermissionSelect：触发体 = glyph 14 缩显 +
+   标签（满宽 220） + chevron；hover 面同 reasoning-opt 族；disabled = 输入锁定）。 */
+.perm-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  height: 26px;
+  max-width: 220px;
+  padding: 0 10px;
+  border: 1px solid var(--dsw-alias-border-l2-darkmode-thin);
+  border-radius: 999px;
+  background: var(--dsw-alias-interactive-bg-hover);
+  color: var(--dsw-alias-label-secondary);
+  font-size: var(--dsw-font-size-xs);
+  line-height: 20px;
+  cursor: pointer;
+}
+.perm-chip:hover {
+  color: var(--dsw-alias-label-primary);
+}
+.perm-chip:disabled {
+  opacity: 0.4;
+  cursor: default;
+}
+.perm-glyph {
+  flex: none;
+  display: inline-flex;
+  width: 16px;
+  height: 16px;
+  color: var(--dsw-alias-state-warn-primary);
+}
+.perm-glyph svg {
+  width: 16px;
+  height: 16px;
+}
+.perm-label {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.perm-chevron {
+  flex: none;
+  width: 12px;
+  height: 12px;
+  color: var(--dsw-alias-label-tertiary);
+  transition: transform 120ms ease-out;
+}
+.perm-chip[aria-expanded='true'] .perm-chevron {
+  transform: rotate(90deg); /* dsh Menu chevron 展开态：朝右翻到朝下 */
+}
+/* 窄卡（≤460px）只留 glyph（dsh PermissionSelect 同规则） */
+@media (max-width: 460px) {
+  .perm-chip .perm-label,
+  .perm-chip .perm-chevron {
+    display: none;
+  }
+}
+/* 访问模式菜单（dsh Menu 表面：浮层、r8、阴影；行 = glyph + 档标签 + 描述；
+   当前档 current 高亮；定位 = menu.js menuPosition 纯函数（视口钳制），app.js 落点） */
+.perm-menu {
+  position: fixed;
+  z-index: 46;
+  min-width: 260px;
+  max-width: min(360px, calc(100vw - 16px));
+  padding: 4px;
+  border: 1px solid var(--dsw-alias-border-l1);
+  border-radius: 8px;
+  background: var(--dsw-specific-menu);
+  box-shadow: var(--dsw-shadow-lv2);
+  animation: row-menu-in 120ms ease-out;
+}
+.perm-menu-item {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  width: 100%;
+  padding: 6px 8px;
+  border: none;
+  border-radius: 6px;
+  background: transparent;
+  color: var(--dsw-alias-label-secondary);
+  text-align: left;
+  cursor: pointer;
+}
+.perm-menu-item:hover {
+  background: var(--dsw-alias-interactive-bg-hover);
+}
+.perm-menu-item.current {
+  background: var(--dsw-alias-interactive-bg-hover);
+  color: var(--dsw-alias-label-primary);
+  font-weight: 500;
+}
+.pm-glyph {
+  flex: none;
+  display: inline-flex;
+  width: 18px;
+  height: 18px;
+  color: var(--dsw-alias-state-warn-primary);
+}
+.pm-glyph svg {
+  width: 18px;
+  height: 18px;
+}
+.pm-text {
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+  gap: 1px;
+}
+.pm-label {
+  font-size: var(--dsw-font-size-m);
+  line-height: 20px;
+  color: inherit;
+  white-space: nowrap;
+}
+.pm-desc {
+  font-size: var(--dsw-font-size-xs);
+  line-height: 16px;
+  color: var(--dsw-alias-label-tertiary);
+  font-weight: 400;
+}
+.pm-desc.warn {
+  color: var(--dsw-alias-state-warn-primary);
 }
 
 /* ---------- 思考强度分段 pill（composer 输入卡上方右侧；dsh segmented 同族） ---------- */

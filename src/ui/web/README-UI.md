@@ -19,20 +19,22 @@ python3 -m http.server 8123            # 在 src/ui/web 目录内
 
 纯逻辑模块（node 可直接 import 的 ESM `.js`）：
 
-| 文件            | 职责                                                                                                                                                                                                                                                                                                        |
-| --------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `sse.js`        | SSE 行缓冲/事件边界解析器 + fetch/ReadableStream 消费器                                                                                                                                                                                                                                                     |
-| `markdown.js`   | 手写安全 Markdown：块/行内解析、escapeHtml、safeHref 白名单、HTML 串渲染 & DOM 渲染                                                                                                                                                                                                                         |
-| `messages.js`   | SSE 事件 → 消息状态机（delta 累积、工具卡、审批队列、用量/运行状态、长会话裁剪；usage 透传 contextEstimateTokens + costUsdCum 会话累计成本）                                                                                                                                                                |
-| `settings.js`   | GET/POST /api/settings、密钥掩码、默认值、工作区目录显示字段、**思考强度四档（off/low/medium/high，缺省 medium）与上下文窗口覆盖归一、saveReasoning 补丁提交**、供应商预设镜像（仅供测试/兼容保留）                                                                                                         |
-| `format.js`     | 截断/token/金额/耗时/参数美化等纯格式化函数                                                                                                                                                                                                                                                                 |
-| `sessions.js`   | 侧栏数据纯逻辑：会话列表/详情归一化（**含 workspaceRoot**）、**workspaceLabel/groupSessionsByWorkspace 归组**（未知项目尾组）、统计行（S13）                                                                                                                                                                |
-| `theme.js`      | 三态主题（system/dark/light）：归一化、localStorage 读写、applyTheme（S13）                                                                                                                                                                                                                                 |
-| `sidebar.js`    | 侧边栏状态纯逻辑（dsh 语义）：展开 260 / rail 56 常量、窄屏阈值、resolveSidebarCollapsed（宽屏偏好 + 窄屏自动折叠 + 运行时覆盖）、折叠持久化 `devdev.sidebarCollapsed` **仅字面量 `'true'` 服从**（损坏/未定义 → 展开；防 localStorage 默认风险）、BUILD_VERSION = package.json version（版本徽章单一来源） |
-| `menu.js`       | 行菜单（kebab → dsh Menu）纯逻辑：条目模型（delete 危险项）、id → action 白名单匹配（未知 id 不落破坏性分支）、锚点定位（先下后上、右缘对齐、视口钳制）                                                                                                                                                     |
-| `extensions.js` | 设置页扩展区纯逻辑：Subagent 工作流（/api/workflow 同步 + localStorage 降级）、Skills/MCP 清单归一化（MCP 徽章按 enabled 渲染，不依赖 status）、args 解析                                                                                                                                                   |
-| `commands.js`   | 「/」命令纯逻辑：12 条命令表（id/name/label/desc/hint 单一来源）、parseCommandLine 行解析、matchCommands 前缀过滤（下拉）、commandFor 白名单匹配、commandArgValid 参数合法裁决、THEME_ARG_VALUES 白名单                                                                                                     |
-| `meter.js`      | 上下文窗口占用环纯逻辑：meterRatio（contextEstimateTokens / window，夹取 [0,1]、只认 number）、meterTier（>80% 琥珀 / >95% 红 / 缺窗 unknown）、百分比文本、tooltip 与 aria（缺窗「—」= 估算模式）、周长常量                                                                                                |
+| 文件                 | 职责                                                                                                                                                                                                                                                                                                                                   |
+| -------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `sse.js`             | SSE 行缓冲/事件边界解析器 + fetch/ReadableStream 消费器                                                                                                                                                                                                                                                                                |
+| `markdown.js`        | 手写安全 Markdown：块/行内解析、escapeHtml、safeHref 白名单、HTML 串渲染 & DOM 渲染                                                                                                                                                                                                                                                    |
+| `messages.js`        | SSE 事件 → 消息状态机（delta 累积、工具卡、审批队列（**内嵌卡一次呈现一个** —— 快照保序，渲染层只取第一个等待项）、用量/运行状态、长会话裁剪；usage 透传 contextEstimateTokens + costUsdCum 会话累计成本）                                                                                                                             |
+| `settings.js`        | GET/POST /api/settings、密钥掩码、默认值、工作区目录显示字段、**思考强度四档（off/low/medium/high，缺省 medium）与上下文窗口覆盖归一、saveReasoning 补丁提交**、**权限档位（read-only/workspace-write/full-access，缺省 workspace-write）与 permissionConfirmedAt 归一、savePermission 补丁提交**、供应商预设镜像（仅供测试/兼容保留） |
+| `format.js`          | 截断/token/金额/耗时/参数美化等纯格式化函数                                                                                                                                                                                                                                                                                            |
+| `sessions.js`        | 侧栏数据纯逻辑：会话列表/详情归一化（**含 workspaceRoot**）、**workspaceLabel/groupSessionsByWorkspace 归组**（未知项目尾组）、统计行（S13）                                                                                                                                                                                           |
+| `theme.js`           | 三态主题（system/dark/light）：归一化、localStorage 读写、applyTheme（S13）                                                                                                                                                                                                                                                            |
+| `sidebar.js`         | 侧边栏状态纯逻辑（dsh 语义）：展开 260 / rail 56 常量、窄屏阈值、resolveSidebarCollapsed（宽屏偏好 + 窄屏自动折叠 + 运行时覆盖）、折叠持久化 `devdev.sidebarCollapsed` **仅字面量 `'true'` 服从**（损坏/未定义 → 展开；防 localStorage 默认风险）、BUILD_VERSION = package.json version（版本徽章单一来源）                            |
+| `menu.js`            | 行菜单（kebab → dsh Menu）纯逻辑：条目模型（delete 危险项）、id → action 白名单匹配（未知 id 不落破坏性分支）、锚点定位（先下后上、右缘对齐、视口钳制）                                                                                                                                                                                |
+| `extensions.js`      | 设置页扩展区纯逻辑：Subagent 工作流（/api/workflow 同步 + localStorage 降级）、Skills/MCP 清单归一化（MCP 徽章按 enabled 渲染，不依赖 status）、args 解析                                                                                                                                                                              |
+| `commands.js`        | 「/」命令纯逻辑：12 条命令表（id/name/label/desc/hint 单一来源）、parseCommandLine 行解析、matchCommands 前缀过滤（下拉）、commandFor 白名单匹配、commandArgValid 参数合法裁决、THEME_ARG_VALUES 白名单                                                                                                                                |
+| `meter.js`           | 上下文窗口占用环纯逻辑：meterRatio（contextEstimateTokens / window，夹取 [0,1]、只认 number）、meterTier（>80% 琥珀 / >95% 红 / 缺窗 unknown）、百分比文本、tooltip 与 aria（缺窗「—」= 估算模式）、周长常量                                                                                                                           |
+| `permissions.js`     | dsh 式权限预设纯逻辑（**三档枚举/中文标签/描述/盾形 glyph 单一来源**）：档位归一（非法 → workspace-write）、permissionConfirmedAt 归一与已确认判定、**风险门计算**（切 full-access 且无确认记录 → 一次性确认门）、风险门文案（复用删除确认视觉）                                                                                       |
+| `approval-banner.js` | 内嵌审批卡视图模型纯逻辑：headline（工具名+一句话）、命令预览提取（JSON cmd/command/path → mono 卡文本，截断 300）、**队列 → 卡视图换算（一次一个，取首个等待项）**；出现/应答收敛/拒绝语义状态机在 messages.js（approvals 队列）+ app.js（渲染首个等待项）                                                                            |
 
 ```bash
 npx vitest run test/ui-web      # 用例数见 vitest 输出（sse/markdown/messages/settings/format/theme/sessions/extensions/sidebar/menu）
@@ -63,18 +65,26 @@ npm run typecheck 需要能解析测试里的 `.js` import：`tsconfig.test.json
 
 ## 协议速记（详见 app.js/sse.js 头注释与 emit.ts）
 
-GET `/api/stream?sessionId=` → SSE（**帧清单 10 类**）：`session-user{text}` / `assistant-delta{text}` /
+GET `/api/stream?sessionId=` → SSE（**帧清单 11 类**）：`session-user{text}` / `assistant-delta{text}` /
+`reasoning{text}`（思考**增量**帧：流内逐段推送、历史回放为折叠单帧——前端就地累积；服务端已下发）/
 `assistant-done{content,toolCalls}` / `tool-start{id,name,arguments}` /
 `tool-result{id,name,ok,contentPreview,content,error}` / `approval-request{toolCallId,name,arguments}` /
 `usage{promptTokens,completionTokens,totalTokens,costUsd,estimated,contextEstimateTokens?}` /
 `run-status{status,steps,durationMs}` / `run-error{message}` /
 `compaction{summary,tokensBefore?,tokensAfter?}`（披露折叠记；服务端已下发，前端接缝就绪）；
 注释行 `: ping` 忽略。
-POST `/api/chat {sessionId?,text} → {sessionId}`；POST `/api/approval {sessionId,toolCallId,approve,reason?}`；
-POST `/api/interrupt`；GET/POST `/api/settings {baseUrl,model,apiKey?,reasoning?,windowTokens?}`
-（只回掩码；response 恒带 `reasoning`（off/low/medium/high，缺省 medium）与 `window`（
-上下文窗口覆盖；未配置 → 缺省不带键 = 估算模式）；POST `reasoning`/`windowTokens` 为**补丁
-字段**（未触碰保持现值）—— 思考强度 pill 只上行 `{reasoning}`）。
+**approval-request 只在 ask 类需问询时到来（权限预设矩阵决定）；deny 类（rm -rf 等
+不可逆命令）不再产生本帧** —— permission-denied 回注是普通 `tool-result{ok:false,error:…}`，
+模型继续（前端无需任何特殊路径）。应答只有 允许/拒绝 两键（**无附注框**）：拒绝一律
+无备注 = 服务端按 `user-interrupted` 收尾本轮。
+POST `/api/chat {sessionId?,text} → {sessionId}`；POST `/api/approval {sessionId,toolCallId,approve}`；
+POST `/api/interrupt`；GET/POST `/api/settings {baseUrl,model,apiKey?,reasoning?,windowTokens?,permission?}`
+（只回掩码；response 恒带 `reasoning`（off/low/medium/high，缺省 medium）、`window`（
+上下文窗口覆盖；未配置 → 缺省不带键 = 估算模式）与 `permission`（read-only/
+workspace-write/full-access，缺省 workspace-write；`permissionConfirmedAt`（epoch ms）仅在
+已记录时携带 —— full-access 风险确认记录，后端记录不强制）；POST `reasoning`/`windowTokens`/
+`permission` 为**补丁字段**（未触碰保持现值）—— 思考强度 pill 只上行 `{reasoning}`，
+访问模式 chip 只上行 `{permission}`）。
 S13 侧栏端点（S12 提供；缺失时前端逐项降级）：
 GET `/api/sessions → {sessions:[{sessionId,title,lastEventMs,stepCount,workspaceRoot}]}`
 （`workspaceRoot: string|null` = 会话所属项目文件夹，null → 「未知项目」）；
@@ -130,11 +140,14 @@ GET `/api/stats → {rssMb,heapMb,sessions,activeShells}`；GET `/api/tools → 
   running 帧到达时重置，见 style.css 对应段注释）。**顶栏只保留 会话名/连接状态**
   —— 品牌行移入侧栏 logoRow（dsh 语义）、设置入口移入侧栏底部 settingsArea、
   用量统计在 composer footer、**停止按钮移入 composer 发送钮左侧**（见下「五改 UI」）。
-- **审批语义**：approval-request 前必有 assistant-done + tool-start；UI modal 一次处理
-  一个（排队）。`approve` → 本地把卡恢复 running、等服务端 tool-result 落色；
-  `deny` 带理由 → 卡落「已拒绝（denied）」并显示拒因（服务端随后补失败回执）；
-  `deny` 无理由 → 服务端不落 tool 事件，终态 run-status=user-interrupted 到达时
-  所有 pending 审批卡统一置「已中断」（不再永脉冲）。
+- **审批语义（dsh ApprovalPanel 内嵌卡）**：approval-request 前必有 assistant-done +
+  tool-start；UI **内嵌审批卡**在 composer 上方 dock 停靠（run-strip 与 composer 卡
+  之间，同宽列），**队列一次一个**（第一等待项；快照保序）。`approve` → 卡收起、
+  本地把工具卡恢复 running、等服务端 tool-result 落色；`deny`（**无附注框** ——
+  dsh 并无）→ 服务端按无备注拒绝收尾本轮：不落 tool 事件，终态 run-status=
+  user-interrupted 到达时所有 pending 审批卡统一置「已中断」（不再永脉冲）。
+  **Esc = 该次拒绝语义**（与「拒绝」键完全同路径）；内嵌卡非 modal —— 焦点不强制
+  移入、无 Tab 陷阱，composer 保留可输入（发送仍由 runActive 门禁管制）。
 - **侧边栏（S13 · dsh SidebarRoot 复刻，仅「对话」区）**：会话单景区 + 底部统计
   （**无供应商区块**：协议开放任意 OpenAI 兼容端点，用户裁定无需列预设）。
   **工具 / MCP / 插件三个侧栏区块已删**（2026-08-28 五改：工具清单与 MCP 的入口只
@@ -246,6 +259,33 @@ GET `/api/stats → {rssMb,heapMb,sessions,activeShells}`；GET `/api/tools → 
    （`--warn`）、>95% 红（`--danger`）；纯逻辑 = `meter.js`（ratio/tier/aria 可单测）。
    说明：`window` 缺省按供应商 preset 估算（服务端契约；前端只消费，不推荐覆盖）。
 
+## 审批改版（2026-08-29 · dsh 式权限预设 + 内嵌审批卡）
+
+1. **权限预设三档**（服务端 `permission` 字段；缺省 `workspace-write` —— 表序即 chip 菜单序）：
+   `read-only` 只读（写/危险命令逐一问询）/ `workspace-write` 工作区写入（写文件直接
+   执行；ask 级问询、deny 级自动拒绝回注）/ `full-access` 全部访问（命令直接执行，
+   不再问询）。判定矩阵在服务端 `decidePermission`；前端只消费 `permission` +
+   `permissionConfirmedAt`。纯逻辑单一来源 = `permissions.js`（归一/标签/风险门）。
+2. **PermissionSelect chip**（composer 输入卡 footer 左置；dsh InputBar `.tools`）：
+   盾形 glyph 16 + 当前档标签 + chevron（`aria-label="访问模式，当前：{档}"`）；点击
+   展开三选菜单（dsh Menu 表面：glyph + 档标签 + 描述，当前档高亮；定位 = menu.js
+   `menuPosition` 视口钳制，外点/Esc/pointer-leave 关闭）。**切换即 POST**
+   `/api/settings {permission}`（防抖 300ms；失败回滚重读 + toast「访问模式保存失败，
+   已还原」—— 思考强度同步同纪律）。`read-only`/`workspace-write` 一键切换零确认；
+   **切 `full-access` 且无 `permissionConfirmedAt` → 一次性风险确认门**（复用删除确认
+   modal 视觉：危险说明 + 取消/确认；确认后 POST —— permissionConfirmedAt 由服务端
+   记录；已确认过 → 下次直接生效）。会话不可用（未配置密钥）时 chip 锁定。
+3. **内嵌审批卡**（替换旧居中 modal）：收到 approval-request 在 **run-strip 与
+   composer 卡之间的 dock** 渲染 dsh ApprovalPanel —— 等待审批 strip（warn 底 +
+   8px 状态点 +「等待你的批准」）+ 理由 headline（`{工具名} 请求执行命令`）+ 命令预览
+   mono 卡（JSON `cmd`/`command`/`path` 提取）+ 右下 **拒绝(outline)/允许(primary)**
+   双钮。**无附注框**（dsh 并无）；Esc = 该次拒绝；队列一次一个；已同意后卡收起、
+   tool 卡继续流式。审批中 composer 保留可输入、发送仍由 runActive 管制（dsh 语义是
+   pending 接管 composer 槽 —— 我们决策为内嵌 dock 不夺焦点，与单流模型一致，注明
+   于此）。旧 modal 的 DOM/CSS（`#approval`/`#approval-scrim`/`.approval`/.ap-sub/
+   .ap-command/.field-row）与相关 app.js 路径已移除；焦点陷阱（Tab 循环）不再适用
+   （非 modal），Esc 语义保留到新内嵌卡。
+
 ## 停止/发送/思考强度/命令/上下文环的接线速记
 
 - 停止：`renderHeader` 统一按 `snap.runActive` 显隐（元素已移入 composer-foot）；
@@ -253,3 +293,53 @@ GET `/api/stats → {rssMb,heapMb,sessions,activeShells}`；GET `/api/tools → 
   补丁字段（服务端其余字段保持现值）；
 - 上下文环：`ui.settings.windowTokens`（GET `window` 字段归一）+ 快照
   `usage.contextEstimateTokens`；无估算 → 整行隐藏（不装假值）。
+
+## 消息区保真（2026-08-29 · Wave 2：行级 meta / Think 思考行 / ToolRow 变体）
+
+1. **消息行 anatomy（dsh MessageItem 对齐）**：用户/助手行删除旧「作者标题行」
+   （`DevMate · 工作中/完成 + 时间` 恒显 top meta）—— **行级 meta** 移至正文下、
+   行尾弱化 caption，**hover（含 :focus-within）显现**：时钟（`formatMessageClock`
+   分日模板：同日 `HH:mm` / 今年 `M月d日 HH:mm` / 跨年 `yyyy/M/d HH:mm`；时刻只认
+   number / Date）+ icon-actions **复制**（clipboard API → 隐藏 textarea+execCommand
+   兜底；成功换对勾 1s 复原，`CLIPBOARD_FEEDBACK_MS=1000`）。复制载荷 = 正文纯文本
+   （`messageCopyText`）。**Ran-for**：助手行 done 后追加 `· Ran for 15s`
+   （`ranForCaption(formatDurationMs)`；数据 = 钟差 —— messages.js 每气泡
+   `startedAt→doneAt`，事件 duration 在 run-status 是 run 级、不落消息级，注明）。
+   行 meta 由 `buildMessageMeta` 装配，`updateRowChrome` 增量（时钟/Ran-for/思考）。
+   消息时刻锚 `at`（user/assistant 快照新增；session-user/addUser 入 item）。
+2. **Think 思考行（dsh ReasoningRow 折叠行）**：`reasoning` 协议帧（{text} 增量；
+   **服务端 emit.ts 尚未生产 —— 前端已前置消费，协议演进即点即亮**；mock 链路与
+   纯逻辑测试覆盖）→ messages.js 累积进当前回合助手气泡 `reasoning/thinkDone`，
+   done 折算 `ranForMs`。app.js：助手气泡顶部「思考」Disclosure 行（14px 灯 icon +
+   caption 12/18 + 单行摘要：**定稿=首行 / 流式=最新一行**，`thinkSummary` 截 120）+
+   chevron；**默认收起**；点击展开全文（惰性 textContent；`THINK_TEXT_CAP` 20k 护栏）；
+   流式展开即跟随增量；**done 收尾自动收起**（dsh 定稿收起语义）。纯逻辑 = format.js
+   `thinkSummary/thinkBodyText`，DOM 折叠态由 CDP 截图验证。
+3. **ToolRow 变体（dsh classifyTool / toolviews 对齐）**：`classifyTool` 六变体
+   （bash=run_command；read=read_file/list_dir；write=write_file；edit=edit_file；
+   search=grep/glob/web_search；其余 generic 原形态兜底）。行 anatomy = **变体 14px 图标
+   （失败/拒绝/中断 → StateDot 红）+ 变体标题（`TOOL_VARIANT_TITLES` 非 mono）
+   - 状态 + 单行摘要 + 结果首行 + chevron**；摘要变体源 = `toolSummaryArgs`：
+     bash = args.**description** ?? command 首 60；文件变体 = 路径；search = pattern；
+     generic = 原压平。展开块：bash/read → **单块 mono 滚动**（失败红字首行压平 + 全文；
+     TerminalBlock/ReadBlock 粗版）；write/edit → **DiffBlock 红-删/绿+加**（edit_file:
+     search→`- `行 / replace→`+ `行；空 replace=纯删除；write_file: content 全`+`行）；
+     search → **SearchBlock 命中行明黄**（含 pattern 大小写不敏感判定，`--`/上下文行
+     不标）。**全部惰性**（展开才渲染；单块 `BLOCK_MAX_CHARS=2000` 截断+「…（截断）」）。
+4. **StatsLine 分组**（B 节 statsline 对齐）：composer-dock 统计行改为 **组间 `|` /
+   组内 `·`** 分组：`5 步 | 15s | 入 48.2k · 出 1.4k · 总 49.6k | ≈$0.0042`
+   （组1 步数、组2 耗时、组3 入/出/总、组4 ≈成本）。**数据缺口注明**：turns/LLM-工具
+   耗时拆分/TTFT/tok/s/缓存命中 需 run-status 协议与 usage 缓存字段扩展 —— 现状保留
+   可得项，溢出省略 + hover tooltip 全文（CSS 原已有 ellipsis + `title`）。
+5. **空态语言（B6 EmptyHero 对齐局部）**：hero 标题改纯品牌 `DevMate` + 「**预览版**」
+   badge（r6 小字 chip）；三步引导保留（DevMate 本地差异化，见下方差异清单）。
+
+### 与 dsh 仍存差异（Wave 2 后）
+
+- thinking 数据源：`reasoning` 帧由协议/服务端生产（emit.ts 目前丢弃 reasoning 存储
+  事件 —— 不在本次范围；前端就绪即点即亮）。
+- 无 branch/fork 操作、无 inspect 跳转、文件路径 OS 打开（点击落 OS 需服务端握手）。
+- 复杂 diff（多 hunk 分组/DiffBlock 上下文行染色）未做 —— 两色整块粗版（搜索块为
+  命中行明黄）。
+- `Ran for` 为消息级钟差，非 run 级 duration 事件（run-status 无每消息时长）。
+- TurnNavigator / turn-process 折叠 / turn-tail 用量 Disclosure 未做（P2 之外）。

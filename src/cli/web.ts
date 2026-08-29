@@ -22,6 +22,8 @@
 import { loadConfig, loadStoredConfig, mergeConfig } from './config.js';
 import type { CliConfig, StoredConfig, StoredMcpServer, StoredWorkflowConfig } from './config.js';
 import { clampMaxParallel } from '../shared/workflow.js';
+import type { ReasoningEffort } from '../shared/llm-types.js';
+import type { PermissionPreset } from '../ui/server/index.js';
 
 /**
  * S12 接缝形状（任务书契约与 S12 实际接口的差异说明：S12 的 `createDevmateServer(deps)`、
@@ -48,7 +50,10 @@ export interface ServerModule {
 
 /**
  * 任务书 config 形状：交付给 assembleDeps 的引擎配置（S12 DevmateConfig 的超集字段
- * providerId/sessionsDir/windowTokens/systemPrompt/toolTimeoutMs 由 S12 缺省处理）。
+ * providerId/sessionsDir/systemPrompt/toolTimeoutMs 由 S12 缺省处理）。设置读回
+ * （B 档）：reasoning / permission / windowTokens 三键自 ~/.devmate/config.json
+ * 读回注入——assembleDeps 的 settings 初值随之播种（缺省不进文件 → 缺省字段不传，
+ * assembleDeps 回落 'medium'/'workspace-write'/供应商 preset 估算）。
  */
 export interface ServerConfig {
   workspaceRoot: string;
@@ -57,6 +62,12 @@ export interface ServerConfig {
   apiKey?: string;
   maxSteps?: number;
   costLimitUsd?: number;
+  /** 思考强度持久值（config.json settings 写路径的读回键；缺省 'medium'）。 */
+  reasoning?: ReasoningEffort;
+  /** 权限预设持久值（读回键；缺省 'workspace-write'）。 */
+  permission?: PermissionPreset;
+  /** 上下文窗口覆盖持久值（读回键；缺省 = 供应商 preset 估算）。 */
+  windowTokens?: number;
 }
 
 /** web 子命令生效参数。 */
@@ -189,6 +200,9 @@ export function buildServerConfig(config: {
   apiKey?: string;
   maxSteps?: number;
   costLimitUsd?: number;
+  reasoning?: ReasoningEffort;
+  permission?: PermissionPreset;
+  windowTokens?: number;
 }): ServerConfig {
   const out: ServerConfig = {
     workspaceRoot: config.workspaceRoot,
@@ -198,6 +212,9 @@ export function buildServerConfig(config: {
   if (config.apiKey !== undefined) out.apiKey = config.apiKey;
   if (config.maxSteps !== undefined) out.maxSteps = config.maxSteps;
   if (config.costLimitUsd !== undefined) out.costLimitUsd = config.costLimitUsd;
+  if (config.reasoning !== undefined) out.reasoning = config.reasoning;
+  if (config.permission !== undefined) out.permission = config.permission;
+  if (config.windowTokens !== undefined) out.windowTokens = config.windowTokens;
   return out;
 }
 
@@ -243,6 +260,11 @@ export async function runWeb(args: string[], io: RunWebIo): Promise<number> {
     ...(config.apiKey !== undefined ? { apiKey: config.apiKey } : {}),
     ...(config.maxSteps !== undefined ? { maxSteps: config.maxSteps } : {}),
     ...(config.costLimitUsd !== undefined ? { costLimitUsd: config.costLimitUsd } : {}),
+    // B 档设置读回：{permission, reasoning, windowTokens} 自 config.json 同键读回
+    // （persistSettings 写出的键；缺省不写 → 缺省字段不传，assembleDeps 回落各自缺省）
+    ...(stored.reasoning !== undefined ? { reasoning: stored.reasoning } : {}),
+    ...(stored.permission !== undefined ? { permission: stored.permission } : {}),
+    ...(stored.windowTokens !== undefined ? { windowTokens: stored.windowTokens } : {}),
   });
   let deps: unknown;
   try {
@@ -253,9 +275,29 @@ export async function runWeb(args: string[], io: RunWebIo): Promise<number> {
   }
   // 设置持久化：POST /api/settings 落盘（mergeConfig 单点合并写——只覆盖 settings 键，
   // maxSteps/costLimitUsd/skills/workflow/mcp 等既有键全保留；patch 显式 apiKey:undefined
-  // = 删除该键）。saveConfig 0600 写 io.configPath 由 mergeConfig 负责（目录/模式纠正）。
-  const persistSettings = (s: { baseUrl: string; model: string; apiKey?: string }): void => {
-    mergeConfig(io.configPath, { baseUrl: s.baseUrl, model: s.model, apiKey: s.apiKey });
+  // = 删除该键；reasoning/windowTokens/permission/permissionConfirmedAt 只在快照携带时写
+  // ——服务端补丁语义本来就在触碰时才携带）。saveConfig 0600 写 io.configPath 由
+  // mergeConfig 负责（目录/模式纠正）。
+  const persistSettings = (s: {
+    baseUrl: string;
+    model: string;
+    apiKey?: string;
+    reasoning?: ReasoningEffort;
+    windowTokens?: number;
+    permission?: PermissionPreset;
+    permissionConfirmedAt?: number;
+  }): void => {
+    mergeConfig(io.configPath, {
+      baseUrl: s.baseUrl,
+      model: s.model,
+      apiKey: s.apiKey,
+      ...(s.reasoning !== undefined ? { reasoning: s.reasoning } : {}),
+      ...(s.windowTokens !== undefined ? { windowTokens: s.windowTokens } : {}),
+      ...(s.permission !== undefined ? { permission: s.permission } : {}),
+      ...(s.permissionConfirmedAt !== undefined
+        ? { permissionConfirmedAt: s.permissionConfirmedAt }
+        : {}),
+    });
   };
   // 三节初值加载（读 config.json 相应节；缺省：skillsRecord {} = 全开、workflow true/2、
   // mcpServers []）；workflow 初值夹紧 1-4（0/7 等在保存路径由服务端 POST 400，此处只夹初值）。

@@ -36,10 +36,11 @@ describe('ui/server/emit：SSE 序列化（纯函数）', () => {
     expect(pingFrame()).toBe(': ping\n\n');
   });
 
-  it('协议事件名单完整（10 类）且字段形状全量通过序列化', () => {
+  it('协议事件名单完整（11 类）且字段形状全量通过序列化', () => {
     const frames: SseEventData[] = [
       { event: 'session-user', data: { text: '' } },
       { event: 'assistant-delta', data: { text: '' } },
+      { event: 'reasoning', data: { text: '' } },
       { event: 'assistant-done', data: { content: '', toolCalls: [] } },
       { event: 'tool-start', data: { id: 'a', name: 'echo', arguments: '{}' } },
       {
@@ -70,6 +71,16 @@ describe('ui/server/emit：SSE 序列化（纯函数）', () => {
       expect(text.startsWith(`event: ${frame.event}\ndata: `)).toBe(true);
       expect(text.endsWith('\n\n')).toBe(true);
     }
+  });
+
+  it('reasoning 帧逐字序列化：delta text（含换行）为单行 JSON，不破坏帧边界', () => {
+    expect(serializeEvent({ event: 'reasoning', data: { text: 'im' } })).toBe(
+      'event: reasoning\ndata: {"text":"im"}\n\n',
+    );
+    const frame: SseEventData = { event: 'reasoning', data: { text: 'a\nb' } };
+    const text = serializeEvent(frame);
+    expect(text.match(/\n\n/g)).toHaveLength(1);
+    expect(text).toContain('"text":"a\\nb"');
   });
 
   it('compaction 帧逐字序列化：缺省 token 键不带入 JSON，data 单行', () => {

@@ -21,7 +21,13 @@ describe('用户消息与会话', () => {
       ['session-user', { text: '第二句话' }],
     ]);
     expect(snap.items.map((i) => i.kind)).toEqual(['user', 'user']);
-    expect(snap.items[0]).toEqual({ id: expect.any(String), kind: 'user', text: '帮我改代码' });
+    // Wave 2：user 快照携带 at（行 meta 时钟锚；只认 number）
+    expect(snap.items[0]).toEqual({
+      id: expect.any(String),
+      kind: 'user',
+      text: '帮我改代码',
+      at: expect.any(Number),
+    });
     expect(snap.title).toBe('帮我改代码');
   });
 
@@ -176,6 +182,35 @@ describe('审批', () => {
     const snap = store.snapshot();
     expect(snap.approvals).toHaveLength(0);
     expect(snap.items.find((i) => i.kind === 'assistant')?.tools[0]?.state).toBe('running');
+  });
+
+  it('队列保序一次一个：两个等待项先呈现第一个，应答后第二个才呈现', () => {
+    // 内嵌审批卡 = snap.approvals[0]（渲染层）；快照保序 → 一次一个语义成立
+    const store = createMessageStore();
+    store.dispatch(ev('assistant-delta', { text: '先看' }));
+    store.dispatch(ev('tool-start', { id: 't1', name: 'bash', arguments: '{"cmd":"a"}' }));
+    store.dispatch(
+      ev('approval-request', { toolCallId: 't1', name: 'bash', arguments: '{"cmd":"a"}' }),
+    );
+    store.dispatch(ev('tool-start', { id: 't2', name: 'bash', arguments: '{"cmd":"b"}' }));
+    store.dispatch(
+      ev('approval-request', { toolCallId: 't2', name: 'bash', arguments: '{"cmd":"b"}' }),
+    );
+    // snapshot() 由 JS 推断：approvals 初始字面量 [] → never[]；测试只用可读字段，
+    // 以显式形状归一去断言（tsc 视角最小断言，与文件既有 cast 风格一致）
+    type Snap = {
+      approvals: Array<{ toolCallId: string }>;
+      items: Array<{ kind: string; tools?: Array<{ state: string }> }>;
+    };
+    const mid = store.snapshot() as Snap;
+    expect(mid.approvals.map((a) => a.toolCallId)).toEqual(['t1', 't2']); // 保序
+    expect(mid.approvals[0]?.toolCallId).toBe('t1'); // 内嵌卡只呈现第一个
+    // 应答第一个（无附注框拒绝只可能无备注）→ 队列余项就地成为第一个
+    store.decideApproval('t1', false, '');
+    const next = store.snapshot() as Snap;
+    expect(next.approvals.map((a) => a.toolCallId)).toEqual(['t2']);
+    expect(next.approvals[0]?.toolCallId).toBe('t2');
+    expect(next.items.find((i) => i.kind === 'assistant')?.tools?.[0]?.state).toBe('pending');
   });
 
   it('拒绝（带理由）→ 卡 denied、结果含「用户拒绝执行」与理由', () => {
@@ -605,5 +640,62 @@ describe('setTitle（历史恢复标题）', () => {
     expect(store.snapshot().title).toBe('来自历史会话的标题');
     store.reset();
     expect(store.snapshot().title).toBe('');
+  });
+});
+
+describe('Wave 2：reasoning 思考帧与行 meta 数据（Think Disclosure / Ran-for 钟差）', () => {
+  it('reasoning 增量累积进当前助手气泡；快照携带 reasoning/thinkDone', () => {
+    const snap = run([
+      ['reasoning', { text: '第一段' }],
+      ['reasoning', { text: '第二段' }],
+      ['assistant-delta', { text: '结论' }],
+    ]);
+    const a = snap.items.find((i) => i.kind === 'assistant');
+    expect(a?.reasoning).toBe('第一段第二段');
+    expect(a?.thinkDone).toBe(false);
+  });
+
+  it('reasoning 先于 delta 到达：自建气泡（非孤立帧）', () => {
+    const snap = run([['reasoning', { text: '独自到达' }]]);
+    const a = snap.items.find((i) => i.kind === 'assistant');
+    expect(a).toBeTruthy();
+    expect(a?.reasoning).toBe('独自到达');
+  });
+
+  it('assistant-done：thinkDone=true；Ran-for 钟差落定（doneAt-startedAt 非负 number）', () => {
+    const store = createMessageStore();
+    store.dispatch(ev('assistant-delta', { text: 'a' }));
+    store.dispatch(ev('reasoning', { text: '想' }));
+    store.dispatch(ev('assistant-done', { content: 'a', toolCalls: [] }));
+    const a = store.snapshot().items.find((i) => i.kind === 'assistant');
+    expect(a?.thinkDone).toBe(true);
+    expect(typeof a?.ranForMs).toBe('number');
+    expect((a?.ranForMs ?? -1) as number).toBeGreaterThanOrEqual(0);
+    expect(a?.at).toEqual(expect.any(Number));
+  });
+
+  it('定稿后迟到 reasoning 帧并入最后一条助手气泡（不回退新建）', () => {
+    const store = createMessageStore();
+    store.dispatch(ev('assistant-delta', { text: 'a' }));
+    store.dispatch(ev('assistant-done', { content: 'a', toolCalls: [] }));
+    store.dispatch(ev('reasoning', { text: '迟到' }));
+    const as = store.snapshot().items.filter((i) => i.kind === 'assistant');
+    expect(as).toHaveLength(1);
+    expect(as[0]?.reasoning).toBe('迟到');
+  });
+
+  it('reset 清空 reasoning（会话切换后思考行消失）', () => {
+    const store = createMessageStore();
+    store.dispatch(ev('reasoning', { text: 'x' }));
+    store.reset();
+    expect(store.snapshot().items).toHaveLength(0);
+  });
+
+  it('user 快照携带 at（行 meta 时钟锚）', () => {
+    const store = createMessageStore();
+    store.addUser('hi');
+    expect(store.snapshot().items[0]?.at).toEqual(expect.any(Number));
+    store.dispatch(ev('session-user', { text: 'sse' }));
+    expect(store.snapshot().items[1]?.at).toEqual(expect.any(Number));
   });
 });

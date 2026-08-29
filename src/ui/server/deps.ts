@@ -61,7 +61,13 @@ import { connectMcpServer, createMcpTools } from '../../core/mcp/index.js';
 import type { McpClient, McpClientFactory } from '../../core/mcp/index.js';
 import type { Tool } from '../../core/loop/types.js';
 import { deriveTitle, sessionWorkspaceOf } from './emit.js';
-import type { DevmateServerDeps, McpServerConfig, SessionLister, SessionSummary } from './index.js';
+import type {
+  DevmateServerDeps,
+  McpServerConfig,
+  PermissionPreset,
+  SessionLister,
+  SessionSummary,
+} from './index.js';
 
 export interface DevmateConfig {
   /** 工作区根：监狱默认边界（启动目录），同时是 run_command 初值 cwd。 */
@@ -81,6 +87,10 @@ export interface DevmateConfig {
   windowTokens?: number | undefined;
   /** 思考强度初值（缺省 'medium'——CTO 裁定；设置页可改，persist 走 settings）。 */
   reasoning?: ReasoningEffort | undefined;
+  /** 权限预设初值（缺省 'workspace-write'——CTO 裁定；设置页可改，persist 走 settings）。 */
+  permission?: PermissionPreset | undefined;
+  /** full-access 风险确认记录（可选；前端风险门后写入——纯记录、不强制）。 */
+  permissionConfirmedAt?: number | undefined;
   systemPrompt?: string | undefined;
   toolTimeoutMs?: number | undefined;
   /** 空闲 shell TTL（ms；缺省 DEFAULT_IDLE_SHELL_TTL_MS = 600_000）。 */
@@ -785,10 +795,16 @@ export async function assembleDeps(config: DevmateConfig): Promise<DevmateServer
       // C 档：思考强度初值（缺省 'medium'）+ 窗口覆盖（缺省 = preset 估算——见 presets
       // contextWindowTokens 的「估算，可在设置覆盖」注释；GET /api/settings 的 window）
       reasoning: config.reasoning ?? 'medium',
+      // 权限预设定案：缺省 'workspace-write'（与 index 的 DEFAULT_PERMISSION_PRESET 同值——
+      // 语义单一来源在该常量与矩阵，此处仅装配初始值）
+      permission: config.permission ?? 'workspace-write',
       ...(config.apiKey !== undefined ? { apiKey: config.apiKey } : {}),
       ...(config.windowTokens !== undefined
         ? { windowTokens: config.windowTokens }
         : { windowTokens: provider.contextWindowTokens }),
+      ...(config.permissionConfirmedAt !== undefined
+        ? { permissionConfirmedAt: config.permissionConfirmedAt }
+        : {}),
     },
     runOptions,
   };

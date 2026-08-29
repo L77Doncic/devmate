@@ -15,7 +15,7 @@ import type { LlmAdapter } from '../../src/core/loop/index.js';
 import { MemorySessionAdapter } from '../../src/core/session/index.js';
 import type { ChatRequest, StreamEvent } from '../../src/shared/llm-types.js';
 import { createSessionToolsFactory } from '../../src/ui/server/deps.js';
-import { echoTool, FakeLlm } from '../loop/support.js';
+import { FakeLlm, runCommandTool } from '../loop/support.js';
 import { canonicalTmpBase, shellCwdForm } from '../shell-tools/support.js';
 import { postJson, SseClient, startServer, waitForFrames } from './support.js';
 
@@ -34,8 +34,10 @@ class RoutingLlm implements LlmAdapter {
   }
 }
 
-const CALL_A = { id: 'call-a', name: 'echo', arguments: '{"text":"a"}' };
-const CALL_B = { id: 'call-b', name: 'echo', arguments: '{"text":"b"}' };
+// ask 级命令（echo=未知→ask）：默认档（workspace-write）下触发 approval-request——
+// 隔离用例的目标正是「各自挂着各自的审批请求」
+const CALL_A = { id: 'call-a', name: 'run_command', arguments: '{"command":"echo a"}' };
+const CALL_B = { id: 'call-b', name: 'run_command', arguments: '{"command":"echo b"}' };
 
 describe('ui/server：会话隔离', () => {
   const servers: DevmateServer[] = [];
@@ -59,7 +61,7 @@ describe('ui/server：会话隔离', () => {
     const store = new MemorySessionAdapter();
     const { base, server } = await startServer({
       store,
-      tools: defineRegistry([echoTool()], { sessionId: 's1' }),
+      tools: defineRegistry([runCommandTool()], { sessionId: 's1' }),
       llm: new RoutingLlm(routes),
       model: 'test-model',
     });

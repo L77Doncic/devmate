@@ -40,10 +40,23 @@ import {
   loadSettings,
   saveSettings,
   saveReasoning,
+  savePermission,
   REASONING_VALUES,
   REASONING_LABELS,
   REASONING_DEFAULT,
 } from './settings.js';
+import {
+  PERMISSION_VALUES,
+  PERMISSION_DESCRIPTIONS,
+  PERMISSION_DEFAULT,
+  permissionLabel,
+  permissionGlyph,
+  normalizePermission,
+  shouldConfirmRisk,
+  RISK_CONFIRM_TITLE,
+  RISK_CONFIRM_TEXT,
+} from './permissions.js';
+import { bannerFromApproval } from './approval-banner.js';
 import {
   SUBAGENT_DEFAULTS,
   SUBAGENT_LOCAL_NOTE,
@@ -102,13 +115,11 @@ import {
   statusTone,
   runStatusLine,
   formatArguments,
-  argSummary,
   toolSummaryLine,
   compactionLine,
   compactionSummary,
   composerStatsLine,
   elapsedText,
-  formatTime,
   shortId,
   truncate,
   timeAgo,
@@ -119,6 +130,21 @@ import {
   TOOL_STATE_LABEL,
   formatTokens,
   formatCostUsd,
+  // Wave 2 消息行 chrome / ToolRow 变体（纯逻辑全部在 format.js，可单测）
+  formatMessageClock,
+  ranForCaption,
+  CLIPBOARD_FEEDBACK_MS,
+  messageCopyText,
+  thinkSummary,
+  thinkBodyText,
+  classifyTool,
+  TOOL_VARIANT_TITLES,
+  toolSummaryArgs,
+  buildDiffLines,
+  buildReadBlock,
+  buildSearchLines,
+  parseToolArguments,
+  BLOCK_MAX_CHARS,
 } from './format.js';
 
 // ============================================================== 常量
@@ -148,10 +174,21 @@ const ui = {
     // C 档：思考强度（缺省 'medium'）与上下文窗口覆盖（缺省 null = 估算模式）
     reasoning: REASONING_DEFAULT,
     windowTokens: null,
+    // 权限预设（缺省 workspace-write）与 full-access 风险确认记录（GET 返回才非 null）
+    permission: PERMISSION_DEFAULT,
+    permissionConfirmedAt: null,
   },
   sessionId: null,
-  modalApproval: null,
-  modalOpen: false,
+  // 内嵌审批卡：currentApproval = 当前呈现项（快照 approvals[0] 的视图模型）；
+  // deciding = 应答已点、POST 在途（双纽防双发，dsh「应答后 disabled」同语义）
+  currentApproval: null,
+  approvalDeciding: false,
+  // 访问模式 chip：菜单开关 + 防抖 300ms 提交（同思考强度纪律）+ 风险确认门态
+  permMenuOpen: false,
+  permissionSyncPending: null,
+  permissionSyncTimer: 0,
+  riskConfirmOpen: false,
+  riskConfirmTarget: null,
   toastTimer: 0,
   rafPending: false,
   dirtyItems: new Set(),
@@ -225,13 +262,24 @@ const el = {
   sessionTitle: document.getElementById('session-title'),
   sessionId: document.getElementById('session-id'),
   toast: document.getElementById('toast'),
-  approval: document.getElementById('approval'),
-  approvalScrim: document.getElementById('approval-scrim'),
-  approvalName: document.getElementById('approval-name'),
-  approvalArgs: document.getElementById('approval-args'),
-  approvalReason: document.getElementById('approval-reason'),
-  btnApprove: document.getElementById('btn-approve'),
-  btnDeny: document.getElementById('btn-deny'),
+  // 内嵌审批卡（dsh ApprovalPanel 本地形态：composer 上方 dock）
+  approvalDock: document.getElementById('approval-dock'),
+  approvalHeadline: document.getElementById('approval-headline'),
+  approvalCommand: document.getElementById('approval-command'),
+  btnBannerApprove: document.getElementById('btn-banner-approve'),
+  btnBannerDeny: document.getElementById('btn-banner-deny'),
+  // PermissionSelect 访问模式 chip + 菜单（dsh Menu 表面）
+  permChip: document.getElementById('perm-chip'),
+  permGlyph: document.getElementById('perm-glyph'),
+  permLabel: document.getElementById('perm-label'),
+  permMenu: document.getElementById('perm-menu'),
+  // 全部访问风险确认门（复用删除确认 modal 视觉）
+  riskConfirm: document.getElementById('risk-confirm'),
+  riskScrim: document.getElementById('risk-scrim'),
+  riskTitle: document.getElementById('risk-confirm-title'),
+  riskText: document.getElementById('risk-confirm-text'),
+  btnRiskOk: document.getElementById('btn-risk-ok'),
+  btnRiskCancel: document.getElementById('btn-risk-cancel'),
   // 命令（/）下拉 + 面板
   cmdMenu: document.getElementById('cmd-menu'),
   cmdPanel: document.getElementById('cmd-panel'),
@@ -1000,7 +1048,201 @@ function paintAssistant(id) {
   }
 }
 
-// ============================================================== 消息装配
+// ============================================================== 消息装配（Wave 2：dsh 行级 meta）
+
+/**
+ * 行 meta（dsh MessageIconActions 局部形态：**消息正文下 hover 显现**）：
+ * 时钟（formatMessageClock 分日模板）+ icon-actions（复制 clipboard —— 成功换对勾 1s）。
+ * 无作者标题行（dsh 无；DevMate 旧「DevMate · 工作中」作者 meta 已删 —— meta 精简去重）。
+ * 位置 = 行尾弱化 caption。author 由位置 + 侧栏品牌承载。
+ */
+function buildMessageMeta() {
+  const meta = document.createElement('div');
+  meta.className = 'msg-meta';
+  const time = document.createElement('time');
+  time.className = 'msg-time';
+  const ran = document.createElement('span');
+  ran.className = 'msg-run';
+  ran.hidden = true;
+  const actions = document.createElement('span');
+  actions.className = 'icon-actions';
+  const copyBtn = document.createElement('button');
+  copyBtn.type = 'button';
+  copyBtn.className = 'icon-action';
+  copyBtn.setAttribute('aria-label', '复制消息');
+  copyBtn.title = '复制消息';
+  copyBtn.append(copyActionIcon('copy'), copyActionIcon('check'));
+  copyBtn.addEventListener('click', () => {
+    void copyMessageFeedback(meta.dataset.itemId, copyBtn);
+  });
+  actions.appendChild(copyBtn);
+  meta.append(time, ran, actions);
+  return { root: meta, time, ran };
+}
+
+function copyActionIcon(kind) {
+  const svg = document.createElementNS('http://www.w3.org/2000/svg', 'svg');
+  svg.setAttribute('viewBox', '0 0 16 16');
+  svg.setAttribute('aria-hidden', 'true');
+  const path = document.createElementNS('http://www.w3.org/2000/svg', 'path');
+  path.setAttribute('fill', 'none');
+  path.setAttribute('stroke', 'currentColor');
+  path.setAttribute('stroke-width', '1.4');
+  if (kind === 'copy') {
+    svg.setAttribute('class', 'ic-copy');
+    path.setAttribute(
+      'd',
+      'M5.6 3.2h5.6l2 2v4.9a.9.9 0 0 1-.9.9H6.5a.9.9 0 0 1-.9-.9v-6.9zm2.6 8.3v.6c0 .5-.4.9-.9.9H4.3a.9.9 0 0 1-.9-.9V6.4c0-.5.4-.9.9-.9h.6',
+    );
+  } else {
+    svg.setAttribute('class', 'ic-check');
+    path.setAttribute('d', 'M3.6 8.6l3 3 5.8-7');
+  }
+  svg.appendChild(path);
+  return svg;
+}
+
+/** 复制反馈（icon-actions 复制 → 对勾 1s 复原；dsh MessageIconActions 同语义）。 */
+function copyMessageFeedback(itemId, btn) {
+  const view = ui.lastSnap?.items.find((it) => it.id === itemId) ?? null;
+  const text = messageCopyText(view);
+  if (!text) return;
+  void copyText(text).then((ok) => {
+    if (!ok) {
+      toast('复制失败', 'warn');
+      return;
+    }
+    btn.classList.add('copied');
+    btn.setAttribute('aria-label', '已复制');
+    btn.title = '已复制';
+    window.clearTimeout(btn._copyTimer);
+    btn._copyTimer = window.setTimeout(() => {
+      btn.classList.remove('copied');
+      btn.setAttribute('aria-label', '复制消息');
+      btn.title = '复制消息';
+    }, CLIPBOARD_FEEDBACK_MS);
+  });
+}
+
+/** clipboard API 优先；非安全上下文/被拒 → 隐藏 textarea + execCommand 兜底。 */
+function copyText(text) {
+  const t = String(text ?? '');
+  if (!t) return Promise.resolve(false);
+  try {
+    const nav = navigator.clipboard;
+    if (nav && typeof nav.writeText === 'function') {
+      return nav.writeText(t).then(
+        () => true,
+        () => legacyCopy(t),
+      );
+    }
+  } catch {
+    // 非安全上下文等：落兜底
+  }
+  return Promise.resolve(legacyCopy(t));
+}
+
+function legacyCopy(text) {
+  const ta = document.createElement('textarea');
+  ta.value = String(text);
+  ta.setAttribute('readonly', '');
+  ta.style.position = 'fixed';
+  ta.style.top = '0';
+  ta.style.left = '0';
+  ta.style.opacity = '0';
+  document.body.appendChild(ta);
+  ta.select();
+  let ok = false;
+  try {
+    ok = document.execCommand('copy');
+  } catch {
+    ok = false;
+  }
+  ta.remove();
+  return ok;
+}
+
+/** 思考折叠行（dsh ReasoningRow 本地形态：default 收起；摘要 = 定稿首行 / 流式末行）。 */
+function buildThinkRow(itemId) {
+  const root = document.createElement('div');
+  root.className = 'think-row';
+  const toggle = document.createElement('button');
+  toggle.type = 'button';
+  toggle.className = 'think-toggle';
+  toggle.setAttribute('aria-expanded', 'false');
+  toggle.title = '思考过程';
+  const icon = document.createElementNS('http://www.w3.org/2000/svg', 'svg');
+  icon.setAttribute('viewBox', '0 0 16 16');
+  icon.setAttribute('class', 'think-icon');
+  icon.setAttribute('aria-hidden', 'true');
+  const bulb = document.createElementNS('http://www.w3.org/2000/svg', 'path');
+  bulb.setAttribute('fill', 'none');
+  bulb.setAttribute('stroke', 'currentColor');
+  bulb.setAttribute('stroke-width', '1.2');
+  bulb.setAttribute(
+    'd',
+    'M8 2.2a3.7 3.7 0 0 1 3.7 3.7c0 1.5-.9 2.4-1.6 3.1-.3.3-.5.6-.5.9H6.4c0-.3-.2-.6-.5-.9-.7-.7-1.6-1.6-1.6-3.1A3.7 3.7 0 0 1 8 2.2zM6.6 10.6h2.8v1H6.6zM6.7 12.2h2.6v1H6.7z',
+  );
+  icon.appendChild(bulb);
+  const caption = document.createElement('span');
+  caption.className = 'think-caption';
+  caption.textContent = '思考';
+  const summary = document.createElement('span');
+  summary.className = 'think-summary';
+  const body = document.createElement('div');
+  body.className = 'think-body';
+  body.hidden = true;
+  toggle.append(icon, caption, summary);
+  root.append(toggle, body);
+  const think = {
+    root,
+    toggle,
+    body,
+    open: false,
+    built: false,
+    current: '',
+    itemId,
+  };
+  // 惰性：全文只在首次展开时写入 textContent；展开期间流式增量即时跟随（接管写入）
+  toggle.addEventListener('click', () => {
+    const open = think.open;
+    think.open = !open;
+    toggle.setAttribute('aria-expanded', String(!open));
+    body.hidden = open;
+    if (!open) {
+      // 展开：全文首次懒写入（超限截断 + 注记）
+      body.textContent = thinkBodyText(think.current);
+      think.built = true;
+    }
+  });
+  return think;
+}
+
+/** 思考行增量同步（renderItems 每帧收口）：摘要位/展开态/收尾收起（dsh 定稿收起）。 */
+function updateThink(think, item) {
+  const has = Boolean(item.reasoning);
+  if (!has) {
+    think.root.hidden = true;
+    return;
+  }
+  think.root.hidden = false;
+  think.current = item.reasoning;
+  think.toggle.querySelector('.think-summary').textContent = thinkSummary(
+    item.reasoning,
+    item.done,
+  );
+  // 定稿收尾：回到默认收起（dsh 语义——流式期间可手动展开选中，done 后收起）
+  if (item.done && think.open) {
+    think.open = false;
+    think.toggle.setAttribute('aria-expanded', 'false');
+    think.body.hidden = true;
+  }
+  // 展开：跟随流式增量（懒写入窗口已开 —— 折叠时 body 为空，不占 DOM）
+  if (think.open) {
+    think.body.textContent = thinkBodyText(think.current);
+    think.built = true;
+  }
+}
 
 function createItemEl(item) {
   const row = document.createElement('div');
@@ -1009,38 +1251,36 @@ function createItemEl(item) {
   if (item.kind === 'user') {
     const bubble = document.createElement('div');
     bubble.className = 'bubble';
-    const meta = document.createElement('div');
-    meta.className = 'msg-meta';
-    const time = document.createElement('time');
-    time.className = 'msg-time';
-    time.textContent = formatTime(Date.now());
-    meta.appendChild(time);
     const text = document.createElement('span');
     text.className = 'bubble-text';
     text.textContent = item.text; // 纯文本（CSS pre-wrap 保留换行）
-    bubble.append(meta, text);
-    row.appendChild(bubble);
+    bubble.appendChild(text);
+    // 行 meta 从「气泡内右上」移到气泡下方 hover 显现（dsh 行级 meta）
+    const meta = buildMessageMeta();
+    meta.root.dataset.itemId = item.id;
+    meta.time.textContent = formatMessageClock(item.at);
+    timeDateTime(meta.time, item.at);
+    row.append(bubble, meta.root);
+    row._metaTime = meta.time;
+    row._metaRan = meta.ran;
   } else if (item.kind === 'assistant') {
     const bubble = document.createElement('div');
     bubble.className = 'bubble';
-    const meta = document.createElement('div');
-    meta.className = 'msg-meta';
-    const author = document.createElement('span');
-    author.className = 'msg-author';
-    author.textContent = 'DevMate';
-    const state = document.createElement('span');
-    state.className = 'msg-time';
-    state.textContent = '· 工作中';
-    const time = document.createElement('time');
-    time.className = 'msg-time';
-    time.textContent = formatTime(Date.now());
-    meta.append(author, state, time);
+    // 思考折叠行（dsh ReasoningRow：先于正文 —— reasoning 常先于 delta 到达）
+    const think = buildThinkRow(item.id);
     const body = document.createElement('div');
     body.className = 'markdown bubble-body';
-    bubble.append(meta, body);
-    row.appendChild(bubble);
+    bubble.append(think.root, body);
+    // 行 meta（正文/工具卡之后、行尾弱化 caption；hover 显现 —— 作者行已删）
+    const meta = buildMessageMeta();
+    meta.root.dataset.itemId = item.id;
+    meta.time.textContent = formatMessageClock(item.at);
+    timeDateTime(meta.time, item.at);
+    row.append(bubble, meta.root);
     row._body = body;
-    row._stateText = state;
+    row._think = think;
+    row._metaTime = meta.time;
+    row._metaRan = meta.ran;
   } else if (item.kind === 'compaction') {
     // 上下文压缩披露（dsh context-injection-disclosure 理念本地形态）：
     // 折叠小记 —— 默认单行，展开才渲染摘要全文（懒惰；textContent only）
@@ -1076,8 +1316,27 @@ function createItemEl(item) {
   return row;
 }
 
-function updateAssistantMeta(node, item) {
-  node._stateText.textContent = `· ${item.done ? '完成' : item.error ? '出错' : '工作中'}`;
+/** <time> 机器可读值（原子集文案；dateTime 只认 number）。 */
+function timeDateTime(timeEl, ts) {
+  const t = Number(ts);
+  if (Number.isFinite(t)) timeEl.dateTime = new Date(t).toISOString();
+}
+
+/**
+ * 行 chrome 增量（dsh MessageIconActions：时钟 + Ran-for + 思考行；meta hover 显隐由
+ * CSS 驱动 —— 本函数只写内容）。时钟分日模板单一源 = formatMessageClock；
+ * Ran-for = 事件钟差（messages.js ranForMs，done 后才存在）。
+ */
+function updateRowChrome(node, item) {
+  node._metaTime.textContent = formatMessageClock(item.at);
+  if (typeof item.ranForMs === 'number' && item.ranForMs !== null) {
+    node._metaRan.textContent = ranForCaption(item.ranForMs);
+    node._metaRan.hidden = false;
+  } else {
+    node._metaRan.textContent = '';
+    node._metaRan.hidden = true;
+  }
+  if (node._think) updateThink(node._think, item);
 }
 
 /** 长会话折叠摘要行：DOM 中恒为唯一一个（超限折叠计数来自 store.foldedCount）。 */
@@ -1113,7 +1372,7 @@ function renderItems(snap) {
         node.querySelector('.bubble-text').textContent = item.text;
       }
     } else if (item.kind === 'assistant') {
-      updateAssistantMeta(node, item);
+      updateRowChrome(node, item);
       updateTools(node, item.tools);
       // 签名变化=内容变化（长度/定稿/出错翻转）→ 每帧至多重绘一次；
       // 已定稿且无新事件即不再重绘（修掉旧实现「每次 emit 全量重绘已完成消息」）。
@@ -1149,7 +1408,143 @@ function renderItems(snap) {
   renderFoldNote(snap);
 }
 
-// ============================================================== 工具卡
+// ============================================================== 工具卡（Wave 2：ToolRow 变体）
+
+/** 变体 leading 图标（14px currentColor；dsh ToolRow 各变体 icon 本地形态）。 */
+function variantIconSvg(variant) {
+  const svg = document.createElementNS('http://www.w3.org/2000/svg', 'svg');
+  svg.setAttribute('viewBox', '0 0 16 16');
+  svg.setAttribute('class', 'tool-icon');
+  svg.setAttribute('aria-hidden', 'true');
+  const path = document.createElementNS('http://www.w3.org/2000/svg', 'path');
+  path.setAttribute('fill', 'none');
+  path.setAttribute('stroke', 'currentColor');
+  path.setAttribute('stroke-width', '1.3');
+  path.setAttribute('stroke-linecap', 'round');
+  path.setAttribute('stroke-linejoin', 'round');
+  if (variant === 'bash') {
+    path.setAttribute('d', 'M3.2 3.4h9.6v9.2H3.2zM5.6 6.2l2.1 1.9-2.1 1.9M9.2 10h1.8');
+  } else if (variant === 'read') {
+    path.setAttribute('d', 'M4.4 2.6h4.8l2.4 2.4v8.2H4.4zM9 2.8v2.4h2.5M5.8 8h4.4M5.8 10.4h4.4');
+  } else if (variant === 'write' || variant === 'edit') {
+    path.setAttribute('d', 'M3.5 12.5l.6-2.7 7.4-7.4 2.1 2.1-7.4 7.4-2.7.6z');
+  } else if (variant === 'search') {
+    path.setAttribute('d', 'M7 3.6a2.9 2.9 0 1 1-.01 5.8A2.9 2.9 0 0 1 7 3.6zM9.2 9.4l3.2 3.2');
+  } else {
+    path.setAttribute('d', 'M3.2 3.2h9.6v9.6H3.2zM6 6.4h.01M10 6.4h.01M6 10h.01M10 10h.01');
+  }
+  svg.appendChild(path);
+  return svg;
+}
+
+/** 卡体（tool-body）按变体重建：generic = 参数/输出双卡（原形态）；bash/read =
+ *  正文 mono 块；write/edit = DiffBlock；search = SearchBlock。**内容全惰性**：
+ *  只有展开（或已在展开态收到更新）才写入 —— 折叠态零正文 DOM。 */
+function ensureToolCardVariant(card, variant) {
+  if (card._variant === variant) return;
+  card._variant = variant;
+  card._lazyBuilt = false;
+  card._plan = null;
+  const inner = card._inner;
+  inner.replaceChildren();
+  card._argLabel = null;
+  card._args = null;
+  card._result = null;
+  card._lineEl = null;
+  if (variant === 'generic') {
+    const argsLabel = document.createElement('div');
+    argsLabel.className = 'tool-args-label';
+    argsLabel.textContent = '参数';
+    const args = document.createElement('pre');
+    args.className = 'tool-args';
+    const outLabel = document.createElement('div');
+    outLabel.className = 'tool-args-label';
+    outLabel.textContent = '输出';
+    const result = document.createElement('pre');
+    result.className = 'tool-result';
+    inner.append(argsLabel, args, outLabel, result);
+    card._argLabel = argsLabel;
+    card._args = args;
+    card._result = result;
+  } else if (variant === 'bash' || variant === 'read') {
+    // Terminal/ReadBlock 形态粗版：单块 mono 滚动（bash 失败含错误首行红字）
+    const outLabel = document.createElement('div');
+    outLabel.className = 'tool-args-label';
+    outLabel.textContent = variant === 'bash' ? '输出' : '内容';
+    const block = document.createElement('pre');
+    block.className = 'tool-block';
+    inner.append(outLabel, block);
+    card._argLabel = outLabel;
+    card._result = block;
+  } else {
+    // DiffBlock / SearchBlock：行渲染（红-删/绿+加 / 命中行明黄）
+    const lines = document.createElement('div');
+    lines.className = variant === 'search' ? 'tool-search' : 'tool-diff';
+    inner.appendChild(lines);
+    card._lineEl = lines;
+  }
+}
+
+/** 展开态渲染收口（惰性：第一次展开或展开中收到更新才落 DOM；块上限 BLOCK_MAX_CHARS）。 */
+function flushToolCard(card) {
+  const plan = card._plan;
+  if (!plan) return;
+  if (card._variant === 'generic') return flushGenericBlocks(card);
+  if (card._variant === 'bash' || card._variant === 'read') {
+    if (card._lazyBuilt) return;
+    card._lazyBuilt = true;
+    card._result.textContent = toolBlockText(plan);
+    card._result.classList.toggle('err', !(plan.result?.ok ?? true));
+    return;
+  }
+  if (card._variant === 'write' || card._variant === 'edit') {
+    if (card._lazyBuilt) return;
+    card._lazyBuilt = true;
+    card._lineEl.replaceChildren(
+      ...buildDiffLines(plan.args, BLOCK_MAX_CHARS).lines.map((l) => {
+        const div = document.createElement('div');
+        div.className = `tool-diff-line ${l.type}`;
+        div.textContent = (l.type === 'del' ? '- ' : l.type === 'add' ? '+ ' : '') + l.text;
+        return div;
+      }),
+    );
+    return;
+  }
+  // search
+  if (card._lazyBuilt) return;
+  card._lazyBuilt = true;
+  const args = parseToolArguments(plan.args);
+  const content = plan.result?.content || plan.result?.preview || '';
+  const pattern = args && typeof args.pattern === 'string' ? args.pattern : '';
+  card._lineEl.replaceChildren(
+    ...buildSearchLines(content, pattern, BLOCK_MAX_CHARS).lines.map((l) => {
+      const div = document.createElement('div');
+      div.className = 'tool-search-line' + (l.hit ? ' hit' : '');
+      div.textContent = l.text;
+      return div;
+    }),
+  );
+}
+
+/** generic 双卡惰性（原守卫行为：pending 引用，展开落一次）。 */
+function flushGenericBlocks(card) {
+  if (card._args._pending !== null) {
+    card._args.textContent = card._args._pending;
+    card._args._pending = null;
+  }
+  if (card._result._pending !== null) {
+    card._result.textContent = card._result._pending;
+    card._result._pending = null;
+  }
+}
+
+/** bash/read 单块正文：失败首行错误（压平）+ 全量内容；上限截断 + 注记。 */
+function toolBlockText(plan) {
+  const full = plan.result?.content || plan.result?.preview || '';
+  const errPrefix =
+    plan.result && !plan.result.ok && plan.result.error ? `${plan.result.error}\n` : '';
+  return buildReadBlock(errPrefix + full, BLOCK_MAX_CHARS).text;
+}
 
 function buildToolCard() {
   const card = document.createElement('div');
@@ -1160,10 +1555,10 @@ function buildToolCard() {
   head.className = 'tool-head';
   head.setAttribute('aria-expanded', 'false');
 
-  const dot = document.createElement('span');
-  dot.className = 'tool-dot';
-  const name = document.createElement('span');
-  name.className = 'tool-name';
+  const leading = document.createElement('span');
+  leading.className = 'tool-leading';
+  const title = document.createElement('span');
+  title.className = 'tool-title';
   const state = document.createElement('span');
   state.className = 'tool-state';
   const argSum = document.createElement('span');
@@ -1182,23 +1577,12 @@ function buildToolCard() {
   path.setAttribute('stroke', 'currentColor');
   path.setAttribute('stroke-width', '1.6');
   chev.appendChild(path);
-  head.append(dot, name, state, argSum, resSum, spacer, chev);
+  head.append(leading, title, state, argSum, resSum, spacer, chev);
 
   const body = document.createElement('div');
   body.className = 'tool-body';
   const inner = document.createElement('div');
   inner.className = 'tool-body-inner';
-  const argsLabel = document.createElement('div');
-  argsLabel.className = 'tool-args-label';
-  argsLabel.textContent = '参数';
-  const args = document.createElement('pre');
-  args.className = 'tool-args';
-  const outLabel = document.createElement('div');
-  outLabel.className = 'tool-args-label';
-  outLabel.textContent = '输出';
-  const result = document.createElement('pre');
-  result.className = 'tool-result';
-  inner.append(argsLabel, args, outLabel, result);
   body.appendChild(inner);
 
   head.addEventListener('click', () => {
@@ -1207,54 +1591,61 @@ function buildToolCard() {
     head.setAttribute('aria-expanded', String(open));
     body.classList.toggle('open', open);
     // DOM 轻量：只有展开时才把「待写全文」真正放进 textContent
-    if (open) flushToolPending(card);
+    if (open) flushToolCard(card);
   });
 
   card.append(head, body);
   card._head = head;
-  card._dot = dot;
+  card._leading = leading;
   card._state = state;
   card._argSum = argSum;
   card._resSum = resSum;
-  card._args = args;
-  card._result = result;
+  card._inner = inner;
+  card._result = null;
+  card._args = null;
+  card._lazyBuilt = false;
+  card._variant = null;
+  card._plan = null;
   card._open = false;
-  card._args._pending = null;
-  card._result._pending = null;
   return card;
 }
 
-function flushToolPending(card) {
-  if (card._args._pending !== null) {
-    card._args.textContent = card._args._pending;
-    card._args._pending = null;
-  }
-  if (card._result._pending !== null) {
-    card._result.textContent = card._result._pending;
-    card._result._pending = null;
+/** leading 槽：失败/拒绝/中断 → StateDot（红/琥珀，dsh error→StateDot）；其余 → 变体图标。 */
+function setToolLeading(leading, variant, state) {
+  const isError = state === 'failed' || state === 'denied' || state === 'interrupted';
+  if (isError) {
+    const dot = document.createElement('span');
+    dot.className = `tool-dot ${state}`;
+    leading.replaceChildren(dot);
+  } else {
+    leading.replaceChildren(variantIconSvg(variant));
   }
 }
 
 function updateToolCard(card, t) {
-  card._dot.className = `tool-dot ${t.state}`;
+  const variant = classifyTool(t.name);
+  ensureToolCardVariant(card, variant);
+  setToolLeading(card._leading, variant, t.state);
   card._state.className = `tool-state ${t.state}`;
   card._state.textContent = TOOL_STATE_LABEL[t.state] ?? statusLabel(t.state);
-  card._head.querySelector('.tool-name').textContent = t.name || '(未命名工具)';
-  // 单行摘要（dsh 卡片哲学本地形态）：参数压平单行 + 结果首行（失败走 errorSummary 压平）。
-  card._argSum.textContent = argSummary(t.arguments);
+  // 变体标题（dsh tool.title.*：非 mono）；原始工具名进 title 悬浮语义
+  card._head.querySelector('.tool-title').textContent = TOOL_VARIANT_TITLES[variant];
+  card._head.title = t.name || '(未命名工具)';
+  card._argSum.textContent = toolSummaryArgs(t.arguments, variant);
   card._resSum.textContent = toolSummaryLine(t.result);
   card._resSum.classList.toggle('err', !(t.result?.ok ?? true));
-  // DOM 轻量：参数/结果全量只在「展开时」才渲染进 DOM（协议 tool-result.content，
-  // 服务端 64KB 缓冲上限内完整；折叠卡只保留待写引用，展开时落一次）
-  card._args._pending = formatArguments(t.arguments);
-  const full = t.result?.content || t.result?.preview || '';
-  // 无内容占位只分两档（运行中 vs 其余）：failed/denied/interrupted 与其它无内容态
-  // （pending/done-waiting-result/success 但无结果）原来各自返回同一个「（无输出）」——
-  // 枚举间无差异，合并为一个分支（否则死三元）。
-  card._result._pending = full || (t.state === 'running' ? '（还没有输出）' : '（无输出）');
-  card._result.classList.toggle('err', !(t.result?.ok ?? true));
+  // 展开块待写（惰性引用：折叠不落 DOM；展开一次落成；块上限 BLOCK_MAX_CHARS）
+  card._plan = { args: t.arguments, result: t.result, state: t.state };
+  if (card._variant === 'generic') {
+    if (card._args) card._args._pending = formatArguments(t.arguments);
+    const full = t.result?.content || t.result?.preview || '';
+    if (card._result) {
+      card._result._pending = full || (t.state === 'running' ? '（还没有输出）' : '（无输出）');
+      card._result.classList.toggle('err', !(t.result?.ok ?? true));
+    }
+  }
   // 默认折叠：单行摘要是消息流的扫视面；展开（含全量 body）由用户主动触发
-  if (card._open) flushToolPending(card);
+  if (card._open) flushToolCard(card);
 }
 
 /** 工具卡增量同步（keyed by tool id）。 */
@@ -1275,9 +1666,10 @@ function updateTools(node, tools) {
       node._toolEls.set(t.id, card);
       slot.appendChild(card);
     }
-    // 签名含折叠态可扫视部分（状态/名称/参数摘要/结果摘要首行）；
-    // 不含 content 全量 — 全文只在展开时写入，不参与「要不要重渲染」判定
-    const sig = `${t.state}|${t.name}|${argSummary(t.arguments)}|${toolSummaryLine(t.result)}`;
+    // 签名含折叠态可扫视部分（状态/名称/变体/参数变体摘要/结果摘要首行）；
+    // 不含块全量 — 块内容只在展开时写入，不参与「要不要重渲染」判定
+    const variant = classifyTool(t.name);
+    const sig = `${t.state}|${t.name}|${variant}|${toolSummaryArgs(t.arguments, variant)}|${toolSummaryLine(t.result)}`;
     if (card._sig !== sig) {
       card._sig = sig;
       updateToolCard(card, t);
@@ -1324,6 +1716,8 @@ function renderComposerStats(snap) {
   const line = composerStatsLine(snap.runStatus, snap.usage);
   el.composerStats.hidden = !line;
   el.composerStatsText.textContent = line;
+  // 溢出省略 + hover tooltip 全文（dsh StatsLine 同行为）
+  el.composerStatsText.title = line;
 }
 
 /**
@@ -1427,51 +1821,239 @@ function stopRunClock() {
   }
 }
 
-// ============================================================== 审批
+// ============================================================== 内嵌审批卡（dsh ApprovalPanel）
 
-function openApprovalModal(waiting) {
-  ui.modalApproval = waiting;
-  ui.modalOpen = true;
-  el.approvalName.textContent = waiting.name || '(未命名工具)';
-  el.approvalArgs.textContent = formatArguments(waiting.arguments);
-  el.approvalReason.value = '';
-  el.approvalScrim.hidden = false;
-  el.approval.hidden = false;
-  el.approvalReason.focus();
+/**
+ * 审批卡渲染（快照驱动）：approvals 队列**一次呈现一个**（第一个等待项；队列保序
+ * 在 messages.js）。已同意后卡收起、tool 卡继续流式（tool-result 随流落色）。
+ * 审批进行中 composer 保留可输入、发送仍由 runActive 管制（startStream 门禁）——
+ * dsh 语义是 pending 接管 composer 槽；我们决策为「内嵌 dock 不夺输入焦点，
+ * 仅挂起运行」，与既有单流模型一致（注明见 README-UI）。
+ */
+function renderApprovalBanner(snap) {
+  const view = bannerFromApproval(snap.approvals);
+  ui.currentApproval = view;
+  if (!view) {
+    el.approvalDock.hidden = true;
+    return;
+  }
+  el.approvalDock.hidden = false;
+  el.approvalHeadline.textContent = view.headline;
+  el.approvalCommand.textContent = view.command || '（无参数）';
+  el.btnBannerApprove.disabled = ui.approvalDeciding;
+  el.btnBannerDeny.disabled = ui.approvalDeciding;
 }
 
-function closeApprovalModal() {
-  ui.modalOpen = false;
-  ui.modalApproval = null;
-  el.approval.hidden = true;
-  el.approvalScrim.hidden = true;
-}
-
-function renderApprovals(snap) {
-  if (ui.modalOpen) return; // 队列一次一个：当前未决时不抢 UI
-  const waiting = snap.approvals[0];
-  if (waiting) openApprovalModal(waiting);
-}
-
-async function decideApproval(approve) {
-  const w = ui.modalApproval;
-  if (!w) return;
-  const reason = el.approvalReason.value.trim();
-  closeApprovalModal();
-  store.decideApproval(w.toolCallId, approve, reason); // 本地先行落色（卡立即变化）
+/** 应答（允许/拒绝；Esc 同拒绝语义）：本地先行落色（卡立即变化），再 POST。
+ *  无附注框（dsh 并无）→ 拒绝一律无备注 = 服务端 user-interrupted 收尾本轮。 */
+async function decideBannerApproval(approve) {
+  const w = ui.currentApproval;
+  if (!w || ui.approvalDeciding) return;
+  ui.approvalDeciding = true;
+  store.decideApproval(w.toolCallId, approve, ''); // 队列清该项（下一等待项随之呈现）
   if (approve) toast(`已批准 ${w.name}，继续执行……`);
   try {
     await fetchJson('/api/approval', {
       method: 'POST',
-      body: {
-        sessionId: ui.sessionId,
-        toolCallId: w.toolCallId,
-        approve,
-        ...(reason ? { reason } : {}),
-      },
+      body: { sessionId: ui.sessionId, toolCallId: w.toolCallId, approve },
     });
   } catch (err) {
     store.addSystem(`审批应答未送达：${err instanceof Error ? err.message : String(err)}`);
+  } finally {
+    ui.approvalDeciding = false;
+    if (ui.lastSnap) renderApprovalBanner(ui.lastSnap); // 双纽回放（防连点态滞留）
+  }
+}
+
+// ============================================================== PermissionSelect 访问模式 chip
+
+/** 档位 glyph（16 视口、currentColor；chip 与 menu 行共用同一几何 —— dsh
+ *  PermissionSelect：check 只读 / pencil 写 / 感叹号 full access）。 */
+function permGlyphSvg(kind) {
+  const svg = document.createElementNS('http://www.w3.org/2000/svg', 'svg');
+  svg.setAttribute('viewBox', '0 0 16 16');
+  svg.setAttribute('aria-hidden', 'true');
+  const path = document.createElementNS('http://www.w3.org/2000/svg', 'path');
+  path.setAttribute('fill', 'none');
+  path.setAttribute('stroke', 'currentColor');
+  path.setAttribute('stroke-width', '1.5');
+  path.setAttribute('stroke-linecap', 'round');
+  path.setAttribute('stroke-linejoin', 'round');
+  if (kind === 'check') {
+    path.setAttribute('d', 'M3.2 8.6l3.1 3L12.8 4.9');
+    svg.appendChild(path);
+  } else if (kind === 'pencil') {
+    path.setAttribute('d', 'M3.5 12.5l.6-2.7 7.4-7.4 2.1 2.1-7.4 7.4-2.7.6z');
+    svg.appendChild(path);
+  } else {
+    // alert（full access）：感叹号
+    path.setAttribute('d', 'M8 3.4v5.6');
+    svg.appendChild(path);
+    const dot = document.createElementNS('http://www.w3.org/2000/svg', 'circle');
+    dot.setAttribute('cx', '8');
+    dot.setAttribute('cy', '12.1');
+    dot.setAttribute('r', '1');
+    dot.setAttribute('fill', 'currentColor');
+    svg.appendChild(dot);
+  }
+  return svg;
+}
+
+/** 菜单行装配（选项 = PERMISSION_VALUES 单一来源；行 = glyph + 档标签 + 描述）。 */
+function buildPermMenu() {
+  el.permMenu.replaceChildren();
+  for (const value of PERMISSION_VALUES) {
+    const item = document.createElement('button');
+    item.type = 'button';
+    item.className = 'perm-menu-item';
+    item.dataset.permissionValue = value;
+    item.setAttribute('role', 'menuitemradio');
+    item.setAttribute('aria-label', permissionLabel(value));
+    const glyph = document.createElement('span');
+    glyph.className = 'pm-glyph';
+    glyph.setAttribute('aria-hidden', 'true');
+    glyph.appendChild(permGlyphSvg(permissionGlyph(value)));
+    const text = document.createElement('span');
+    text.className = 'pm-text';
+    const label = document.createElement('span');
+    label.className = 'pm-label';
+    label.textContent = permissionLabel(value);
+    const desc = document.createElement('span');
+    desc.className = 'pm-desc' + (value === 'full-access' ? ' warn' : '');
+    desc.textContent = PERMISSION_DESCRIPTIONS[value];
+    text.append(label, desc);
+    item.append(glyph, text);
+    item.addEventListener('click', () => {
+      void selectPermissionFromMenu(value);
+    });
+    el.permMenu.appendChild(item);
+  }
+  syncPermMenu();
+}
+
+/** 当前档回显（chip 标签/glyph + 菜单 current 高亮 + aria；单一收口）。 */
+function syncPermChip() {
+  const value = normalizePermission(ui.settings.permission);
+  el.permLabel.textContent = permissionLabel(value);
+  el.permGlyph.replaceChildren(permGlyphSvg(permissionGlyph(value)));
+  const label = `访问模式，当前：${permissionLabel(value)}`;
+  el.permChip.setAttribute('aria-label', label);
+  el.permChip.title = label;
+  syncPermMenu();
+}
+
+function syncPermMenu() {
+  const current = normalizePermission(ui.settings.permission);
+  for (const item of el.permMenu.querySelectorAll('.perm-menu-item')) {
+    const active = item.dataset.permissionValue === current;
+    item.classList.toggle('current', active);
+    item.setAttribute('aria-checked', String(active));
+  }
+}
+
+/** 菜单开关（定位 = menu.js 纯函数；chip 视口系锚 → fixed 落点，视口钳制）。 */
+function togglePermMenu(force) {
+  const open = force !== undefined ? force : !ui.permMenuOpen;
+  if (open) {
+    const rect = el.permChip.getBoundingClientRect();
+    el.permMenu.hidden = false; // 先解除隐藏：offsetWidth/Height 实测
+    const size = { width: el.permMenu.offsetWidth, height: el.permMenu.offsetHeight };
+    const pos = menuPosition(
+      { left: rect.left, top: rect.top, width: rect.width, height: rect.height },
+      size,
+      { width: window.innerWidth, height: window.innerHeight },
+    );
+    el.permMenu.style.left = `${pos.left}px`;
+    el.permMenu.style.top = `${pos.top}px`;
+    ui.permMenuOpen = true;
+    el.permChip.setAttribute('aria-expanded', 'true');
+  } else {
+    el.permMenu.hidden = true;
+    ui.permMenuOpen = false;
+    el.permChip.setAttribute('aria-expanded', 'false');
+  }
+}
+
+/** 菜单选中（档位切换收口）：当前档 no-op；full-access 且无确认记录 → 风险确认门；
+ *  其余一键切换（read-only/workspace-write 零确认），切换即 POST（防抖 300ms）。 */
+function selectPermissionFromMenu(value) {
+  const normalized = normalizePermission(value);
+  togglePermMenu(false);
+  if (normalized === ui.settings.permission) return; // 已在本档：不重复提交
+  if (shouldConfirmRisk(normalized, ui.settings.permissionConfirmedAt)) {
+    openRiskConfirm(normalized);
+    return;
+  }
+  applyPermission(normalized);
+}
+
+/** 本地先落档（chip 即时反馈）+ 防抖提交（失败回滚重读 + toast —— 思考强度同纪律）。 */
+function applyPermission(value) {
+  ui.settings = { ...ui.settings, permission: normalizePermission(value) };
+  syncPermChip();
+  schedulePermissionSync(value);
+}
+
+// --- 风险确认门（full-access 一次性：复用删除确认 modal 视觉，危险色调） ---
+
+function openRiskConfirm(target) {
+  ui.riskConfirmOpen = true;
+  ui.riskConfirmTarget = target;
+  el.riskTitle.textContent = RISK_CONFIRM_TITLE;
+  el.riskText.textContent = RISK_CONFIRM_TEXT;
+  el.riskScrim.hidden = false;
+  el.riskConfirm.hidden = false;
+  el.btnRiskOk.focus();
+}
+
+function closeRiskConfirm() {
+  ui.riskConfirmOpen = false;
+  ui.riskConfirmTarget = null;
+  el.riskConfirm.hidden = true;
+  el.riskScrim.hidden = true;
+}
+
+function confirmRiskAccess() {
+  const target = ui.riskConfirmTarget;
+  closeRiskConfirm();
+  if (!target) return;
+  applyPermission(target); // 确认后 POST（permissionConfirmedAt 由服务端记录）
+}
+
+// --- 权限同步（防抖 300ms；失败回滚重读 + toast） ---
+
+function schedulePermissionSync(value) {
+  ui.permissionSyncPending = value;
+  window.clearTimeout(ui.permissionSyncTimer);
+  ui.permissionSyncTimer = window.setTimeout(() => {
+    ui.permissionSyncTimer = 0;
+    void flushPermissionSync();
+  }, 300);
+}
+
+async function flushPermissionSync() {
+  window.clearTimeout(ui.permissionSyncTimer);
+  ui.permissionSyncTimer = 0;
+  const value = ui.permissionSyncPending;
+  ui.permissionSyncPending = null;
+  if (value === null || value === undefined) return;
+  try {
+    const saved = await savePermission(value);
+    ui.settings = { ...ui.settings, ...saved }; // 服务端权威回体（含 confirmedAt 记录）
+  } catch {
+    await revertPermission();
+    toast('访问模式保存失败，已还原', 'warn');
+  }
+  syncPermChip();
+}
+
+/** POST 失败回滚：GET 服务端态还原（GET 也失败 → 保持现显示，不猜测）。 */
+async function revertPermission() {
+  try {
+    const s = await loadSettings();
+    ui.settings = { ...ui.settings, ...s };
+  } catch {
+    // 服务端不可达：保持当前值（下次切换再试）
   }
 }
 
@@ -2065,6 +2647,7 @@ async function openSettings() {
     }
   }
   syncReasoningSeg(); // 服务端档位权威：回显（含窗口覆盖 —— meter 随之取值）
+  syncPermChip(); // 权限档位（含 permissionConfirmedAt 记录 —— 风险门判定依据）
   fillSettingsForm();
   // 设置页扩展区：Subagent 工作流（GET /api/workflow 同步；失败/缺端点降级本地）
   // + Skills/MCP 端点清单（缺失各自降级）
@@ -2373,6 +2956,8 @@ function renderComposer() {
   // 运行中不禁用发送钮：点击由 send() 门禁 toast「仍在运行」（不再静默吞）。
   const canSend = el.input.value.trim().length > 0 && inputUnlocked();
   el.send.disabled = !canSend;
+  // 访问模式 chip：会话不可用（未配置密钥）时锁定（dsh PermissionSelect locked 语义）
+  el.permChip.disabled = !inputUnlocked();
 }
 
 // ============================================================== 全局渲染收口
@@ -2392,7 +2977,7 @@ function render(snap) {
   renderStrip(snap);
   syncRunClock();
   renderComposer();
-  renderApprovals(snap);
+  renderApprovalBanner(snap);
   autoscroll();
 }
 
@@ -2401,20 +2986,31 @@ function render(snap) {
 function wireEvents() {
   el.send.addEventListener('click', send);
   el.stop.addEventListener('click', stopStream);
-  el.btnApprove.addEventListener('click', () => decideApproval(true));
-  el.btnDeny.addEventListener('click', () => decideApproval(false));
-  el.approvalReason.addEventListener('keydown', (e) => {
-    if (e.key === 'Enter' && !e.shiftKey && !e.isComposing) {
-      e.preventDefault();
-      decideApproval(true);
-    }
+  // 内嵌审批卡双键（无附注框 —— dsh ApprovalPanel：拒绝(outline)/允许(primary)）
+  el.btnBannerApprove.addEventListener('click', () => {
+    void decideBannerApproval(true);
   });
+  el.btnBannerDeny.addEventListener('click', () => {
+    void decideBannerApproval(false);
+  });
+  // 访问模式 chip：点击开菜单（菜单自身点击由行 handle 收口；外点/Esc 关闭）
+  el.permChip.addEventListener('click', () => {
+    togglePermMenu();
+  });
+  el.riskScrim.addEventListener('click', closeRiskConfirm);
+  el.btnRiskCancel.addEventListener('click', closeRiskConfirm);
+  el.btnRiskOk.addEventListener('click', confirmRiskAccess);
   document.addEventListener('keydown', (e) => {
-    // Esc 只收起面板：审批未被应答，服务端会按超时/拒绝兜底，UI 不臆断结果；
-    // 设置抽屉与删除确认同样支持 Esc 关闭。
+    // Esc：内嵌审批卡 = 该次拒绝（无备注拒绝 = 服务端 user-interrupted 收尾本轮，
+    // 与点「拒绝」键完全同语义 —— 内嵌卡非 modal，无焦点陷阱，仅在页内停靠）；
+    // 设置抽屉 / 删除确认 / 风险确认门同样支持 Esc 关闭。
     if (e.key === 'Escape') {
-      if (ui.modalOpen) {
-        closeApprovalModal();
+      if (ui.riskConfirmOpen) {
+        closeRiskConfirm();
+        return;
+      }
+      if (!el.approvalDock.hidden && ui.currentApproval) {
+        void decideBannerApproval(false);
         return;
       }
       if (ui.confirmOpen) {
@@ -2429,25 +3025,11 @@ function wireEvents() {
         closeCmdPanel();
         return;
       }
-      hideCommandMenu();
-    }
-    // 审批 modal 焦点陷阱：Tab / Shift+Tab 在 modal 可聚焦元素内循环
-    if (ui.modalOpen && e.key === 'Tab') {
-      const items = [
-        ...el.approval.querySelectorAll(
-          'button, [href], input, select, textarea, [tabindex]:not([tabindex="-1"])',
-        ),
-      ].filter((n) => !n.disabled && n.offsetParent !== null);
-      if (items.length === 0) return;
-      const first = items[0];
-      const last = items[items.length - 1];
-      if (e.shiftKey && document.activeElement === first) {
-        e.preventDefault();
-        last.focus();
-      } else if (!e.shiftKey && document.activeElement === last) {
-        e.preventDefault();
-        first.focus();
+      if (ui.permMenuOpen || !el.permMenu.hidden) {
+        togglePermMenu(false);
+        return;
       }
+      hideCommandMenu();
     }
   });
   el.btnSettings.addEventListener('click', openSettings);
@@ -2557,6 +3139,11 @@ function wireEvents() {
       if (event.target instanceof Node && el.cmdMenu.contains(event.target)) return;
       hideCommandMenu();
     }
+    if (ui.permMenuOpen || !el.permMenu.hidden) {
+      if (event.target instanceof Node && el.permMenu.contains(event.target)) return;
+      if (event.target instanceof Element && event.target.closest('#perm-chip')) return;
+      togglePermMenu(false);
+    }
   });
   // 输入离开即收起命令下拉（贴外层关闭不覆盖输入区的点击）
   el.input.addEventListener('blur', () => {
@@ -2573,10 +3160,11 @@ function wireEvents() {
       scheduleSidebarSettle();
     });
   }
-  // 卸载前 flush Subagent 工作流 / 思考强度挂起同步（best-effort：同源 POST 尽力送达）
+  // 卸载前 flush Subagent 工作流 / 思考强度 / 访问模式挂起同步（best-effort）
   window.addEventListener('pagehide', () => {
     if (ui.subagentSyncPending) void flushSubagentSync();
     if (ui.reasoningSyncPending !== null) void flushReasoningSync();
+    if (ui.permissionSyncPending !== null) void flushPermissionSync();
   });
 }
 
@@ -2610,6 +3198,9 @@ async function boot() {
   // 思考强度分段 pill（选项 = settings.js 常量；回显当前档位）
   buildReasoningSeg();
   syncReasoningSeg();
+  // 访问模式 chip（选项 = permissions.js 常量；回显当前档位 + 盾形 glyph）
+  buildPermMenu();
+  syncPermChip();
   // 窗口覆盖就绪：上下文环重新取值（首帧可能在 settings 未到前渲染过）
   if (ui.lastSnap) renderMeter();
 

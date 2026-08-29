@@ -9,7 +9,8 @@ import {
   renderBanner,
   runWeb,
 } from '../../src/cli/web.js';
-import type { RunWebIo, ServerModule } from '../../src/cli/web.js';
+import { mergeConfig } from '../../src/cli/config.js';
+import type { RunWebIo, ServerConfig, ServerModule } from '../../src/cli/web.js';
 
 /**
  * S14 CLI `web` 子命令规格：
@@ -203,6 +204,57 @@ describe('runWeb：启动冒烟（注入假 ServerModule，不真监听）', () 
     expect(events).toEqual(['close']);
   });
 
+  it('设置读回种子：持久三键写盘 → 重启（同文件重读）→ assembleDeps 收到持久值；清键 → 键缺省不传', async () => {
+    const configPath = join(tmpHome, '.devmate', 'config.json');
+    // 模拟上一进程 POST /api/settings 的持久化路径（mergeConfig 单点合并写）
+    mergeConfig(configPath, {
+      baseUrl: 'https://persist.example/v1',
+      model: 'm1',
+      reasoning: 'high',
+      permission: 'read-only',
+      windowTokens: 24_000,
+    });
+    const captured: Array<ServerConfig> = [];
+    const module: ServerModule = {
+      assembleDeps: async (config: ServerConfig) => {
+        captured.push(config);
+        return { assembled: true };
+      },
+      createDevmateServer: () => ({
+        listen: async () => ({ host: '127.0.0.1', port: 4321 }),
+        close: async () => undefined,
+      }),
+    };
+    const { rt } = makeRuntime([], { loadServerModule: async () => module });
+
+    await runWeb(['--no-open'], rt); // 启动 #1（读盘）
+    await runWeb(['--no-open'], rt); // 启动 #2 = 重启：同文件重读
+    expect(captured).toHaveLength(2);
+    for (const cfg of captured) {
+      expect(cfg).toMatchObject({
+        baseUrl: 'https://persist.example/v1',
+        model: 'm1',
+        reasoning: 'high',
+        permission: 'read-only',
+        windowTokens: 24_000,
+      });
+    }
+
+    // 清键（mergeConfig undefined = 删除键）→ 读回缺省：键不传（assembleDeps 回落各自缺省）
+    mergeConfig(configPath, {
+      reasoning: undefined,
+      permission: undefined,
+      windowTokens: undefined,
+    });
+    await runWeb(['--no-open'], rt);
+    expect(captured).toHaveLength(3);
+    const bare = captured[2]!;
+    expect(Object.prototype.hasOwnProperty.call(bare, 'reasoning')).toBe(false);
+    expect(Object.prototype.hasOwnProperty.call(bare, 'permission')).toBe(false);
+    expect(Object.prototype.hasOwnProperty.call(bare, 'windowTokens')).toBe(false);
+    expect(bare).toMatchObject({ baseUrl: 'https://persist.example/v1', model: 'm1' });
+  });
+
   it('saveConfig 作为 persistSettings 传入 createDevmateServer（POST /api/settings 落盘）', async () => {
     let captured: Record<string, unknown> | null = null;
     const module: ServerModule = {
@@ -238,6 +290,23 @@ describe('runWeb：启动冒烟（注入假 ServerModule，不真监听）', () 
       baseUrl: 'https://persist.example/v1',
       model: 'm1',
     });
+
+    // 扩展设置键（reasoning/windowTokens/permission/permissionConfirmedAt）：快照携带即落盘，
+    // 未携带的既有键保留（merge 语义——一次 POST 只写被触碰的键）
+    persist({
+      baseUrl: 'https://persist.example/v1',
+      model: 'm1',
+      reasoning: 'high',
+      permission: 'full-access',
+      permissionConfirmedAt: 424242,
+    });
+    expect(JSON.parse(readFileSync(configPath, 'utf8'))).toEqual({
+      baseUrl: 'https://persist.example/v1',
+      model: 'm1',
+      reasoning: 'high',
+      permission: 'full-access',
+      permissionConfirmedAt: 424242,
+    });
   });
 });
 
@@ -268,5 +337,28 @@ describe('buildServerConfig：任务书 config 形状（交付给 assembleDeps�
       model: 'm',
     });
     expect(Object.prototype.hasOwnProperty.call(cfg, 'apiKey')).toBe(false);
+  });
+
+  it('设置读回三键透传（reasoning/permission/windowTokens）；未提供 → 键缺省不落', () => {
+    const cfg = buildServerConfig({
+      workspaceRoot: '/ws',
+      baseUrl: 'https://x',
+      model: 'm',
+      reasoning: 'high',
+      permission: 'full-access',
+      windowTokens: 24_000,
+    });
+    expect(cfg).toMatchObject({
+      workspaceRoot: '/ws',
+      baseUrl: 'https://x',
+      model: 'm',
+      reasoning: 'high',
+      permission: 'full-access',
+      windowTokens: 24_000,
+    });
+    const bare = buildServerConfig({ workspaceRoot: '/ws', baseUrl: 'https://x', model: 'm' });
+    expect(Object.prototype.hasOwnProperty.call(bare, 'reasoning')).toBe(false);
+    expect(Object.prototype.hasOwnProperty.call(bare, 'permission')).toBe(false);
+    expect(Object.prototype.hasOwnProperty.call(bare, 'windowTokens')).toBe(false);
   });
 });

@@ -37,7 +37,8 @@
  *   回退内置占位页）。绑定 127.0.0.1（本机）。
  *
  * 直调形态（run 照单接，不修改 core）：run() 的四个依赖全被装饰注入——
- * store 观察器（追加事件 → broker）、llm tee（text 增量 → assistant-delta、
+ * store 观察器（追加事件 → broker；reasoning 事件只推尾部增量——去重基线见
+ * pendingReasoning）、llm tee（text 增量 → assistant-delta、reasoning 增量 → reasoning、
  * end/error 快照 → assistant-done）、registry 观察器（执行结果 → tool-result）、
  * 以及服务端自己实现的 Approver（emitted tool-start + approval-request、阻塞到
  * POST /api/approval；run 的 signal（interrupt）到达时按无备注拒绝收尾）。
@@ -71,6 +72,8 @@ import type {
   ToolRegistry,
 } from '../../core/loop/index.js';
 import { run } from '../../core/loop/index.js';
+// 命令安全分类器（S10；本模块只读消费：run_command 的 ask/deny 直拒矩阵输入）
+import { classify, type Verdict } from '../../core/tools/classify.js';
 import type { WorkflowConfig } from '../../shared/workflow.js';
 import { clampMaxParallel, DEFAULT_SUBAGENTS_ENABLED } from '../../shared/workflow.js';
 import type { SkillsIndex } from '../../core/tools/skill.js';
@@ -106,7 +109,27 @@ export { maskApiKey };
 // 公共接口（S14 CLI 依赖的形状；服务端构造注入全部依赖，测试用假）
 // ---------------------------------------------------------------------------
 
-/** 审批策略：true = 该调用需要人工审批（缺省全问 = CONTEXT「许可模式」Manual 档）。 */
+/**
+ * dsh 式权限预设（CTO 语义定案；settings 持久化，缺省 'workspace-write'）：
+ * - read-only（仅读）：fs 读类与只读命令放行；fs 写/编辑与 ask/deny 级命令 → ask（弹窗兜底）；
+ * - workspace-write（默认，自动（工作区写））：fs 全类放行；只读命令放行；ask 级 → ask；
+ *   deny 级（rm -rf 等不可逆）→ 不弹窗直接拒绝（permission-denied 回注 = 普通工具失败，模型继续）；
+ * - full-access（全访问）：全放行（含 deny 级——一次性风险确认门由前端负责，后端只记录
+ *   permissionConfirmedAt，不做强制后端门）。
+ */
+export type PermissionPreset = 'read-only' | 'workspace-write' | 'full-access';
+
+/** 预设枚举（settings 值校验的单一集合；GET 响应恒为一个枚举值）。 */
+export const PERMISSION_PRESETS: readonly PermissionPreset[] = [
+  'read-only',
+  'workspace-write',
+  'full-access',
+];
+
+/** 缺省预设（CTO 定案：workspace-write——写文件不再弹窗；dsh web shipped 同缺省）。 */
+export const DEFAULT_PERMISSION_PRESET: PermissionPreset = 'workspace-write';
+
+/** 审批策略（deps 覆写接缝）：true = 该调用需要人工审批；缺省走权限预设矩阵（见 decidePermission）。 */
 export type ApprovalPolicy = (call: ToolCall, sessionId: string) => boolean;
 
 export interface UiSettings {
@@ -117,6 +140,10 @@ export interface UiSettings {
   reasoning?: ReasoningEffort;
   /** 上下文窗口覆盖初值（缺省 = 供应商 preset 估算；测试/假 deps 可不给）。 */
   windowTokens?: number;
+  /** 权限预设初值（缺省 'workspace-write'——CTO 裁定；与 reasoning 同机制）。 */
+  permission?: PermissionPreset;
+  /** full-access 风险确认记录（epoch ms；前端二次确认后写入——纯记录、不强制）。 */
+  permissionConfirmedAt?: number;
 }
 
 export interface SettingsSnapshot {
@@ -127,6 +154,10 @@ export interface SettingsSnapshot {
   reasoning?: ReasoningEffort;
   /** 上下文窗口覆盖（同 reasoning 的触碰语义）。 */
   windowTokens?: number;
+  /** 权限预设（同触碰语义）。 */
+  permission?: PermissionPreset;
+  /** full-access 风险确认记录（同触碰语义）。 */
+  permissionConfirmedAt?: number;
 }
 
 /** 会话列表摘要（GET /api/sessions 的 sessions[] 元素）。 */
@@ -193,7 +224,7 @@ export interface DevmateServerDeps {
   model: string;
   /** 初始设置；缺省 {model: deps.model}。 */
   settings?: UiSettings;
-  /** 审批策略；缺省恒 true（全问）。 */
+  /** 审批策略覆写（true = 弹窗）；缺省 = 权限预设矩阵（decidePermission × current.permission）。 */
   approvalPolicy?: ApprovalPolicy;
   /** run 透传覆写（maxSteps/windowTokens/pricing 等）；store/tools/llm/approver/signal/model 由其接管。 */
   runOptions?: Partial<RunOptions>;
@@ -292,6 +323,12 @@ interface SessionCtx {
   readonly executed: Set<string>;
   /** 悬挂审批：toolCallId → settle。 */
   readonly pending: Map<string, (decision: ApprovalDecision) => void>;
+  /**
+   * 已推送的推理文本（当前 llm 周期；tee 的 reasoning 增量与存储 reasoning 事件的
+   * 去重基线——存储落的是整轮推理全文（agent.ts 逐轮追加），只推「尚未推送的尾部」）。
+   * 每次 teeLlm.chat 开始即清（新推理周期从头计）。
+   */
+  pendingReasoning: string;
   controller: AbortController | null;
   active: boolean;
 }
@@ -510,6 +547,36 @@ function eventFrames(ev: SessionEvent): SseEventData[] {
   return [{ event: 'compaction', data: out }];
 }
 
+// ---------------------------------------------------------------------------
+// reasoning 帧（Wave 2：思考增量；在线流逐步推送 / 历史回放折叠单帧）
+// ---------------------------------------------------------------------------
+
+/**
+ * 历史回放推理折叠帧的文本上限（字符；与 src/ui/web/format.js 的 THINK_TEXT_CAP 同值
+ * 20k——前端展示侧既有护栏，服务端回放在源头先截）。
+ */
+export const REASONING_TEXT_CAP = 20_000;
+/** 截断注记（与前端 thinkBodyText 的「…（截断）」标注同规：正文超出即附注）。 */
+export const REASONING_TRUNCATED_MARK = '…（截断）';
+
+/**
+ * 增量推导：content（存储侧整轮推理全文）与 pushed（已推送量）同前缀时取尾部增量；
+ * 未推过（pushed 空）→ 全文；两源漂移（前缀不匹配——防御，正常不可达）→ 全文兜底
+ * （宁重复不少字；下一 llm 周期从头计，不累积污染）。
+ */
+export function reasoningDeltaOf(content: string, pushed: string): string {
+  if (content.length >= pushed.length && content.startsWith(pushed)) {
+    return content.slice(pushed.length);
+  }
+  return content.length > 0 ? content : '';
+}
+
+/** 回放折叠帧的正文：≤ 上限原样；超出截断 + 注记（前端再按 THINK_TEXT_CAP 兜底）。 */
+export function reasoningFrameText(content: string): string {
+  if (content.length <= REASONING_TEXT_CAP) return content;
+  return content.slice(0, REASONING_TEXT_CAP) + REASONING_TRUNCATED_MARK;
+}
+
 function observeStore(inner: SessionStore, ctxFor: (id: string) => SessionCtx): SessionStore {
   return {
     create: (id) => inner.create(id),
@@ -543,6 +610,15 @@ function observeStore(inner: SessionStore, ctxFor: (id: string) => SessionCtx): 
               ...(outcome.error !== undefined ? { error: outcome.error } : {}),
             },
           });
+        }
+      } else if (wide.kind === 'reasoning') {
+        // 推理事件追加（agent 每次 runTurn 落整轮推理全文；tee 已在流内推过同一批增量）
+        // ——只推「尚未推送的尾部增量」（观察器模式与 compaction 同源；增量对账见
+        // ctx.pendingReasoning / reasoningDeltaOf）。
+        const delta = reasoningDeltaOf(wide.payload.content, ctx.pendingReasoning);
+        if (delta !== '') {
+          ctx.pendingReasoning += delta;
+          ctx.broker.push({ event: 'reasoning', data: { text: delta } });
         }
       } else if (wide.kind === 'event') {
         for (const frame of eventFrames(wide)) ctx.broker.push(frame);
@@ -579,6 +655,8 @@ function observeRegistry(inner: ToolRegistry, ctx: SessionCtx): ToolRegistry {
 function teeLlm(inner: LlmAdapter, ctx: SessionCtx): LlmAdapter {
   return {
     async *chat(request, signal) {
+      // 新推理周期：去重基线清零（存储推测事件是整轮全文，对账只在本周期内）
+      ctx.pendingReasoning = '';
       let content = '';
       let snapshot: StreamSnapshot | null = null;
       let done = false;
@@ -596,6 +674,10 @@ function teeLlm(inner: LlmAdapter, ctx: SessionCtx): LlmAdapter {
           if (ev.type === 'text') {
             content += ev.text;
             ctx.broker.push({ event: 'assistant-delta', data: { text: ev.text } });
+          } else if (ev.type === 'reasoning') {
+            // 思考增量即时镜像（实时性：模型边思考边推送；前端就地累积）
+            ctx.pendingReasoning += ev.text;
+            ctx.broker.push({ event: 'reasoning', data: { text: ev.text } });
           } else if (ev.type === 'end' || ev.type === 'error') {
             snapshot = ev.snapshot;
           }
@@ -613,14 +695,128 @@ function teeLlm(inner: LlmAdapter, ctx: SessionCtx): LlmAdapter {
   };
 }
 
-function makeApprover(ctx: SessionCtx, policy: ApprovalPolicy): Approver {
+// ---------------------------------------------------------------------------
+// 权限预设判定矩阵（CTO 语义定案；纯函数——单元测试逐格覆盖，无需 IO）
+// ---------------------------------------------------------------------------
+
+/** fs 读类工具（read-only/workspace-write/full-access 三档均放行）。 */
+const FS_READ_TOOLS = new Set(['read_file', 'list_dir', 'glob', 'grep']);
+/** fs 写/编辑工具（read-only → ask；workspace-write/full-access → 放行）。 */
+const FS_WRITE_TOOLS = new Set(['write_file', 'edit_file']);
+/** shell 工具（命令按 classify 三档裁定）。 */
+const SHELL_TOOL = 'run_command';
+
+/** 一次调用的矩阵类别（fs 读 / fs 写 / shell（含 classify 档位）/ 矩阵外普通工具）。 */
+export type PermissionCallClass =
+  | { kind: 'fs-read' }
+  | { kind: 'fs-write' }
+  | { kind: 'shell'; verdict: Verdict; reasons: readonly string[] }
+  | { kind: 'tool' };
+
+/** 调用 → 矩阵类别（run_command 的参数不可解析/无 command → 按未知命令 ask，不放行不明命令）。 */
+export function classifyPermissionCall(call: ToolCall): PermissionCallClass {
+  if (FS_WRITE_TOOLS.has(call.name)) return { kind: 'fs-write' };
+  if (FS_READ_TOOLS.has(call.name)) return { kind: 'fs-read' };
+  if (call.name === SHELL_TOOL) {
+    const command = shellCommandOf(call.arguments);
+    if (command !== undefined) {
+      const classification = classify(command);
+      return {
+        kind: 'shell',
+        verdict: classification.verdict,
+        reasons: classification.reasons ?? [],
+      };
+    }
+    return {
+      kind: 'shell',
+      verdict: 'ask',
+      reasons: ['run_command 参数不可用：命令为空/无法解析'],
+    };
+  }
+  // 矩阵外普通工具（use_skill/spawn_subagent/mcp_* 等）：dsh 口径——普通工具调用不产生
+  // 审批请求（A3）；三档均放行（真正的文件效应已由监狱层在工具执行期实施）。
+  return { kind: 'tool' };
+}
+
+/** run_command arguments JSON → command 字符串（畸形 → undefined；与 shell.ts 的解析口径一致）。 */
+function shellCommandOf(rawArguments: string): string | undefined {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(rawArguments);
+  } catch {
+    return undefined;
+  }
+  if (typeof parsed !== 'object' || parsed === null) return undefined;
+  const command = (parsed as Record<string, unknown>)['command'];
+  return typeof command === 'string' && command !== '' ? command : undefined;
+}
+
+/** 矩阵单格判定结果：'allow'（放行不弹窗）/ 'ask'（approval-request）/ deny（直拒回注）。 */
+export type PermissionDecision = 'allow' | 'ask' | { deny: true; reason: string };
+
+/**
+ * 权限判定矩阵（CTO 语义定案，逐格）：
+ * | 类别 \ 预设           | read-only | workspace-write（默认） | full-access |
+ * | fs 读（read/list/glob/grep） | allow | allow | allow |
+ * | fs 写/编辑（write_file/edit_file）| ask | allow | allow |
+ * | shell classify=read-only | allow | allow | allow |
+ * | shell classify=ask   | ask | ask | allow |
+ * | shell classify=deny（rm -rf 等） | ask | deny（不弹窗直接拒） | allow |
+ * | 矩阵外普通工具        | allow | allow | allow |
+ * 说明：deny 直拒（permission-denied 回注）只在 workspace-write 档保留——DevMate 无沙箱
+ * 执行层，这正是模型唯一可见的红色护栏；full-access = 用户经一次性风险确认后接受无障碍执行；
+ * read-only 档 deny 级命令走 ask（无执行层拦不下，必须问询兜底）。
+ */
+export function decidePermission(permission: PermissionPreset, call: ToolCall): PermissionDecision {
+  const cls = classifyPermissionCall(call);
+  switch (cls.kind) {
+    case 'fs-read':
+    case 'tool':
+      return 'allow';
+    case 'fs-write':
+      return permission === 'read-only' ? 'ask' : 'allow';
+    case 'shell':
+      switch (cls.verdict) {
+        case 'read-only':
+          return 'allow';
+        case 'ask':
+          return permission === 'full-access' ? 'allow' : 'ask';
+        case 'deny':
+          if (permission === 'read-only') return 'ask';
+          if (permission === 'workspace-write') {
+            return { deny: true, reason: permissionDeniedMessage(permission, cls.reasons) };
+          }
+          return 'allow';
+      }
+  }
+}
+
+/** deny 直拒的唯一拒因文案（dsh marker 风格 + classify 拒因；单一实现，测试逐字断言）。 */
+export function permissionDeniedMessage(
+  permission: PermissionPreset,
+  reasons: readonly string[],
+): string {
+  const details = reasons.length > 0 ? `：${reasons.join('；')}` : '';
+  return `[permission: 命令被安全策略拒绝 under ${permission} mode]${details}`;
+}
+
+/** approver 决策函数（依赖注入形态；decidePermission 的 sessionId 无关包装）。 */
+export type PermissionDecider = (call: ToolCall) => PermissionDecision;
+
+function makeApprover(ctx: SessionCtx, decide: PermissionDecider): Approver {
   return async (call: ToolCall): Promise<ApprovalDecision> => {
     ctx.callNames.set(call.id, call.name);
     ctx.broker.push({
       event: 'tool-start',
       data: { id: call.id, name: call.name, arguments: call.arguments },
     });
-    if (!policy(call, ctx.sessionId)) return 'allow';
+    const decision = decide(call);
+    if (decision === 'allow') return 'allow';
+    if (typeof decision === 'object') {
+      // deny 路径：不产生 approval-request（纯工具节点）——权限拒绝 = 普通工具失败消息，
+      // 回注 error.type='permission-denied'，模型继续（CTO 语义定案 #3/#6）
+      return { deny: true, reason: decision.reason, errorType: 'permission-denied' };
+    }
     ctx.broker.push({
       event: 'approval-request',
       data: { toolCallId: call.id, name: call.name, arguments: call.arguments },
@@ -663,8 +859,10 @@ const HISTORY_SLICE_EVENTS = 720;
  * （流式 delta 已不可再得——历史只落终态，哑式合并为 done；toolCalls 保真）+
  * 有结果的调用补 tool-start（approval 前置与 result 配对可还原）；tool → tool-result
  * （name 由 assistant 登记的 callNames 映射，缺失回退 unknown）；
- * event（type compaction）→ compaction 帧（其余 event 类型仍丢弃）；system/reasoning
- * 不入协议帧。title 规则与列表一致（首条 user 文本前 40 字符 /（空会话））。
+ * event（type compaction）→ compaction 帧（其余 event 类型仍丢弃）；
+ * reasoning → **折叠为一条** reasoning 帧（同一 assistant 预案的连续多条推理事件拼接为
+ * 完整正文；≤ REASONING_TEXT_CAP 截断注记），按事件序置于其 assistant 之前；
+ * system 不入协议帧。title 规则与列表一致（首条 user 文本前 40 字符 /（空会话））。
  *
  * 裁剪语义（audit 双一致）：按**帧数**计（≤HISTORY_FRAME_LIMIT 帧），并从尾部回退到
  * 帧级切点后做**剧集边界对齐**：
@@ -741,7 +939,26 @@ async function sessionDetailFrames(
         return [];
     }
   };
-  const groups = recent.map(framesOf);
+  // 推理折叠扫描：连续 reasoning 事件缓冲入 pendingReasoning（同 assistant 预案——
+  // agent 每轮至多一条，多条防御性拼接），下一个非推理事件前 flush 为一条折叠帧；
+  // 尾部残存（会话止于推理事件）照常 flush（不丢审计内容，帧序=事件序）。
+  const groups: SseEventData[][] = [];
+  let pendingReasoning: string | null = null;
+  const flushReasoning = (): void => {
+    if (pendingReasoning !== null) {
+      groups.push([{ event: 'reasoning', data: { text: reasoningFrameText(pendingReasoning) } }]);
+      pendingReasoning = null;
+    }
+  };
+  for (const ev of recent) {
+    if (ev.kind === 'reasoning') {
+      pendingReasoning = (pendingReasoning ?? '') + ev.payload.content;
+      continue;
+    }
+    flushReasoning();
+    groups.push(framesOf(ev));
+  }
+  flushReasoning();
   let total = 0;
   for (const group of groups) total += group.length;
   let window: SseEventData[][];
@@ -954,6 +1171,7 @@ export function createDevmateServer(deps: DevmateServerDeps): DevmateServer {
         callNames: new Map(),
         executed: new Set(),
         pending: new Map(),
+        pendingReasoning: '',
         controller: null,
         active: false,
       };
@@ -978,7 +1196,9 @@ export function createDevmateServer(deps: DevmateServerDeps): DevmateServer {
     return guarded;
   }
 
-  const approvalPolicy = deps.approvalPolicy ?? (() => true);
+  // 审批决策：deps.approvalPolicy 覆写（测试/无头模式注入）?? 权限预设矩阵。
+  // 矩阵经 current.permission 每次调用现读——POST /api/settings 后即时生效（与 reasoning 同机制）。
+  const approvalPolicy = deps.approvalPolicy;
   const heartbeatMs = deps.heartbeatMs ?? 30_000;
   const observedStore = observeStore(deps.store, ctxFor);
 
@@ -1038,14 +1258,22 @@ export function createDevmateServer(deps: DevmateServerDeps): DevmateServer {
     reasoning: ReasoningEffort;
     /** 上下文窗口覆盖（C 档；未提供 = 未知（不传 runOptions，压缩不触发）。 */
     windowTokens?: number;
+    /** 权限预设（权限预设定案：缺省 'workspace-write'；POST /api/settings 即时生效）。 */
+    permission: PermissionPreset;
+    /** full-access 风险确认记录（epoch ms；前端风险门后写入——纯记录、不强制）。 */
+    permissionConfirmedAt?: number;
   }
   const current: CurrentSettings = {
     baseUrl: deps.settings?.baseUrl ?? '',
     model: deps.settings?.model ?? deps.model,
     reasoning: deps.settings?.reasoning ?? 'medium',
+    permission: deps.settings?.permission ?? DEFAULT_PERMISSION_PRESET,
     ...(deps.settings?.apiKey !== undefined ? { apiKey: deps.settings.apiKey } : {}),
     ...(deps.settings?.windowTokens !== undefined
       ? { windowTokens: deps.settings.windowTokens }
+      : {}),
+    ...(deps.settings?.permissionConfirmedAt !== undefined
+      ? { permissionConfirmedAt: deps.settings.permissionConfirmedAt }
       : {}),
   };
 
@@ -1092,7 +1320,13 @@ export function createDevmateServer(deps: DevmateServerDeps): DevmateServer {
             store: observedStore,
             tools: observeRegistry(tools, ctx),
             llm: teeLlm(llm, ctx),
-            approver: makeApprover(ctx, approvalPolicy),
+            approver: makeApprover(ctx, (call) =>
+              approvalPolicy !== undefined
+                ? approvalPolicy(call, sessionId)
+                  ? 'ask'
+                  : 'allow'
+                : decidePermission(current.permission, call),
+            ),
             model: current.model,
             signal: controller.signal,
           },
@@ -1645,6 +1879,8 @@ export function createDevmateServer(deps: DevmateServerDeps): DevmateServer {
     apiKey?: string;
     reasoning: ReasoningEffort;
     window?: number;
+    permission: PermissionPreset;
+    permissionConfirmedAt?: number;
   } {
     const response: {
       baseUrl: string;
@@ -1652,10 +1888,13 @@ export function createDevmateServer(deps: DevmateServerDeps): DevmateServer {
       apiKey?: string;
       reasoning: ReasoningEffort;
       window?: number;
+      permission: PermissionPreset;
+      permissionConfirmedAt?: number;
     } = {
       baseUrl: current.baseUrl,
       model: current.model,
       reasoning: current.reasoning, // C 档：缺省 'medium'
+      permission: current.permission, // 权限预设定案：缺省 'workspace-write'
     };
     if (current.apiKey !== undefined) {
       const masked = maskApiKey(current.apiKey);
@@ -1663,6 +1902,10 @@ export function createDevmateServer(deps: DevmateServerDeps): DevmateServer {
     }
     // C 档：窗口覆盖（预设估算在 deps 装配层播种；未知 → 不带键，前端回退内置估算）
     if (current.windowTokens !== undefined) response.window = current.windowTokens;
+    // full-access 风险确认记录（无记录不带键——前端只在 full-access 且已确认时展示）
+    if (current.permissionConfirmedAt !== undefined) {
+      response.permissionConfirmedAt = current.permissionConfirmedAt;
+    }
     return response;
   }
 
@@ -1710,17 +1953,47 @@ export function createDevmateServer(deps: DevmateServerDeps): DevmateServer {
       }
       windowTokens = rawWindowTokens;
     }
+    const rawPermission = record.permission;
+    let permission: PermissionPreset | undefined;
+    if (rawPermission !== undefined) {
+      if (
+        typeof rawPermission !== 'string' ||
+        !(PERMISSION_PRESETS as readonly string[]).includes(rawPermission)
+      ) {
+        throw new HttpError(400, 'permission must be one of read-only/workspace-write/full-access');
+      }
+      permission = rawPermission as PermissionPreset;
+    }
+    const rawConfirmedAt = record.permissionConfirmedAt;
+    let permissionConfirmedAt: number | undefined;
+    if (rawConfirmedAt !== undefined) {
+      if (
+        typeof rawConfirmedAt !== 'number' ||
+        !Number.isInteger(rawConfirmedAt) ||
+        rawConfirmedAt < 0
+      ) {
+        throw new HttpError(400, 'permissionConfirmedAt must be a non-negative integer (epoch ms)');
+      }
+      permissionConfirmedAt = rawConfirmedAt;
+    }
     if (
       baseUrl === undefined &&
       model === undefined &&
       apiKey === undefined &&
       reasoning === undefined &&
-      rawWindowTokens === undefined
+      rawWindowTokens === undefined &&
+      rawPermission === undefined &&
+      rawConfirmedAt === undefined
     ) {
       throw new HttpError(400, 'no settings fields provided');
     }
     // 触碰语义：只有被本次 POST 触碰的字段随快照持久化（补丁合并写——未指字段保留现值）
-    const touched: { reasoning?: boolean; windowTokens?: boolean } = {};
+    const touched: {
+      reasoning?: boolean;
+      windowTokens?: boolean;
+      permission?: boolean;
+      permissionConfirmedAt?: boolean;
+    } = {};
     if (baseUrl !== undefined) current.baseUrl = baseUrl;
     if (model !== undefined) current.model = model;
     if (apiKey !== undefined) {
@@ -1739,11 +2012,33 @@ export function createDevmateServer(deps: DevmateServerDeps): DevmateServer {
       current.windowTokens = windowTokens;
       touched.windowTokens = true;
     }
+    if (permission !== undefined) {
+      current.permission = permission;
+      touched.permission = true;
+      // full-access 风险确认记录：首次切到 full-access 时被动记录（前端负责确认 UI——
+      // 后端只记录、不做强制门；显式 permissionConfirmedAt 优先，且不覆盖已有记录）
+      if (
+        permission === 'full-access' &&
+        permissionConfirmedAt === undefined &&
+        current.permissionConfirmedAt === undefined
+      ) {
+        current.permissionConfirmedAt = Date.now();
+        touched.permissionConfirmedAt = true;
+      }
+    }
+    if (permissionConfirmedAt !== undefined) {
+      current.permissionConfirmedAt = permissionConfirmedAt;
+      touched.permissionConfirmedAt = true;
+    }
     if (deps.persistSettings !== undefined) {
       const snapshot: SettingsSnapshot = { baseUrl: current.baseUrl, model: current.model };
       if (current.apiKey !== undefined) snapshot.apiKey = current.apiKey;
       if (touched.reasoning === true) snapshot.reasoning = current.reasoning;
       if (touched.windowTokens === true) snapshot.windowTokens = current.windowTokens as number;
+      if (touched.permission === true) snapshot.permission = current.permission;
+      if (touched.permissionConfirmedAt === true) {
+        snapshot.permissionConfirmedAt = current.permissionConfirmedAt as number;
+      }
       await deps.persistSettings(snapshot);
     }
     sendJson(res, 200, settingsResponse());

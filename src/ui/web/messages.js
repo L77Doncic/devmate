@@ -21,10 +21,19 @@
  * - assistant-done  ：定稿；content 以其为准（delta 千字万句不如服务端权威值），
  *                     工具调用列表并卡（已存在的不重复）；回合结束（下一轮 delta 由
  *                     run-status/session-user 边界或本事件结束 —— 定稿即收流）。
+ *                     思考定稿（thinkDone=true）+ Ran-for 钟差折算（doneAt-startedAt）。
+ * - reasoning       ：思考增量（**Wave 2 新增协议帧；服务端 emit 尚未发 —— 前端先行
+ *                     具备，协议演进即点即亮**）。就地累积到当前回合助手气泡的
+ *                     reasoning 字段（Think Disclosure 折叠行数据源）；无活动气泡时
+ *                     先建（reasoning 常先于正文 delta 到达）；assistant-done 后到达的
+ *                     迟到帧并入最后一条助手气泡（不回退新建 —— 防御）。
  * - tool-start      ：生成/复位工具卡（执行中）。可在无 delta 时先到（独立成卡）。
  * - tool-result     ：工具卡落定 成功/失败；preview 供列表 + content 全量供展开详情
  *                     （服务端 64KB 缓冲上限，超出已由服务端截断）。
- * - approval-request：工具卡挂起（待审批）并进入审批队列（modal 一次处理一个）。
+ * - approval-request：工具卡挂起（待审批）并进入审批队列（内嵌审批卡一次呈现一个，
+ *                     快照按队列保序，渲染层只取第一个等待项）。**协议演进（本轮）：
+ *                     仅 ask 类需问询时到来；权限矩阵 deny 直拒不再产生本帧** ——
+ *                     permission-denied 回注是普通 tool-result(ok:false)，模型继续。
  * - usage           ：覆盖式保存（服务端语义：本次运行累计），取最新调用值；
  *                    可带 contextEstimateTokens（run 内最后一次投影估算，缺省不带键）；
  *                    成本按 run 边界增量累入 costUsdCum（/cost 面板数据源）。
@@ -56,6 +65,9 @@ export function createMessageStore({ maxItems = DEFAULT_MAX_ITEMS } = {}) {
     seq: 0,
     items: [], // {id,kind:'user'|'assistant'|'system', text|content…}
     activeAssistantId: null,
+    // 最近一次定稿的助手气泡 id（reasoning 迟到帧归属判定：同 turn 内 done 后到达的
+    // 思考并入该气泡；session-user/addUser 开新 turn 即清 —— 绝不跨 turn 归并）。
+    lastDoneAssistantId: null,
     approvals: [], // {toolCallId,name,arguments,state:'waiting'|'decided',approved?,reason?}
     usage: null,
     runStatus: null,
@@ -107,9 +119,12 @@ export function createMessageStore({ maxItems = DEFAULT_MAX_ITEMS } = {}) {
   // 助手气泡运行时
   // ---------------------------------------------------------------------
 
-  /** 当前回合的助手气泡（无则新建）；轮次边界由调用方按 run 重置。 */
+  /** 当前回合的助手气泡（无则新建）；轮次边界由调用方按 run 重置。
+   *  Wave 2：at = 消息时刻锚（行 meta 时钟）；startedAt = 本气泡首事件时刻（Ran-for 钟差，
+   *  done 时折算 ranForMs —— 详见 assistant-done）；reasoning/thinkDone = 思考折叠行数据。 */
   function activeAssistant() {
     if (!state.activeAssistantId) {
+      const now = Date.now();
       const item = {
         id: nextId(),
         kind: 'assistant',
@@ -117,6 +132,12 @@ export function createMessageStore({ maxItems = DEFAULT_MAX_ITEMS } = {}) {
         done: false,
         error: null,
         tools: [],
+        at: now,
+        startedAt: now,
+        reasoning: '',
+        thinkDone: false,
+        doneAt: null,
+        ranForMs: null,
       };
       state.items.push(item);
       state.activeAssistantId = item.id;
@@ -156,9 +177,10 @@ export function createMessageStore({ maxItems = DEFAULT_MAX_ITEMS } = {}) {
         // 轮次边界与去重解耦：无论回放是否去重，新 run 的 delta 必须进新气泡。
         // 同时置 run 边界标记（下一条 usage = 新 run 全额 —— /cost 累计正确性前提）。
         state.activeAssistantId = null;
+        state.lastDoneAssistantId = null;
         state.usageRunStarted = false;
         if (lastUser && lastUser.text === text) break; // 去重（见头注释）
-        state.items.push({ id: nextId(), kind: 'user', text });
+        state.items.push({ id: nextId(), kind: 'user', text, at: Date.now() });
         if (!state.title) state.title = text.slice(0, 24);
         break;
       }
@@ -173,6 +195,13 @@ export function createMessageStore({ maxItems = DEFAULT_MAX_ITEMS } = {}) {
         const a = activeAssistant();
         if (typeof data?.content === 'string' && data.content !== '') a.text = data.content;
         a.done = true;
+        // 思考收尾（dsh ReasoningRow 定稿态）：首行摘要 + 行收起（app.js 消费 thinkDone）
+        a.thinkDone = true;
+        // Ran-for 钟差：done 时刻 = 本气泡首事件时刻（首 delta/reasoning/tool 已设 startedAt）
+        a.doneAt = Date.now();
+        if (Number.isFinite(a.startedAt) && a.startedAt !== null) {
+          a.ranForMs = Math.max(0, a.doneAt - a.startedAt);
+        }
         for (const tc of data?.toolCalls ?? []) {
           if (!a.tools.some((t) => t.id === tc.id)) {
             a.tools.push({
@@ -186,6 +215,22 @@ export function createMessageStore({ maxItems = DEFAULT_MAX_ITEMS } = {}) {
         }
         state.streaming = false;
         state.activeAssistantId = null; // 定稿：后续事件不再并入（延迟回执按 id 找卡）
+        state.lastDoneAssistantId = a.id; // 同 turn 迟到 reasoning 的归并目标
+        break;
+      }
+      case 'reasoning': {
+        // 思考增量帧（同上注释）：入当前回合（或最后一条）助手气泡；纯累积，无流态变化。
+        const text = String(data?.text ?? '');
+        if (!text) break;
+        // 归属裁决：turn 内定稿后到达的迟到帧并入刚定稿气泡（不回退新建）；
+        // 新 turn（session-user 已清 lastDoneAssistantId）→ activeAssistant() 新开。
+        let a = null;
+        if (state.activeAssistantId === null && state.lastDoneAssistantId !== null) {
+          const last = findLastKind('assistant');
+          if (last && last.id === state.lastDoneAssistantId) a = last;
+        }
+        if (!a) a = activeAssistant();
+        a.reasoning = (a.reasoning ?? '') + text;
         break;
       }
       case 'tool-start': {
@@ -302,7 +347,7 @@ export function createMessageStore({ maxItems = DEFAULT_MAX_ITEMS } = {}) {
     emit();
   }
 
-  /** 无理由拒绝/中断本轮：pending 审批卡 → 终态「已中断」，审批队列清空（modal 不再抢 UI）。 */
+  /** 无理由拒绝/中断本轮：pending 审批卡 → 终态「已中断」，审批队列清空（内嵌卡收起）。 */
   function settleInterruptedApprovals() {
     for (const ap of state.approvals) {
       if (ap.state === 'waiting') {
@@ -338,12 +383,13 @@ export function createMessageStore({ maxItems = DEFAULT_MAX_ITEMS } = {}) {
   // 主动作（UI 层调用）
   // ---------------------------------------------------------------------
   function addUser(text) {
-    const item = { id: nextId(), kind: 'user', text: String(text) };
+    const item = { id: nextId(), kind: 'user', text: String(text), at: Date.now() };
     state.items.push(item);
     if (!state.title) state.title = String(text).slice(0, 24);
     // 轮次边界：乐观渲染的用户消息也是新 run 的起点（下一轮 delta 开新气泡）；
     // 并置 run 边界标记（同上 —— 本次发送产出的 usage 按新 run 全额累计）。
     state.activeAssistantId = null;
+    state.lastDoneAssistantId = null;
     state.usageRunStarted = false;
     trim();
     emit();
@@ -372,6 +418,7 @@ export function createMessageStore({ maxItems = DEFAULT_MAX_ITEMS } = {}) {
     state.items.length = 0;
     state.approvals.length = 0;
     state.activeAssistantId = null;
+    state.lastDoneAssistantId = null;
     state.usage = null;
     state.runStatus = null;
     state.lastError = null;
@@ -415,11 +462,11 @@ export function createMessageStore({ maxItems = DEFAULT_MAX_ITEMS } = {}) {
   }
 
   /**
-   * 审批应答（用户点了 允许/拒绝）。
+   * 审批应答（用户点了内嵌审批卡的 允许/拒绝，或按 Esc）。
    * - approve：工具卡回到 running（服务端后续会补 tool-result 落色；若没有则以兜底收场）；
    * - deny 带理由：卡直接落「已拒绝（denied）」终态并带拒因（服务端随后补 tool-result 失败回执）；
-   * - deny 无理由：卡保持 pending（服务端不落 tool 事件）；终态 run-status=user-interrupted
-   *   到达时统一置「已中断」——不再永脉冲。
+   * - deny 无理由（内嵌卡现状：无附注框 —— 拒绝即无备注拒绝）：卡保持 pending
+   *   （服务端不落 tool 事件）；终态 run-status=user-interrupted 到达时统一置「已中断」。
    */
   function decideApproval(toolCallId, approve, reason) {
     const ap = state.approvals.find((x) => x.toolCallId === toolCallId);
@@ -468,6 +515,10 @@ export function createMessageStore({ maxItems = DEFAULT_MAX_ITEMS } = {}) {
             text: it.text,
             done: it.done,
             error: it.error,
+            at: it.at,
+            ranForMs: it.ranForMs,
+            reasoning: it.reasoning,
+            thinkDone: it.thinkDone,
             tools: it.tools.map((t) => ({
               id: t.id,
               name: t.name,
@@ -477,7 +528,7 @@ export function createMessageStore({ maxItems = DEFAULT_MAX_ITEMS } = {}) {
             })),
           };
         }
-        if (it.kind === 'user') return { id: it.id, kind: 'user', text: it.text };
+        if (it.kind === 'user') return { id: it.id, kind: 'user', text: it.text, at: it.at };
         if (it.kind === 'compaction') {
           return {
             id: it.id,
@@ -489,7 +540,7 @@ export function createMessageStore({ maxItems = DEFAULT_MAX_ITEMS } = {}) {
         }
         return { id: it.id, kind: 'system', level: it.level, text: it.text };
       }),
-      // 审批队列：只暴露「等待中」的第一个（modal 一次一个）
+      // 审批队列：只暴露「等待中」的项（保序；内嵌审批卡渲染层只取第一个 —— 一次一个）
       approvals: state.approvals.filter((a) => a.state === 'waiting'),
       usage: state.usage ? { ...state.usage } : null,
       costUsdCum: state.costUsdCum,

@@ -41,6 +41,7 @@ import {
   validateToolCall,
 } from './tools.js';
 import type {
+  ApprovalDeniedErrorType,
   Approver,
   LlmAdapter,
   Pricing,
@@ -298,7 +299,7 @@ type TurnOutcome =
 
 type CallOutcome =
   | { kind: 'result'; call: ToolCall; result: ToolResult }
-  | { kind: 'denied'; call: ToolCall; reason: string }
+  | { kind: 'denied'; call: ToolCall; reason: string; errorType?: ApprovalDeniedErrorType }
   | { kind: 'denied-no-reason'; call: ToolCall }
   | { kind: 'malformed'; call: ToolCall; result: ToolResult }
   | { kind: 'skipped'; call: ToolCall };
@@ -446,8 +447,14 @@ async function evaluateCall(call: ToolCall, deps: TurnDeps): Promise<CallOutcome
     const decision = await deps.approver(call);
     if (decision !== 'allow' && decision.deny === true) {
       if (decision.reason !== undefined && decision.reason !== '') {
-        // 带备注拒绝：拒因回注（错误回注类型 user-denied），模型继续（ADR-0013）
-        return { kind: 'denied', call, reason: decision.reason };
+        // 带理由拒绝：拒因回注（缺省 user-denied；权限策略直拒 = permission-denied），
+        // 模型继续（ADR-0013 / 权限预设语义定案）
+        return {
+          kind: 'denied',
+          call,
+          reason: decision.reason,
+          ...(decision.errorType !== undefined ? { errorType: decision.errorType } : {}),
+        };
       }
       // 无备注拒绝：用户拒绝停止本轮（CONTEXT「危险操作审批」）
       return { kind: 'denied-no-reason', call };
@@ -500,12 +507,19 @@ async function appendToolOutcome(
         },
       });
       return 'denied-no-reason';
-    case 'denied':
+    case 'denied': {
+      // 拒绝类型（用户弹窗拒绝 / 权限策略自动拒绝）；缺省 user-denied（ADR-0013 旧语义）
+      const errorType = outcome.errorType ?? 'user-denied';
       await deps.store.append(deps.sessionId, {
         kind: 'event',
         payload: {
           type: 'approval_denied',
-          data: { toolCallId: outcome.call.id, name: outcome.call.name, reason: outcome.reason },
+          data: {
+            toolCallId: outcome.call.id,
+            name: outcome.call.name,
+            reason: outcome.reason,
+            ...(errorType === 'permission-denied' ? { errorType } : {}),
+          },
         },
       });
       await deps.store.append(deps.sessionId, {
@@ -514,11 +528,12 @@ async function appendToolOutcome(
           toolCallId: outcome.call.id,
           content: JSON.stringify({
             ok: false,
-            error: { type: 'user-denied', message: outcome.reason },
+            error: { type: errorType, message: outcome.reason },
           }),
         },
       });
       return undefined;
+    }
     case 'malformed':
       await deps.store.append(deps.sessionId, {
         kind: 'tool',

@@ -19,8 +19,11 @@ import {
 } from '../../src/shared/llm-types.js';
 import type { SessionEvent } from '../../src/shared/session-types.js';
 
-/** 一条假响应脚本：content 先流为一条 text；toolCalls/usage 在 end 快照上给出。 */
+/** 一条假响应脚本：reasoning 分片先流（每条一条 reasoning 增量）、content 再流为一条 text；
+ * toolCalls/usage 在 end 快照上给出。 */
 export interface FakeScript {
+  /** 思考增量分片（缺省无推理；形如 ['I am ', 'thinking']——逐条 yield reasoning）。 */
+  reasoning?: string[];
   content?: string;
   toolCalls?: Array<{ id: string; name: string; arguments: string }>;
   usage?: LlmUsage;
@@ -79,6 +82,11 @@ export class FakeLlm implements LlmAdapter {
         yield { type: 'error', error: script.error, snapshot: snapshotOf(script) };
         return;
       }
+      if (script.reasoning !== undefined) {
+        for (const chunk of script.reasoning) {
+          yield { type: 'reasoning', text: chunk };
+        }
+      }
       if (script.content !== undefined && script.content !== '') {
         yield { type: 'text', text: script.content };
       }
@@ -104,6 +112,30 @@ export function echoTool(): Tool {
     async execute(call) {
       const parsed = JSON.parse(call.arguments) as { text?: unknown };
       return { ok: true, content: `echo:${String(parsed.text ?? '')}` };
+    },
+  };
+}
+
+/**
+ * run_command 假工具（协议/审批用例用——按 name+arguments 触发服务端权限矩阵，
+ * execute 只模拟常驻 shell 输出，绝不真 spawn）。
+ */
+export function runCommandTool(): Tool {
+  return {
+    name: 'run_command',
+    description: 'Run a shell command (fake).',
+    parameters: {
+      type: 'object',
+      properties: { command: { type: 'string' } },
+      required: ['command'],
+    },
+    async execute(call) {
+      const parsed = JSON.parse(call.arguments) as { command?: string };
+      const command = String(parsed.command ?? '');
+      return {
+        ok: true,
+        content: `[out] ${command}\n--- exit code: 0 ---`,
+      };
     },
   };
 }

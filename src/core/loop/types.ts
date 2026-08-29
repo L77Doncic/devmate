@@ -133,8 +133,17 @@ export interface ToolRegistry {
 // 审批接缝（ADR-0013）
 // ---------------------------------------------------------------------------
 
-/** 'allow' 放行；{deny:true, reason} 拒绝并回注；{deny:true}（无理由）→ 用户中止本轮（user-interrupted）。 */
-export type ApprovalDecision = 'allow' | { deny: boolean; reason?: string };
+/** 拒绝回注的错误类型（审批链路单一集合：用户弹窗拒绝 / 权限预设策略自动拒绝）。 */
+export type ApprovalDeniedErrorType = 'user-denied' | 'permission-denied';
+
+/**
+ * 'allow' 放行；{deny:true, reason} 拒绝并回注；{deny:true}（无理由）→ 用户中止本轮
+ * （user-interrupted）。
+ * errorType 只在带理由拒绝时生效：'user-denied'（用户弹窗拒绝；缺省）或
+ * 'permission-denied'（权限预设矩阵的 deny 直拒——工具结果 error.type 逐字，普通回注）。
+ */
+export type ApprovalDecision =
+  'allow' | { deny: boolean; reason?: string; errorType?: ApprovalDeniedErrorType };
 export type Approver = (call: ToolCall) => Promise<ApprovalDecision>;
 
 // ---------------------------------------------------------------------------

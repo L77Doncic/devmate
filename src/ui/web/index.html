@@ -222,7 +222,9 @@
                 <rect width="32" height="32" rx="8" fill="var(--accent-dim)" />
                 <path d="M9 9h14v3H9zm0 6h14v3H9zm0 5.5h9v3H9z" fill="var(--accent)" />
               </svg>
-              <h1>用 DevMate 干活</h1>
+              <!-- 空态语言（dsh EmptyHero 对齐）：品牌 mark + 标语 + 「预览版」badge；
+                   三步引导保留为 DevMate 本地差异化（见 README-UI 差异记录） -->
+              <h1>DevMate<span class="hero-badge">预览版</span></h1>
               <p class="empty-sub">
                 一个认真讨论后在你机器上执行命令的编程智能体。<br />它做的每一步都看得到、都拦得住、都可追溯。
               </p>
@@ -256,7 +258,7 @@
                 <div class="step-body">
                   <h2>看它边做边汇报</h2>
                   <p>
-                    每条回复、每个工具调用都以卡片呈现在这里；需要批准的危险操作会弹窗等你确认。
+                    每条回复、每个工具调用都以卡片呈现在这里；需要批准的操作会以内嵌审批卡等你确认。
                   </p>
                 </div>
               </li>
@@ -269,6 +271,36 @@
           <!-- 运行状态条（run-status / run-error；dsh「目标/状态属于输入框上下文」哲学）：
                运行中 = 细横条（色点脉冲 + 闪烁阶段词 + 实时耗时）；终态 = 单行小字。 -->
           <div class="run-strip" id="run-strip" hidden role="status" aria-live="polite"></div>
+          <!-- 内嵌审批卡（dsh ApprovalPanel 本地形态；替代旧居中 modal）：收到
+               approval-request 时在此停靠 —— 等待审批 strip + 理由 headline + 命令预览
+               mono 卡 + 右下 拒绝/允许 双钮（无附注框：dsh 并无 —— 拒绝=无备注拒绝，
+               服务端按 user-interrupted 收尾）。位置 = run-strip 与 composer 卡之间
+               （同宽列）；每次只呈现一个（队列一次一个）。 -->
+          <div class="approval-dock" id="approval-dock" hidden>
+            <section
+              class="approval-banner"
+              role="group"
+              aria-label="待审批操作"
+              aria-describedby="approval-headline"
+            >
+              <div class="ap-strip">
+                <span class="ap-dot" aria-hidden="true"></span>
+                <span id="approval-strip-text">等待你的批准</span>
+              </div>
+              <div class="ap-body">
+                <h2 class="ap-headline" id="approval-headline">工具请求执行命令</h2>
+                <pre class="ap-args" id="approval-command" tabindex="0"></pre>
+                <div class="ap-actions">
+                  <button class="btn btn-outline ap-reject" id="btn-banner-deny" type="button">
+                    拒绝
+                  </button>
+                  <button class="btn btn-primary" id="btn-banner-approve" type="button">
+                    允许
+                  </button>
+                </div>
+              </div>
+            </section>
+          </div>
           <!-- 输入卡上方提示条（dsh InputBar .notice：整卡宽 r8 淡填充小字） -->
           <p class="composer-hint" id="composer-hint">
             发送后 DevMate 会自动开始工作；调试中可随时点「停止」。输入 / 可打开命令。
@@ -299,6 +331,25 @@
               disabled
             ></textarea>
             <div class="composer-foot">
+              <!-- dsh InputBar .tools 左置组：PermissionSelect 访问模式 chip（盾形 glyph +
+                   当前档标签 + chevron；点击展开三选菜单 —— dsh Menu 表面；菜单 DOM 在
+                   .composer-box 内锚定）。右侧 = 停止 + 发送（双 34px 圆钮）。 -->
+              <div class="composer-tools">
+                <button
+                  type="button"
+                  class="perm-chip"
+                  id="perm-chip"
+                  aria-haspopup="menu"
+                  aria-expanded="false"
+                  title="访问模式"
+                >
+                  <span class="perm-glyph" id="perm-glyph" aria-hidden="true"></span>
+                  <span class="perm-label" id="perm-label">工作区写入</span>
+                  <svg class="perm-chevron" viewBox="0 0 14 14" aria-hidden="true">
+                    <path fill="currentColor" d="M5.4 3.3l5 4.7-5 4.7z" />
+                  </svg>
+                </button>
+              </div>
               <!-- dsh InputBar .primary 发送钮：34px 圆形蓝钮 + 白色箭头（figma
                    IconButton 34:10465）—— 纯图标，文字语义放 title；
                    其左侧为停止钮（runActive 时可见）：同为 34px 圆形（danger 红）。 -->
@@ -336,6 +387,9 @@
                 </button>
               </div>
             </div>
+            <!-- 访问模式菜单（dsh Menu 表面：浮层、r8、阴影；锚于 chip；行 = glyph +
+                 档标签 + 描述，当前档高亮；选 full-access 无确认记录时先过风险确认门） -->
+            <div class="perm-menu" id="perm-menu" hidden role="menu" aria-label="访问模式"></div>
             <!-- 命令下拉（输入区首个字符 / 触发、防抖 150ms；纯逻辑 = commands.js，
                  DOM 装配 = app.js；dsh Menu 表面：浮层、r8、阴影；锚于输入卡上缘） -->
             <div class="cmd-menu" id="cmd-menu" hidden role="listbox" aria-label="命令菜单"></div>
@@ -391,43 +445,7 @@
       </div>
     </div>
 
-    <!-- ============ 审批面板（modal） ============ -->
-    <div class="scrim" id="approval-scrim" hidden></div>
-    <!-- 审批面板（dsh ApprovalPanel chrome：warn 条 + r20 卡 + 右下 ghost/primary Capsule） -->
-    <section
-      class="approval"
-      id="approval"
-      hidden
-      role="alertdialog"
-      aria-modal="true"
-      aria-labelledby="approval-title"
-    >
-      <div class="ap-strip">
-        <span class="ap-dot" aria-hidden="true"></span>
-        <span>工具需要你的批准</span>
-      </div>
-      <div class="ap-body">
-        <h2 class="ap-headline" id="approval-title">等待批准后执行</h2>
-        <p class="ap-sub">执行前请确认下面的命令/参数是正确的，一切由你决定。</p>
-        <span class="ap-command" id="approval-name">bash</span>
-        <pre class="ap-args" id="approval-args" tabindex="0"></pre>
-        <label class="field-row" for="approval-reason">
-          <span class="field-label">附注理由（可选）</span>
-          <input
-            class="input"
-            id="approval-reason"
-            type="text"
-            placeholder="例如：正则正确，放心执行"
-          />
-        </label>
-        <div class="ap-actions">
-          <button class="btn btn-outline ap-reject" id="btn-deny" type="button">拒绝执行</button>
-          <button class="btn btn-primary" id="btn-approve" type="button">允许执行</button>
-        </div>
-      </div>
-    </section>
-
-    <!-- ============ 删除确认面板（复用审批 modal 视觉语言；危险色调） ============ -->
+    <!-- ============ 删除确认面板（确认 modal 视觉语言；危险色调） ============ -->
     <div class="scrim" id="confirm-scrim" hidden></div>
     <!-- 删除确认 modal（dsh Modal chrome：r24 layer-2 卡 + outline/主色 Capsule 对） -->
     <section
@@ -443,6 +461,27 @@
       <div class="approval-actions">
         <button class="btn btn-outline" id="btn-confirm-cancel" type="button">取消</button>
         <button class="btn btn-danger" id="btn-confirm-ok" type="button">确认删除</button>
+      </div>
+    </section>
+
+    <!-- ============ 全部访问风险确认门（复用删除确认 modal 视觉；危险色调） ============ -->
+    <div class="scrim" id="risk-scrim" hidden></div>
+    <!-- 一次性风险确认（dsh RiskConfirmation 本地形态：确认/取消双钮，无勾选——
+         任务语义定案：「确认」即承担；已确认过（GET 返回 permissionConfirmedAt）
+         下次切 full-access 直接生效，不再问询）。 -->
+    <section
+      class="confirm"
+      id="risk-confirm"
+      hidden
+      role="alertdialog"
+      aria-modal="true"
+      aria-labelledby="risk-confirm-title"
+    >
+      <h2 id="risk-confirm-title">启用全部访问</h2>
+      <p id="risk-confirm-text">全部访问：不再问询，命令直接执行（含删除/破坏性操作）。确认？</p>
+      <div class="approval-actions">
+        <button class="btn btn-outline" id="btn-risk-cancel" type="button">取消</button>
+        <button class="btn btn-danger" id="btn-risk-ok" type="button">确认</button>
       </div>
     </section>
 
