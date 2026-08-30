@@ -1780,10 +1780,19 @@ export function createDevmateServer(deps: DevmateServerDeps): DevmateServer {
 
   /**
    * E7 上限学习（ADR-0016 L2）：运行时「超限报错 → 压缩重试」链从 400 message 免费解析的
-   * 供应商上限（0 token 计费的「真值探测」）。全局单值（settings 是全局的——provider 变更
-   * 即清空）；参与窗口预算钳制（min）与 GET /api/settings 的 windowDetail 注记（「由错误学习」）。
+   * 供应商上限（0 token 计费的「真值探测」）。
+   *
+   * 生命周期（VT2-1 修正：learned = run-scoped——只对「产生该错误的 run」的后续轮注记/
+   * 钳制：实例全局槽仅为「本 run 内」，产生学习的 run 结束即清除，新 run 恒从空开始，
+   * 不做跨 run 粘滞）。语义（a 条）：learned 只降不抬，但**用户显式 windowTokens 是
+   * 最高权威**——显式覆盖时不得被 learned min 钳制/顶替（only 无显式时 min 生效）；
+   * 参与窗口预算钳制（min）与 GET /api/settings 的 windowDetail 注记（「由错误学习」）。
+   * provider 变更（settings POST）仍即清空（旧供应商真值对新端点无意义）。
    */
   let learnedLimitCaps: { windowCap?: number; outputCap?: number; evidence?: string } = {};
+  /** 槽值归属的 run（runId 计数器）；仅归属 run 结束时清除槽——并发 run 不互相误清/串用。 */
+  let learnedCapsOwnerRun: number | undefined;
+  let runSequence = 0;
 
   /** 评审哨兵门（R2-S2）语义版装配：hasSubstantiveWork/hasReviewRun 由 ctx 观察器记帐的
    * RunStats 判定（纯函数 loop/types）；flag 为会话级一次性（注入即置位——护栏即一次）。 */
@@ -1803,6 +1812,7 @@ export function createDevmateServer(deps: DevmateServerDeps): DevmateServer {
   }
 
   function startRun(sessionId: string, text: string, images?: UserImage[]): void {
+    const runToken = ++runSequence; // run 身份（learned 槽归属：run-scoped，VT2-1）
     const ctx = ctxFor(sessionId);
     const controller = new AbortController();
     ctx.controller = controller;
@@ -1823,7 +1833,10 @@ export function createDevmateServer(deps: DevmateServerDeps): DevmateServer {
         // > INPUT=预算上限钳（用户设了 maxInputTokens → 窗口预算钳于它：INPUT 双语义——
         // DashScope wire 载体 + 预算上限；README 有注明）。
         let windowBudget = effectiveWindow().window;
-        if (learnedLimitCaps.windowCap !== undefined) {
+        // E7 学习钳（min——「由错误学习」真值只降不抬）。VT2-1 语义：
+        // - learned 为 run-scoped（本 run 内学习才可能驻留——run 结束即清，见 finally）；
+        // - 用户显式 windowTokens 是最高权威：显式时跳过（learned 绝不钳制/顶替用户值）。
+        if (!explicitWindowTokens && learnedLimitCaps.windowCap !== undefined) {
           windowBudget =
             windowBudget === undefined
               ? learnedLimitCaps.windowCap
@@ -1854,7 +1867,8 @@ export function createDevmateServer(deps: DevmateServerDeps): DevmateServer {
           delete runOptions.maxInputTokens;
         }
         // E7 自愈链学习回调（L2）：核心循环从 400 message 免费学到上限 →
-        // 全局记入 learnedLimitCaps（windowDetail「由错误学习」/ 后续 run 钳制）。
+        // 记入 learnedLimitCaps（windowDetail「由错误学习」/ 后续轮钳制）；记录归属
+        // runToken（run-scoped，VT2-1——本 run 结束即清除，见 finally）。
         runOptions.onLimitsError = async (learning) => {
           if (learning.kind === 'context-exceeded' && learning.hintMax !== undefined) {
             learnedLimitCaps = {
@@ -1862,12 +1876,14 @@ export function createDevmateServer(deps: DevmateServerDeps): DevmateServer {
               windowCap: learning.hintMax,
               evidence: learning.message,
             };
+            learnedCapsOwnerRun = runToken;
           } else if (learning.kind === 'output-limit' && learning.hintMax !== undefined) {
             learnedLimitCaps = {
               ...learnedLimitCaps,
               outputCap: learning.hintMax,
               evidence: learning.message,
             };
+            learnedCapsOwnerRun = runToken;
           }
         };
         // R2-S1：方法论前置门按开关传递——false → 删除 methodology 键（门不拦）；
@@ -1951,6 +1967,13 @@ export function createDevmateServer(deps: DevmateServerDeps): DevmateServer {
         const pending = [...ctx.pending.values()];
         ctx.pending.clear();
         for (const settle of pending) settle({ deny: true });
+        // run-scoped 学习（VT2-1）：产生本 run 的学习只随本 run 生命周期存活——
+        // run 结束即清（新 run 恒从空开始；跨 run 无粘滞）。归属判定：并发 run
+        // 互不误清（只清自己写入的槽）。
+        if (learnedCapsOwnerRun === runToken) {
+          learnedLimitCaps = {};
+          learnedCapsOwnerRun = undefined;
+        }
       }
     })();
   }
@@ -3005,7 +3028,8 @@ export function createDevmateServer(deps: DevmateServerDeps): DevmateServer {
    */
   function effectiveWindow(): { window?: number; detail?: string } {
     if (explicitWindowTokens && current.windowTokens !== undefined) {
-      return withLearnedCap(current.windowTokens, '用户显式覆盖（settings.windowTokens）');
+      // VT2-1：用户显式 windowTokens 是最高权威——不回学习钳、不被学习注记。
+      return { window: current.windowTokens, detail: '用户显式覆盖（settings.windowTokens）' };
     }
     const discovered = deps.windowDiscovered !== undefined ? deps.windowDiscovered() : null;
     if (discovered !== null && discovered.window !== null) {
@@ -3015,7 +3039,9 @@ export function createDevmateServer(deps: DevmateServerDeps): DevmateServer {
       );
     }
     // E7 学习源（L2）：运行时超限报错 message 明示的窗口——证据密度高于 preset 估算
-    //（供应商自证），此时它作为取窗来源本身（无其它源时）。
+    //（供应商自证），此时它作为取窗来源本身（无其它源时）。VT2-1：为 run-scoped——
+    // 只在「产生该错误的 run」期间驻留（run 结束即清）；显式 windowTokens 分支先行
+    // 返回，学习源永不到达（用户权威 > learned，a 条）。
     if (learnedLimitCaps.windowCap !== undefined) {
       return {
         window: learnedLimitCaps.windowCap,
@@ -3028,7 +3054,9 @@ export function createDevmateServer(deps: DevmateServerDeps): DevmateServer {
     return {};
   }
 
-  /** E7 学习钳（min）：三源任一出值后按「由错误学习」真值钳制（只降不抬；钳到则注记来源）。 */
+  /** E7 学习钳（min）：非用户显式来源（网关探测 / preset 估算）出值后按「由错误学习」
+   *  真值钳制（只降不抬；钳到则注记来源）。显式 windowTokens 不经过本函数——
+   *  用户权威 > learned（VT2-1 a 条）。 */
   function withLearnedCap(window: number, detail: string): { window: number; detail: string } {
     if (learnedLimitCaps.windowCap !== undefined && learnedLimitCaps.windowCap < window) {
       return {
@@ -3282,9 +3310,11 @@ export function createDevmateServer(deps: DevmateServerDeps): DevmateServer {
       reviewMode?: boolean;
     } = {};
     // 端点/模型/密钥变更 → E7 上限学习清空（旧供应商「由错误学习」的真值对新端点无意义；
-    // 端点未变（纯上限/补丁类 POST）→ 学习保留——它是该供应商的稳定真值）。
+    // 端点未变（纯上限/补丁类 POST）→ 学习保留——它是该供应商的稳定真值；
+    // 归属 run 一并解除（槽已空——即使正在 run 中的学习也会随后按新端点语义重新记录）。
     if (baseUrl !== undefined || model !== undefined || apiKey !== undefined) {
       learnedLimitCaps = {};
+      learnedCapsOwnerRun = undefined;
     }
     if (baseUrl !== undefined) current.baseUrl = baseUrl;
     // 模型名保存即净化（用户实测残留根除）：POST 的 `[N]m/k` 尾标剥离后才应用/持久化/

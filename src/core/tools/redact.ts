@@ -66,7 +66,10 @@ const DEFAULT_PATTERNS: readonly RedactPattern[] = [
   },
   { type: 'aws-access-key', regex: /\b(?:AKIA|ASIA)[0-9A-Z]{16}\b/g },
   { type: 'github-token', regex: /\bgh[pousr]_[A-Za-z0-9]{20,}\b/g },
-  { type: 'openai-key', regex: /\bsk-[A-Za-z0-9-]{36,}\b/g },
+  // VT2-2（脱敏漏 real key）：阈值 36 → 24——真实 DeepSeek `sk-`+32hex = 35 符
+  //（sk- + 32 位），旧 {36,} 恰好漏掉（35 < 36）；通用低阈至少 24（sk-+24 即打码）。
+  // 误杀可接受（脱敏优先——短 mock 形态本就不在覆盖内，见模块头取舍）。
+  { type: 'openai-key', regex: /\bsk-[A-Za-z0-9-]{24,}\b/g },
   // 注意：bearer/basic 的 token 类包含 '='（base64 padding），故不收尾 \b——
   // trailing `\b` 会把最后一个 '=' 留在原地（`[REDACTED:…]=`）；最小长度 +
   // basic 的 guard 已保证不会吞掉不相干的相邻单词。

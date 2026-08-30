@@ -30,8 +30,16 @@
  *   文件语境文案（FILE_BINARY_PLACEHOLDER——文件内容不是「命令输出」，不复用
  *   BINARY_OUTPUT_PLACEHOLDER 的 shell 口吻）；read_file 对大文件采样判定
  *   （头尾采样段，中间省略区不扫描——注明）。
+ * - 工具锚点统一（P1-1）：六个工具的 path/pattern 参数——相对路径一律先按
+ *   「会话工作区根」（ctx.jail.workspaceRoot——createSessionTools 的 per-session jail 根）
+ *   resolve 成绝对路径（workspacePath），绝对路径原样；**同一解析值**同时喂给
+ *   jail 判定与实际 I/O、并用于错误/结果消息。锚定语义与 jail 一致（jail 本就按
+ *   workspaceRoot 解析相对路径）、与 run_command 初始 cwd 同根——绝不锚进程 cwd
+ *   （cwd≠workspace 时「写入成功却找不到/写到别处」：jail 判的是工作区根下路径，
+ *   而裸相对路径的 I/O 在进程 cwd 执行——P1-1 修复即消除该分裂）。
  */
 import { open, readdir, readFile, stat, writeFile } from 'node:fs/promises';
+import * as path from 'node:path';
 import { basename, dirname, join, resolve } from 'node:path';
 
 import type { ToolCall } from '../../shared/session-types.js';
@@ -157,6 +165,18 @@ function boolArg(args: Record<string, unknown>, key: string): boolean {
   return args[key] === true;
 }
 
+/**
+ * 工具锚点统一（P1-1）：相对路径按「会话工作区根」解析（jail 的 workspaceRoot——
+ * createSessionTools per-session 根，见模块头注）；绝对路径原样。解析值即工具
+ * 实际使用的路径（jail 判定 / 全部 I/O / 结果与错误消息同一来源）。
+ * 注意：absolute 判定必须做——`path.resolve(wsRoot, abs)` 会丢弃 wsRoot，但显式
+ * 分支让语义自明；jail 的 workspaceRoot 在 FakeJail.allowAll 等探针形态可为空串，
+ * 相对路径回退进程 cwd 解析仅在该（全放行探针）形态下发生。
+ */
+function workspacePath(ctx: FsToolContext, p: string): string {
+  return path.isAbsolute(p) ? p : path.resolve(ctx.jail.workspaceRoot, p);
+}
+
 /** stat 失败归一：ENOENT → file-not-found（含路径与可执行线索），其余 → tool-error。 */
 function statError(toolName: string, path: string, err: unknown): ToolResult {
   if (errCode(err) === 'ENOENT') {
@@ -229,9 +249,10 @@ async function readBounded(path: string, size: number): Promise<{ text: string; 
 // ---------------------------------------------------------------------------
 
 async function readOp(ctx: FsToolContext, args: Record<string, unknown>): Promise<ToolResult> {
-  const path = strArg(args, 'path');
-  if (path === '')
+  const rawPath = strArg(args, 'path');
+  if (rawPath === '')
     return failToolResult('invalid-arguments', 'read_file: "path" must be a non-empty string');
+  const path = workspacePath(ctx, rawPath); // 锚点统一：相对 → 会话工作区根（P1-1）
   const decision = await jailDecision(ctx, path, 'read');
   if (!decision.allowed) return outsideError(path, decision);
   let st;
@@ -269,10 +290,11 @@ async function readOp(ctx: FsToolContext, args: Record<string, unknown>): Promis
 // ---------------------------------------------------------------------------
 
 async function writeOp(ctx: FsToolContext, args: Record<string, unknown>): Promise<ToolResult> {
-  const path = strArg(args, 'path');
+  const rawPath = strArg(args, 'path');
   const content = strArg(args, 'content');
-  if (path === '')
+  if (rawPath === '')
     return failToolResult('invalid-arguments', 'write_file: "path" must be a non-empty string');
+  const path = workspacePath(ctx, rawPath); // 锚点统一：相对 → 会话工作区根（P1-1）
   const decision = await jailDecision(ctx, path, 'write');
   if (!decision.allowed) return outsideError(path, decision);
   try {
@@ -327,11 +349,12 @@ function searchSnippet(search: string): string {
 }
 
 async function editOp(ctx: FsToolContext, args: Record<string, unknown>): Promise<ToolResult> {
-  const path = strArg(args, 'path');
+  const rawPath = strArg(args, 'path');
   const search = strArg(args, 'search');
   const replace = strArg(args, 'replace'); // 缺省 = 删除段（空串合法）
-  if (path === '')
+  if (rawPath === '')
     return failToolResult('invalid-arguments', 'edit_file: "path" must be a non-empty string');
+  const path = workspacePath(ctx, rawPath); // 锚点统一：相对 → 会话工作区根（P1-1）
   // edit_file 对已存在文件做写覆盖 → 写语义
   const decision = await jailDecision(ctx, path, 'write');
   if (!decision.allowed) return outsideError(path, decision);
@@ -435,10 +458,11 @@ async function collectEntries(
 }
 
 async function listDirOp(ctx: FsToolContext, args: Record<string, unknown>): Promise<ToolResult> {
-  const path = strArg(args, 'path');
+  const rawPath = strArg(args, 'path');
   const recursive = boolArg(args, 'recursive');
-  if (path === '')
+  if (rawPath === '')
     return failToolResult('invalid-arguments', 'list_dir: "path" must be a non-empty string');
+  const path = workspacePath(ctx, rawPath); // 锚点统一：相对 → 会话工作区根（P1-1）
   const decision = await jailDecision(ctx, path, 'read');
   if (!decision.allowed) return outsideError(path, decision);
   let st;
@@ -570,14 +594,15 @@ async function collectFiles(
 
 async function globOp(ctx: FsToolContext, args: Record<string, unknown>): Promise<ToolResult> {
   const pattern = strArg(args, 'pattern');
-  const base = strArg(args, 'path');
+  const rawBase = strArg(args, 'path');
   if (pattern === '')
     return failToolResult('invalid-pattern', 'glob: "pattern" must be a non-empty string');
-  if (base === '')
+  if (rawBase === '')
     return failToolResult(
       'invalid-arguments',
       'glob: "path" (base directory) must be a non-empty string',
     );
+  const base = workspacePath(ctx, rawBase); // 锚点统一：相对 → 会话工作区根（P1-1）
   const baseDecision = await jailDecision(ctx, base, 'read');
   if (!baseDecision.allowed) return outsideError(base, baseDecision);
   let st;
@@ -763,7 +788,10 @@ async function grepOp(ctx: FsToolContext, args: Record<string, unknown>): Promis
   }
   const files: string[] = [];
   const seen = new Set<string>();
-  for (const p of paths) {
+  for (const rawPath of paths) {
+    // 锚点统一（P1-1）：每个路径参数（含 paths 数组元素）相对 → 会话工作区根后
+    // 才进入 jail 判定与实际扫描（jail 判定与 I/O 同一路径）。
+    const p = workspacePath(ctx, rawPath);
     const decision = await jailDecision(ctx, p, 'read');
     if (!decision.allowed) return outsideError(p, decision);
     let st;

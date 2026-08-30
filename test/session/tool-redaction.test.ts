@@ -12,7 +12,7 @@ import { cleanupTmpDirs, createTmpDir, event, readAll, userPayload } from './sup
  * 只作用于 tool 事件（user 等不脱敏）；开关可关（redactToolContent:false 原文落盘）。
  */
 describe('存储层脱敏（VT-3 修复 b：tool result content 落盘掩码）', () => {
-  const OPENAI_KEY = `sk-${'a'.repeat(40)}`; // 命中默认 openai-key 模式（sk- + ≥36 字符）
+  const OPENAI_KEY = `sk-${'a'.repeat(40)}`; // 命中默认 openai-key 模式（sk- + ≥24 字符，VT2-2 阈值）
 
   it('tool 事件 content 落盘掩码：磁盘无明文、读回与 append 返回值均掩码（默认开）', async () => {
     const dir = createTmpDir();

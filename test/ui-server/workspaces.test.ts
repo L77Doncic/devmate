@@ -13,6 +13,7 @@
  *   缓存）→ createJail(canonicalRoot) + createPersistentShell(canonicalRoot) 同源；旧会话
  *   无 meta → 默认根（迁移）。
  */
+import { existsSync } from 'node:fs';
 import { mkdir, mkdtemp, readFile, realpath, rm, stat, symlink, writeFile } from 'node:fs/promises';
 import { homedir, tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -664,11 +665,48 @@ describe('ui/server/deps：per-session 根工具面（createSessionToolsFactory 
     expect(r3).not.toBe(r1); // dispose 后重建（干净重启）
     await factory.dispose();
   });
+
+  it('t3) 工具锚点统一（P1-1）：cwd ≠ 会话根时相对路径 write/read 落会话根（不落进程 cwd）', async () => {
+    const rootA = await tempDir();
+    const jailA = await createJail({ workspaceRoot: rootA });
+    const factory = createSessionToolsFactory({ workspaceRoot: rootA, jail: jailA });
+    const reg: ToolRegistry = await factory.createSessionTools('s-p1');
+    const rel = `rel-anchor-${Date.now().toString(36)}.txt`; // 唯一名：进程 cwd 侧的副证不与残留撞车
+    // 回归前提：进程 cwd 不在会话根（dev/测试宿主从仓库根跑——会话根是临时目录）
+    expect(process.cwd()).not.toBe(rootA);
+
+    const w = await reg.execute({
+      id: 't3-write',
+      name: 'write_file',
+      arguments: JSON.stringify({ path: rel, content: 'session-grounded' }),
+    });
+    expect(w.ok).toBe(true);
+    // 修复前：jail 按会话根放行，但写文件在进程 cwd 执行 —— 文件落到别处
+    expect(await readFile(join(rootA, rel), 'utf8')).toBe('session-grounded');
+    expect(existsSync(join(process.cwd(), rel))).toBe(false);
+
+    // 同相对路径 read 可读（修复前：写、判、读三锚分裂 → 「写入成功却找不到」）
+    const r = await reg.execute({
+      id: 't3-read',
+      name: 'read_file',
+      arguments: JSON.stringify({ path: rel }),
+    });
+    expect(r.ok).toBe(true);
+    expect(r.content).toBe('session-grounded');
+    await factory.dispose();
+  });
 });
 
 // ---------------------------------------------------------------------------
-// E2E：会话根贯穿（HTTP 全链：pwd 断言 + A/B 工具隔离）
+// E2E：会话根贯穿（HTTP 全链：pwd 断言 + A/B 工具隔离 + P1-1 锚点统一）
 // ---------------------------------------------------------------------------
+
+/** tool-result 帧的最小收窄形状（e3 锚点统一用例用——只取本用例关注的字段）。 */
+type ToolResultFrame = {
+  id: string;
+  ok: boolean;
+  content: string;
+};
 
 describe('ui/server：多工作区 E2E（会话根贯穿全链）', () => {
   const servers: DevmateServer[] = [];
@@ -829,5 +867,79 @@ describe('ui/server：多工作区 E2E（会话根贯穿全链）', () => {
     // B 的写 B 根：放行（文件真实落盘）
     expect((bResult as { data: { ok: boolean } }).data.ok).toBe(true);
     expect(await readFile(join(rootB, 'made.txt'), 'utf8')).toBe('from B side');
+  });
+
+  it('e3) P1-1 锚点统一（HTTP 全链）：相对路径 write → read 顺序两轮均 ok，文件落会话根（不落进程 cwd）', async () => {
+    const rootA = await mkdtemp(join(canonicalTmpBase(), 'devmate-e2e-anchor-'));
+    tempDirs.push(rootA);
+    const rel = `rel-http-${Date.now().toString(36)}.txt`;
+    const store = new MemorySessionAdapter();
+    const jailA = await createJail({ workspaceRoot: rootA });
+    const factory = createSessionToolsFactory({
+      workspaceRoot: rootA,
+      jail: jailA,
+      workspaceRootOf: metaRootReader(store, rootA),
+      shellPlatform: 'posix',
+    });
+
+    const WRITE_REL = {
+      id: 'call-rel-write',
+      name: 'write_file',
+      arguments: JSON.stringify({ path: rel, content: 'http relative write' }),
+    };
+    const READ_REL = {
+      id: 'call-rel-read',
+      name: 'read_file',
+      arguments: JSON.stringify({ path: rel }),
+    };
+    const routes = new Map<string, FakeLlm>([
+      [
+        'rel-anchor',
+        new FakeLlm([
+          { content: 'go', toolCalls: [WRITE_REL] },
+          { content: 'go2', toolCalls: [READ_REL] },
+          { content: 'chain end' },
+        ]),
+      ],
+    ]);
+    const { base, server } = await startServer({
+      store,
+      tools: defineRegistry([], { sessionId: 'e2e-unused' }),
+      llm: new RoutingLlm(routes),
+      model: 'test-model',
+      workspaceRoot: rootA,
+      workspaces: [rootA],
+      approvalPolicy: () => false,
+      settings: { reviewMode: false },
+      createSessionTools: factory.createSessionTools,
+      dispose: () => factory.dispose(),
+    });
+    servers.push(server);
+
+    const body = (await (
+      await postJson(base, '/api/chat', { text: 'rel-anchor', workspaceRoot: rootA })
+    ).json()) as {
+      sessionId: string;
+    };
+    const client = await SseClient.connect(base, body.sessionId);
+    clients.push(client);
+    await waitForFrames(client, 13, 30_000);
+
+    const byId = new Map<string, ToolResultFrame>();
+    for (const frame of client.frames) {
+      if (frame.event === 'tool-result') {
+        const data = frame.data as ToolResultFrame;
+        byId.set(data.id, data);
+      }
+    }
+    // 写入成功 + 同路径读出内容（修复前：写锚进程 cwd、读判 jail——分裂即「写入成功却找不到」）
+    const w = byId.get('call-rel-write')!;
+    expect(w.ok).toBe(true);
+    const r = byId.get('call-rel-read')!;
+    expect(r.ok).toBe(true);
+    expect(r.content).toBe('http relative write');
+    // 落盘真相：文件在会话根，不在进程 cwd
+    expect(await readFile(join(rootA, rel), 'utf8')).toBe('http relative write');
+    expect(existsSync(join(process.cwd(), rel))).toBe(false);
   });
 });

@@ -59,8 +59,28 @@ describe('redactSecrets：默认形态集（切片 a）', () => {
     expect(redactSecrets(`alt=${OPENAI_PROJ_KEY}`)).toBe('alt=[REDACTED:openai-key]');
   });
 
-  it('短于最小长度的类 token 不误杀（sk- 最小 36 位）', () => {
+  it('VT2-2：真实 DeepSeek 形态（sk- + 32hex = 35 符）命中（旧阈值 36 恰好漏掉——脱敏漏 real key）', () => {
+    const deepseekReal = 'sk-' + 'a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6'; // 32 hex
+    expect(deepseekReal).toHaveLength(35);
+    expect(redactSecrets(`DEV_MATE_API_KEY=${deepseekReal}`)).toBe(
+      'DEV_MATE_API_KEY=[REDACTED:openai-key]',
+    );
+  });
+
+  it('VT2-2：sk- + 24..34 符（通用低阈区间）命中；<24 不命中', () => {
+    for (const n of [24, 29, 34]) {
+      const key = 'sk-' + 'a1b2c3d4'.repeat(Math.ceil(n / 8)).slice(0, n);
+      expect(key).toHaveLength(n + 3);
+      expect(redactSecrets(`k=${key}`)).toBe('k=[REDACTED:openai-key]');
+    }
+    const tooShort = 'sk-' + 'a1b2c3d4'.repeat(3).slice(0, 23); // sk- + 23 符
+    expect(tooShort).toHaveLength(26);
+    expect(redactSecrets(`k=${tooShort}`)).toBe(`k=${tooShort}`);
+  });
+
+  it('短于最小长度的类 token 不误杀（sk- 最小 24 位）', () => {
     expect(redactSecrets('token=sk-short')).toBe('token=sk-short');
+    expect(redactSecrets('token=sk-' + 'a'.repeat(23))).toBe('token=sk-' + 'a'.repeat(23));
   });
 
   it('Bearer <JWT>（Authorization 头）→ bearer-token', () => {

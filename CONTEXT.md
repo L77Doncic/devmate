@@ -194,7 +194,7 @@ _Avoid_: ACL（访问控制列表）、策略（policy）、黑名单规则
 _Avoid_: 危险命令黑名单、命令过滤、禁词表
 
 **机密脱敏（Secret Redaction）**:
-凭据类敏感内容的掩码处理，两层同一实现（redactSecrets）：① 工具结果回注给模型前（securedRegistry——registry 层唯一咽喉）；② 存储层——kind==='tool' 的结果 content 落盘前（JsonlFileAdapter 默认开）：掩码即最终口径（append 返回值、磁盘、resume/回放一致，模型可见上下文不会出现两次明文）。只覆盖常见凭据形态（AKIA/ghp_/sk-≥36/Bearer/Basic/PEM 块），短 mock 形态不在覆盖内；只作用于 tool 事件（user 消息不脱敏）。
+凭据类敏感内容的掩码处理，两层同一实现（redactSecrets）：① 工具结果回注给模型前（securedRegistry——registry 层唯一咽喉）；② 存储层——kind==='tool' 的结果 content 落盘前（JsonlFileAdapter 默认开）：掩码即最终口径（append 返回值、磁盘、resume/回放一致，模型可见上下文不会出现两次明文）。只覆盖常见凭据形态（AKIA/ghp_/sk-≥24/Bearer/Basic/PEM 块），短 mock 形态不在覆盖内；只作用于 tool 事件（user 消息不脱敏）。
 _Avoid_: 日志脱敏、密钥替换
 
 ### 执行环境

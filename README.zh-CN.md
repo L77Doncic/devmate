@@ -193,7 +193,7 @@ UI 的所有动作都走这些端点（`src/ui/server/index.ts`）：
 
 常开护栏：
 
-- **机密脱敏**——回注前统一掩码（`securedRegistry`）＋存储层落盘前掩码（`JsonlFileAdapter` 默认开，tool 结果 content——掩码即最终口径：磁盘/resume/回放一致）；错误信息同样打码。覆盖常见凭据形态（AKIA…、`ghp_…`、`sk-…`≥36、`Bearer`/`Basic`、PEM 块），短 mock 形态不在覆盖内。
+- **机密脱敏**——回注前统一掩码（`securedRegistry`）＋存储层落盘前掩码（`JsonlFileAdapter` 默认开，tool 结果 content——掩码即最终口径：磁盘/resume/回放一致）；错误信息同样打码。覆盖常见凭据形态（AKIA…、`ghp_…`、`sk-…`≥24、`Bearer`/`Basic`、PEM 块），短 mock 形态不在覆盖内。
 - **存储卫生**——`~/.devmate/config.json` 与会话文件以 `0600` 写入、目录 `0700`（会话目录启动时把历史 0644/0755 存量一次性纠正；两者皆 POSIX 语义——Windows 无 POSIX `chmod`，0600/0700 主张仅 POSIX 有效）；端点只回掩码；Web UI 全文禁止 `innerHTML`、强制 `safeHref` 白名单 + CSP。
 - **成本护栏**——唯一默认开启的保险丝：`$3`/任务，每次查询前预检、流式中超阈值即中止，带真实 usage 校准账本。
 - **内存警戒线**——超过 RSS 阈值释放空闲 Shell，`GET /api/stats` 上报 `memoryGuard` 状态。

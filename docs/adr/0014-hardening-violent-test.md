@@ -32,7 +32,7 @@ Status: accepted
 **决策**：
 1. **权限**：`JsonlFileAdapter` 目录 `mkdir mode 0700` + 构造时 `chmod 0700`；新会话文件 `open(...,'wx',0o600)`；存量 `*.jsonl` 构造时目录扫描一次性 chmod 0600（不越权纠正非会话文件）。POSIX 语义（Windows chmod 近似）；与 config.ts saveConfig 0600/0700 同口径。
 2. **存储层脱敏（最终口径）**：`JsonlFileAdapter` append 前对 `kind==='tool'` 的 payload.content 过 `redactSecrets`（与 registry 层 securedRegistry 同一实现，幂等）——append 返回值、磁盘、resume/回放**全为掩码**（真实凭据不出现两次；与原「回注前脱敏」一致且更彻底）。只作用于 tool 事件（user 消息不脱敏）；开关 `redactToolContent:false`（默认 true）供白名单/第三方适配逃生；掩码产物无引号/换行 → JSON 形状保持可解析。
-3. **边界记录**：脱敏只覆盖常见凭据形态（AKIA…、ghp_/gho_/ghu_…、`sk-`≥36、Bearer/Basic、PEM 块）——短 mock 形态（`sk-short`）不在正则集内（与 redact 模块「常见形态、不追求穷尽」经验取舍一致）；shell 读侧越界是**模型侧边界之外的事实**：监狱是行为约束层、非 OS 沙箱（ADR-0013 第 1 层），文档明示「读侧不受边界限制、密钥可被会话读取」，依赖存储 0600 + 落盘掩码兜底。
+3. **边界记录**：脱敏只覆盖常见凭据形态（AKIA…、ghp_/gho_/ghu_…、`sk-`≥24、Bearer/Basic、PEM 块）——短 mock 形态（`sk-short`）不在正则集内（与 redact 模块「常见形态、不追求穷尽」经验取舍一致）；shell 读侧越界是**模型侧边界之外的事实**：监狱是行为约束层、非 OS 沙箱（ADR-0013 第 1 层），文档明示「读侧不受边界限制、密钥可被会话读取」，依赖存储 0600 + 落盘掩码兜底。
 
 **后果**：shell 越界读出的 key 不再以明文出现在同机可读会话文件；磁盘/回放/投影掩码一次对齐（无「内存原文、磁盘掩码」两张皮）；e2e 断言基于 mock 无 key → 零影响。
 
