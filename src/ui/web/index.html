@@ -835,36 +835,43 @@
                 />
               </div>
               <div class="field-group">
-                <label for="set-max-input-tokens">输入上限（token）</label>
+                <label for="set-max-input-tokens"
+                  >输入上限（token）<span class="req-mark">*</span></label
+                >
                 <input
                   class="input input-num"
                   id="set-max-input-tokens"
                   type="number"
                   min="1"
                   step="1"
-                  placeholder="留空=厂商默认"
+                  placeholder="请输入正整数"
                   autocomplete="off"
                 />
                 <p class="field-help">
-                  请求侧单请求输入上限（max_input_tokens）。仅 DashScope/Qwen
-                  等白名单供应商支持发送； 其余供应商（含
-                  DeepSeek）档位由模型固有上下文决定（不发送该字段）。
+                  请求侧单请求输入上限（max_input_tokens），必填正整数。仅 DashScope/Qwen
+                  等白名单供应商支持发送；其余供应商（含 DeepSeek）不发送该字段
+                  （档位由模型固有上下文决定）。
                 </p>
+                <p class="field-help err" id="set-max-input-tokens-err" hidden></p>
               </div>
               <div class="field-group">
-                <label for="set-max-output-tokens">输出上限（token）</label>
+                <label for="set-max-output-tokens"
+                  >输出上限（token）<span class="req-mark">*</span></label
+                >
                 <input
                   class="input input-num"
                   id="set-max-output-tokens"
                   type="number"
                   min="1"
                   step="1"
-                  placeholder="留空=厂商默认"
+                  placeholder="请输入正整数"
                   autocomplete="off"
                 />
                 <p class="field-help">
-                  请求侧单请求输出上限（max_tokens）；留空按模型厂商默认（预算估价按 8192 预留）。
+                  请求侧单请求输出上限（max_tokens），必填正整数；未设置时按缺省 8192
+                  （DEFAULT_MAX_TOKENS）回填。
                 </p>
+                <p class="field-help err" id="set-max-output-tokens-err" hidden></p>
               </div>
               <div class="field-group">
                 <label for="set-key">API Key</label>

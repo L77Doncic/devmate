@@ -56,6 +56,7 @@ import {
   REVIEWMODE_DEFAULT,
   normalizeReviewMode,
   saveReviewMode,
+  tokenLimitError,
 } from './settings.js';
 import {
   PERMISSION_VALUES,
@@ -254,10 +255,16 @@ const ui = {
     methodFirst: METHODFIRST_DEFAULT,
     // R2-S2：收尾评审哨兵开关（缺省 true；GET /api/settings 权威回显，见设置页常规区）
     reviewMode: REVIEWMODE_DEFAULT,
-    // A 档：请求侧输入/输出上限（null = 未设置（留空=厂商默认）；服务端只回已设值）
+    // A/B 档：请求侧输入/输出上限（null = 数据未到/坏值；服务端 GET 恒回显——
+    // 存量缺失回填缺省并挂 *Default 键）；A 档模型名净化标记（GET 值带 UI 尾标 → 已校正）
     maxInputTokens: null,
     maxOutputTokens: null,
+    maxInputTokensDefault: false,
+    maxOutputTokensDefault: false,
+    modelAutoCorrected: false,
   },
+  // A 档提示纪律：模型名「已自动校正」只在本次加载提示**一次**（不重复打扰）
+  modelAutoCorrectedNotified: false,
   // 附件（ADR-0015）：composer 待发送图像（{url,width,height,name} 于 pick 时归一；
   // 发送成功即清空；失败保留供重试）。
   attachments: [],
@@ -469,6 +476,9 @@ const el = {
   setKey: document.getElementById('set-key'),
   setMaxInputTokens: document.getElementById('set-max-input-tokens'),
   setMaxOutputTokens: document.getElementById('set-max-output-tokens'),
+  setMaxInputTokensErr: document.getElementById('set-max-input-tokens-err'),
+  setMaxOutputTokensErr: document.getElementById('set-max-output-tokens-err'),
+  btnSaveSettings: document.getElementById('btn-save-settings'),
   setWorkspace: document.getElementById('set-workspace'),
   keyState: document.getElementById('key-state'),
   settingsStatus: document.getElementById('settings-status'),
@@ -3003,7 +3013,7 @@ async function flushPermissionSync() {
   ui.permissionSyncPending = null;
   if (value === null || value === undefined) return;
   try {
-    const saved = await savePermission(value);
+    const saved = await savePermission(value, currentTokenLimits());
     ui.settings = { ...ui.settings, ...saved }; // 服务端权威回体（含 confirmedAt 记录）
   } catch {
     await revertPermission();
@@ -3054,7 +3064,7 @@ async function flushMethodFirstSync() {
   ui.methodFirstSyncPending = null;
   if (value === null || value === undefined) return;
   try {
-    const saved = await saveMethodFirst(value);
+    const saved = await saveMethodFirst(value, currentTokenLimits());
     ui.settings = { ...ui.settings, ...saved }; // 服务端权威回体（含归一）
   } catch {
     await revertMethodFirst();
@@ -3105,7 +3115,7 @@ async function flushReviewModeSync() {
   ui.reviewModeSyncPending = null;
   if (value === null || value === undefined) return;
   try {
-    const saved = await saveReviewMode(value);
+    const saved = await saveReviewMode(value, currentTokenLimits());
     ui.settings = { ...ui.settings, ...saved }; // 服务端权威回体（含归一）
   } catch {
     await revertReviewMode();
@@ -4028,7 +4038,7 @@ async function flushReasoningSync() {
   ui.reasoningSyncPending = null;
   if (value === null || value === undefined) return;
   try {
-    const saved = await saveReasoning(value);
+    const saved = await saveReasoning(value, currentTokenLimits());
     ui.settings = { ...ui.settings, ...saved };
   } catch {
     await revertReasoning();
@@ -4080,6 +4090,29 @@ function renderMeter() {
 
 // ============================================================== 设置
 
+/**
+ * B 档：单字段补丁 POST（reasoning/permission/methodFirst/reviewMode）携带的必填
+ * 上限对——值取当前设置（GET 回填缺省后恒有值）；未同步（null）→ '' 由 save*
+ * 本地先拦 + 服务端 400 (max-input-output-required) 兜底。
+ */
+function currentTokenLimits() {
+  return {
+    maxInputTokens: ui.settings.maxInputTokens ?? '',
+    maxOutputTokens: ui.settings.maxOutputTokens ?? '',
+  };
+}
+
+/**
+ * A 档：模型名「已自动校正」提示（每次加载至多一次——存量 config 带 UI 标记后缀时
+ * GET 净化回显 + toast 告知，不静默；提示后本存储位不再弹）。
+ */
+function noticeModelAutoCorrection() {
+  if (ui.settings.modelAutoCorrected === true && !ui.modelAutoCorrectedNotified) {
+    ui.modelAutoCorrectedNotified = true;
+    toast('模型名已自动校正（去掉 UI 标记后缀）', 'warn');
+  }
+}
+
 function closeDrawer() {
   // 切换前 flush 待提交的 Subagent 工作流同步（change 即提交：无队列，只补发最后一片）
   void flushSubagentSync();
@@ -4096,6 +4129,7 @@ async function openSettings() {
     const s = await loadSettings();
     ui.settings = { ...ui.settings, ...s };
     ui.settingsReady = true;
+    noticeModelAutoCorrection(); // A 档：存量模型名带 UI 尾标 → 净化回显 + 提示一次
   } catch {
     if (!ui.settingsReady) {
       el.settingsStatus.textContent = '静态预览环境（未连接服务端）：设置保存仅本地提示';
@@ -4118,20 +4152,40 @@ async function openSettings() {
 }
 
 /**
- * 上限输入解析（A 档）：空串 → null（未设置——不发送）；纯数字串（仅 [0-9]+）且为
- * 正整数 → number；其余抛错（保存中止 + 文案）。与 service 端「严格正整数」同口径。
+ * 上限输入解析（A/B 档）：纯数字串（仅 [0-9]+）且为正整数 → number；其余抛错
+ * （保存中止 + 文案）。与服务端「严格正整数必填」同口径；空串拦截在
+ * syncTokenLimitValidity（必填态：红字 + 禁存）与本函数兜底（不改行为——不再返回 null）。
  */
 function tokenLimitInputValue(input) {
   const raw = String(input?.value ?? '').trim();
-  if (raw === '') return null;
   if (!/^[0-9]+$/.test(raw)) {
-    throw new Error('输入/输出上限必须是正整数（留空 = 厂商默认）');
+    throw new Error('输入/输出上限必须是正整数');
   }
   const value = Number(raw);
   if (!Number.isSafeInteger(value) || value < 1) {
-    throw new Error('输入/输出上限必须是正整数（留空 = 厂商默认）');
+    throw new Error('输入/输出上限必须是正整数');
   }
   return value;
+}
+
+/**
+ * B 档：上限必填校验（空/非正 → 各自红字 + 保存设置禁用——不哑巴）。
+ * 触发点：input 事件 + 回显后（fillSettingsForm 末尾）+ 保存前兜底。
+ */
+function syncTokenLimitValidity() {
+  const inErr = tokenLimitError(el.setMaxInputTokens.value, '输入上限');
+  const outErr = tokenLimitError(el.setMaxOutputTokens.value, '输出上限');
+  showFieldError(el.setMaxInputTokensErr, inErr);
+  showFieldError(el.setMaxOutputTokensErr, outErr);
+  const valid = inErr === '' && outErr === '';
+  el.btnSaveSettings.disabled = !valid;
+  return valid;
+}
+
+function showFieldError(node, message) {
+  if (!node) return;
+  node.hidden = message === '';
+  node.textContent = message;
 }
 
 async function saveSettingsForm() {
@@ -4139,14 +4193,19 @@ async function saveSettingsForm() {
   const model = el.setModel.value.trim();
   const apiKey = el.setKey.value; // 明文仅存在于此刻读值
   el.setKey.value = ''; // 立即清空输入框 —— 明文不滞留
-  // A 档：输入/输出上限（留空 = 不发送——「留空=厂商默认」；
-  // 非空必须是正整数才保存：双端校验，客户端先拦、服务端 400 兜底）。
+  // B 档：输入/输出上限必填（空/非正 → 红字+禁存；保存兜底先拦、服务端 400 再兜）
+  if (syncTokenLimitValidity() === false) {
+    el.settingsStatus.textContent = '保存失败：输入/输出上限必填（正整数）';
+    el.settingsStatus.className = 'drawer-status err';
+    return;
+  }
   let maxInputTokens;
   let maxOutputTokens;
   try {
     maxInputTokens = tokenLimitInputValue(el.setMaxInputTokens);
     maxOutputTokens = tokenLimitInputValue(el.setMaxOutputTokens);
   } catch (err) {
+    syncTokenLimitValidity();
     el.settingsStatus.textContent = `保存失败：${err instanceof Error ? err.message : String(err)}`;
     el.settingsStatus.className = 'drawer-status err';
     return;
@@ -4168,12 +4227,21 @@ async function saveSettingsForm() {
 
 function fillSettingsForm() {
   el.setBaseUrl.value = ui.settings.baseUrl || DEFAULT_SETTINGS.baseUrl;
+  // A 档：模型名回显=净化值（服务端 GET 已净化；normalize 双保险——残留尾标被剥离）
   el.setModel.value = ui.settings.model || DEFAULT_SETTINGS.model;
-  // A 档：输入/输出上限回显（null = 未设置 → 输入框留空——「留空=厂商默认」占位）
+  // A/B 档：输入/输出上限回显（服务端 GET 恒回显——存量缺失回填缺省；
+  // null（数据未到/坏值）→ 空串，必填校验随即红字+禁存，不做静默留空）
   el.setMaxInputTokens.value =
     ui.settings.maxInputTokens !== null ? String(ui.settings.maxInputTokens) : '';
   el.setMaxOutputTokens.value =
     ui.settings.maxOutputTokens !== null ? String(ui.settings.maxOutputTokens) : '';
+  syncTokenLimitValidity(); // B 档：必填态随回显即算（红字/禁存随值）
+  // B 档：缺省回填提示（GET 回体 *Default=true → 「已用默认，请修改保存」——不静默；
+  // 保存后升格为存量，回体不再带 Default 键 → 不再提示）
+  if (ui.settings.maxInputTokensDefault === true || ui.settings.maxOutputTokensDefault === true) {
+    el.settingsStatus.textContent = '输入/输出上限已用默认值，请修改并保存';
+    el.settingsStatus.className = 'drawer-status';
+  }
   // 工作区目录：服务端未提供时为占位（显示字段，不可改）
   el.setWorkspace.textContent =
     ui.settings.workspaceDir || '（服务端未提供 · 工作目录由 DevMate 启动位置决定）';
@@ -4690,6 +4758,9 @@ function wireEvents() {
   // dsh 设置卡 Cancel/Apply 对：取消 = 关闭设置页（配置改动不落盘）
   el.btnSettingsCancel?.addEventListener('click', closeDrawer);
   document.getElementById('btn-save-settings').addEventListener('click', saveSettingsForm);
+  // B 档：上限必填校验随输入即时（空/非正 → 红字 + 保存设置禁用）
+  el.setMaxInputTokens.addEventListener('input', syncTokenLimitValidity);
+  el.setMaxOutputTokens.addEventListener('input', syncTokenLimitValidity);
   el.drawerScrim.addEventListener('click', closeDrawer);
   el.input.addEventListener('input', () => {
     autogrow();
@@ -4955,6 +5026,7 @@ async function boot() {
     const s = await loadSettings();
     ui.settings = { ...ui.settings, ...s };
     ui.settingsReady = true;
+    noticeModelAutoCorrection(); // A 档：存量模型名带 UI 尾标 → 净化回显 + 提示一次
   } catch {
     ui.settingsReady = false;
   }

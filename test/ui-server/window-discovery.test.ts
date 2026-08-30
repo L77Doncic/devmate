@@ -41,6 +41,9 @@ function baseDeps(extra: Partial<DevmateServerDeps> = {}): DevmateServerDeps {
   };
 }
 
+/** B 档：/api/settings POST 恒要求的必填上限对（2026-08-30 用户强制）。 */
+const TOKENS = { maxInputTokens: 4096, maxOutputTokens: 2048 };
+
 const gatewayDiscovery = {
   window: 200_000,
   source: 'gateway' as const,
@@ -77,7 +80,7 @@ describe('ui/server：三源取窗 GET /api/settings 优先级', () => {
     );
     servers.push(server);
     const posted = (await (
-      await postJson(base, '/api/settings', { windowTokens: 300_000 })
+      await postJson(base, '/api/settings', { windowTokens: 300_000, ...TOKENS })
     ).json()) as { window?: number; windowDetail?: string };
     expect(posted.window).toBe(300_000);
     expect(posted.windowDetail).toContain('覆盖');
@@ -144,7 +147,10 @@ describe('ui/server：三源取窗 GET /api/settings 优先级', () => {
       baseDeps({ windowDiscovered: () => currentDiscovery, probeWindow: probe }),
     );
     servers.push(server);
-    const res = await postJson(base, '/api/settings', { baseUrl: 'https://new.example/v1' });
+    const res = await postJson(base, '/api/settings', {
+      baseUrl: 'https://new.example/v1',
+      ...TOKENS,
+    });
     expect(res.status).toBe(200);
     expect(probe).toHaveBeenCalledWith({
       baseUrl: 'https://new.example/v1',
@@ -168,7 +174,10 @@ describe('ui/server：三源取窗 GET /api/settings 优先级', () => {
       }),
     );
     servers.push(server2);
-    const res2 = await postJson(base2, '/api/settings', { baseUrl: 'https://other.example/v1' });
+    const res2 = await postJson(base2, '/api/settings', {
+      baseUrl: 'https://other.example/v1',
+      ...TOKENS,
+    });
     expect(res2.status).toBe(200);
   });
 });
@@ -262,7 +271,10 @@ describe('ui/server：assembleDeps 后台探测接线', () => {
       window?: number;
     };
     expect(before.window).toBe(defaultProviderPreset().contextWindowTokens);
-    const res = await postJson(base, '/api/settings', { baseUrl: 'https://off.example/v1' });
+    const res = await postJson(base, '/api/settings', {
+      baseUrl: 'https://off.example/v1',
+      ...TOKENS,
+    });
     expect(res.status).toBe(200);
   });
 
@@ -290,5 +302,34 @@ describe('ui/server：assembleDeps 后台探测接线', () => {
     };
     expect(settings.window).toBe(defaultProviderPreset().contextWindowTokens);
     expect(settings.windowDetail).toContain('preset');
+  });
+
+  it('a5) 模型名带 `[1m]` 尾标 → 网关探测按**净化名**匹配（有效窗口三源·命中）——用户实测修复', async () => {
+    const dir = await tempDir();
+    const fetchImpl = vi.fn(async (_url: Parameters<typeof fetch>[0], _init?: RequestInit) =>
+      modelListResponse([{ id: 'deepseek-v4-flash', context_length: 128_000 }]),
+    );
+    const deps = await assembleDeps({
+      workspaceRoot: dir,
+      sessionsDir: join(dir, 'sessions'),
+      model: 'deepseek-v4-flash[1m]',
+      apiKey: 'sk-probe-1234567890abc',
+      windowDiscovery: { fetchImpl, timeoutMs: 500 },
+    });
+    await vi.waitFor(() => expect(deps.windowDiscovered?.()).not.toBeNull(), {
+      timeout: 2_000,
+    });
+    // 净化名匹配条目（若带尾标直传则无匹配 detail 变「未命中」——命中证明净化）
+    const discovered = deps.windowDiscovered!();
+    expect(discovered).toMatchObject({ window: 128_000, source: 'gateway' });
+    expect(discovered?.detail).toContain('命中模型');
+    const { base, server } = await startServer(deps);
+    servers.push(server);
+    const settings = (await (await fetch(new URL('/api/settings', base))).json()) as {
+      window?: number;
+      model?: string;
+    };
+    expect(settings.window).toBe(128_000);
+    expect(settings.model).toBe('deepseek-v4-flash'); // GET 恒净化名
   });
 });

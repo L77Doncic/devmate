@@ -3,6 +3,13 @@
  *
  * GET/POST /api/settings {baseUrl, model, apiKey?}；apiKey 只回掩码（前 4 尾 4），
  * 绝不出现在任何响应里；model 变更即时作用于后续 run（真实 llm 请求带新 model）。
+ * A 档（2026-08-30 用户实测修正）：模型名 `[N]m/k` UI 标记后缀**全链净化**——
+ * GET/POST 响应恒净化名；POST 保存即净化（persist/config 净化值）；有效窗口
+ * （网关探测匹配）按净化名。
+ * B 档（2026-08-30 用户强制）：maxInputTokens/maxOutputTokens **必填**——POST 缺任一
+ * → 400 code=max-input-output-required / 非正整数 → code=invalid；GET 恒回显
+ * （存量缺失回填缺省：输出 8192=DEFAULT_MAX_TOKENS、输入=供应商 preset，并挂
+ * `*Default` 提示键——「已用默认，请修改保存」不静默）。
  */
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { defineRegistry } from '../../src/core/loop/index.js';
@@ -13,6 +20,10 @@ import { echoTool, FakeLlm, runCommandTool } from '../loop/support.js';
 import { postJson, SseClient, startServer, waitForFrames } from './support.js';
 
 const RAW_KEY = 'sk-1234567890abcdef';
+/** B 档：POST 必填上限对（测试共用值；断言只用存在性/数字等同——见各用例）。 */
+const TEST_TOKENS = { maxInputTokens: 4096, maxOutputTokens: 2048 };
+const DEFAULT_OUTPUT_TOKENS = 8192; // DEFAULT_MAX_TOKENS（core/loop/types）
+const DEFAULT_PRESET_WINDOW = 128_000; // deepseek preset 估算（输入上限缺省回填）
 
 function baseDeps(llm: FakeLlm): DevmateServerDeps {
   return {
@@ -49,6 +60,7 @@ describe('ui/server：settings', () => {
       baseUrl: 'https://new.example/v1',
       model: 'm1',
       apiKey: RAW_KEY,
+      ...TEST_TOKENS,
     });
     expect(res.status).toBe(200);
     const text = await res.text();
@@ -67,20 +79,20 @@ describe('ui/server：settings', () => {
     const { base, server } = await startServer(baseDeps(new FakeLlm([{ content: 'x' }])));
     servers.push(server);
 
-    const long = (await (await postJson(base, '/api/settings', { apiKey: RAW_KEY })).json()) as {
-      apiKey: string;
-    };
+    const long = (await (
+      await postJson(base, '/api/settings', { apiKey: RAW_KEY, ...TEST_TOKENS })
+    ).json()) as { apiKey: string };
     expect(long.apiKey).toBe(`${RAW_KEY.slice(0, 4)}****${RAW_KEY.slice(-4)}`);
 
     // 9~12 字符边界（此前实现 ≤8 才全掩，9~12 会漏出首尾 —— 现按单一实现全掩）
     for (const len of [9, 10, 11, 12]) {
       const key = 'k'.repeat(len);
-      const res = await postJson(base, '/api/settings', { apiKey: key });
+      const res = await postJson(base, '/api/settings', { apiKey: key, ...TEST_TOKENS });
       expect(((await res.json()) as { apiKey: string }).apiKey).toBe('****');
     }
     // >12 的分界（13 字符）：显首尾 4
     const edge = (await (
-      await postJson(base, '/api/settings', { apiKey: 'm'.repeat(13) })
+      await postJson(base, '/api/settings', { apiKey: 'm'.repeat(13), ...TEST_TOKENS })
     ).json()) as { apiKey: string };
     expect(edge.apiKey).toBe('mmmm****mmmm');
   });
@@ -90,10 +102,9 @@ describe('ui/server：settings', () => {
     const { base, server } = await startServer(baseDeps(llm));
     servers.push(server);
 
-    const v1 = (await (await postJson(base, '/api/settings', { model: 'm2' })).json()) as {
-      baseUrl: string;
-      model: string;
-    };
+    const v1 = (await (
+      await postJson(base, '/api/settings', { model: 'm2', ...TEST_TOKENS })
+    ).json()) as { baseUrl: string; model: string };
     expect(v1).toMatchObject({ baseUrl: 'https://default.example/v1', model: 'm2' });
 
     const created = (await (await postJson(base, '/api/chat', { text: 'hi' })).json()) as {
@@ -105,7 +116,7 @@ describe('ui/server：settings', () => {
     expect(llm.requests[0]!.model).toBe('m2');
   });
 
-  it('f5) persistSettings：POST 后按应用值调用（含 apiKey）；GET 不触发；空 key 清除时不带 apiKey', async () => {
+  it('f5) persistSettings：POST 后按应用值调用（含 apiKey 与必填上限对）；GET 不触发；空 key 清除时不带 apiKey', async () => {
     const persisted: Array<Record<string, unknown>> = [];
     const { base, server } = await startServer({
       ...baseDeps(new FakeLlm([{ content: 'x' }])),
@@ -119,22 +130,40 @@ describe('ui/server：settings', () => {
       baseUrl: 'https://persist.example/v1',
       model: 'm-p',
       apiKey: RAW_KEY,
+      ...TEST_TOKENS,
     });
     expect(persisted).toEqual([
-      { baseUrl: 'https://persist.example/v1', model: 'm-p', apiKey: RAW_KEY },
+      {
+        baseUrl: 'https://persist.example/v1',
+        model: 'm-p',
+        apiKey: RAW_KEY,
+        maxInputTokens: TEST_TOKENS.maxInputTokens,
+        maxOutputTokens: TEST_TOKENS.maxOutputTokens,
+      },
     ]);
 
     await fetch(new URL('/api/settings', base)); // GET 不触发持久化
     expect(persisted).toHaveLength(1);
 
-    const cleared = await postJson(base, '/api/settings', { apiKey: '' });
+    const cleared = await postJson(base, '/api/settings', { apiKey: '', ...TEST_TOKENS });
     expect(cleared.status).toBe(200);
     const body = (await cleared.json()) as { baseUrl: string; model: string; apiKey?: string };
     expect(body).toMatchObject({ baseUrl: 'https://persist.example/v1', model: 'm-p' });
     expect(body.apiKey).toBeUndefined(); // 空 key = 显式删除：响应不出现掩码
     expect(persisted).toEqual([
-      { baseUrl: 'https://persist.example/v1', model: 'm-p', apiKey: RAW_KEY },
-      { baseUrl: 'https://persist.example/v1', model: 'm-p' },
+      {
+        baseUrl: 'https://persist.example/v1',
+        model: 'm-p',
+        apiKey: RAW_KEY,
+        maxInputTokens: TEST_TOKENS.maxInputTokens,
+        maxOutputTokens: TEST_TOKENS.maxOutputTokens,
+      },
+      {
+        baseUrl: 'https://persist.example/v1',
+        model: 'm-p',
+        maxInputTokens: TEST_TOKENS.maxInputTokens,
+        maxOutputTokens: TEST_TOKENS.maxOutputTokens,
+      },
     ]);
   });
 
@@ -151,6 +180,7 @@ describe('ui/server：settings', () => {
       baseUrl: 'https://run.example/v1',
       model: 'm-run',
       apiKey: 'sk-llm-1234567890abcd',
+      ...TEST_TOKENS,
     });
 
     const created = (await (await postJson(base, '/api/chat', { text: 'hi' })).json()) as {
@@ -166,7 +196,7 @@ describe('ui/server：settings', () => {
     expect(runLlm.requests[0]!.model).toBe('m-run');
 
     // 清空 key：下一次 run 的 llm 接缝拿 apiKey undefined
-    await postJson(base, '/api/settings', { apiKey: '' });
+    await postJson(base, '/api/settings', { apiKey: '', ...TEST_TOKENS });
     const created2 = (await (await postJson(base, '/api/chat', { text: 'again' })).json()) as {
       sessionId: string;
     };
@@ -179,15 +209,101 @@ describe('ui/server：settings', () => {
     });
   });
 
-  it('f4) 空字段/非对象体 → 400 {error}', async () => {
+  it('f4) 空字段/非对象体 → 400 {error}（B 档：空体先被「上限必填」拦截——仍是 400）', async () => {
     const { base, server } = await startServer(baseDeps(new FakeLlm([{ content: 'x' }])));
     servers.push(server);
     const empty = await postJson(base, '/api/settings', {});
     expect(empty.status).toBe(400);
     expect(((await empty.json()) as { error: string }).error).toBeTypeOf('string');
-    const badType = await postJson(base, '/api/settings', { model: 42 });
+    const badType = await postJson(base, '/api/settings', { model: 42, ...TEST_TOKENS });
     expect(badType.status).toBe(400);
     expect(((await badType.json()) as { error: string }).error).toBeTypeOf('string');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// A 档：模型名全链净化（2026-08-30 用户实测修正——`[N]m/k` UI 标记后缀残留）
+// ---------------------------------------------------------------------------
+
+describe('ui/server：模型名全链净化（A 档）', () => {
+  const servers: DevmateServer[] = [];
+
+  afterEach(async () => {
+    for (const server of servers.splice(0)) await server.close();
+  });
+
+  it('g1) 存量 settings.model 带 `[1m]` 尾标（历史残留 config）→ GET 显示净化名 + modelSanitized 标记', async () => {
+    const { base, server } = await startServer({
+      ...baseDeps(new FakeLlm([{ content: 'x' }])),
+      settings: { baseUrl: 'https://default.example/v1', model: 'm0[1m]' },
+    });
+    servers.push(server);
+
+    const get = (await (await fetch(new URL('/api/settings', base))).json()) as {
+      model: string;
+      modelSanitized?: boolean;
+    };
+    expect(get.model).toBe('m0');
+    expect(get.model).not.toMatch(/\[(?:[0-9.]+)(?:[km])/i);
+    expect(get.modelSanitized).toBe(true); // 前端据此提示「模型名已自动校正」一次
+
+    // 无尾标的存量 → 无标记（不误提示）
+    const { base: base2, server: server2 } = await startServer(
+      baseDeps(new FakeLlm([{ content: 'x' }])),
+    );
+    servers.push(server2);
+    const clean = (await (await fetch(new URL('/api/settings', base2))).json()) as {
+      model: string;
+      modelSanitized?: boolean;
+    };
+    expect(clean.model).toBe('m0');
+    expect(clean.modelSanitized).toBeUndefined();
+  });
+
+  it('g2) POST {model:[1m] 尾标} → 保存即净化：persist 净化值 + 响应/GET 净化名 + run 用净化名', async () => {
+    const llm = new FakeLlm([{ content: 'x' }]);
+    const persisted: Array<Record<string, unknown>> = [];
+    const { base, server } = await startServer({
+      ...baseDeps(llm),
+      persistSettings: (s: unknown) => {
+        persisted.push(JSON.parse(JSON.stringify(s)) as Record<string, unknown>);
+      },
+    });
+    servers.push(server);
+
+    const posted = await postJson(base, '/api/settings', { model: 'm-p[1m]', ...TEST_TOKENS });
+    expect(posted.status).toBe(200);
+    const saved = (await posted.json()) as { model: string };
+    expect(saved.model).toBe('m-p');
+    expect(persisted[persisted.length - 1]!).toMatchObject({ model: 'm-p' });
+
+    const after = (await (await fetch(new URL('/api/settings', base))).json()) as {
+      model: string;
+      modelSanitized?: boolean;
+    };
+    expect(after.model).toBe('m-p');
+    expect(after.modelSanitized).toBeUndefined(); // 新保存值不触发「存量已校正」提示
+
+    // run：current.model 恒净化（摘要器/llm 接缝同源——FakeLlm 收到的模型名净化）
+    const created = (await (await postJson(base, '/api/chat', { text: 'hi' })).json()) as {
+      sessionId: string;
+    };
+    const client = await SseClient.connect(base, created.sessionId);
+    await waitForFrames(client, 5, 10_000);
+    expect(llm.requests[0]!.model).toBe('m-p');
+    client.close();
+  });
+
+  it('g3) 规则：非尾标/无后缀名原样（不误伤 my-model-1m / my[m]model）', async () => {
+    const { base, server } = await startServer({
+      ...baseDeps(new FakeLlm([{ content: 'x' }])),
+      settings: { baseUrl: 'https://default.example/v1', model: 'my[m]model[128k]' },
+    });
+    servers.push(server);
+    const get = (await (await fetch(new URL('/api/settings', base))).json()) as {
+      model: string;
+    };
+    expect(get.model).toBe('my[m]model');
   });
 });
 
@@ -219,23 +335,30 @@ describe('ui/server：reviewMode（R2-S2 评审哨兵开关）', () => {
     };
     expect(initial.reviewMode).toBe(true);
 
-    // 未触碰不带键（补丁语义——与 methodFirst 同规）
-    await postJson(base, '/api/settings', { model: 'm1' });
-    expect(persisted[0]).toEqual({ baseUrl: 'https://default.example/v1', model: 'm1' });
+    // 未触碰不带键（补丁语义——与 methodFirst 同规）；上限对恒携带（B 档必填）
+    await postJson(base, '/api/settings', { model: 'm1', ...TEST_TOKENS });
+    expect(persisted[0]).toEqual({
+      baseUrl: 'https://default.example/v1',
+      model: 'm1',
+      maxInputTokens: TEST_TOKENS.maxInputTokens,
+      maxOutputTokens: TEST_TOKENS.maxOutputTokens,
+    });
 
-    const off = await postJson(base, '/api/settings', { reviewMode: false });
+    const off = await postJson(base, '/api/settings', { reviewMode: false, ...TEST_TOKENS });
     expect(off.status).toBe(200);
     expect(((await off.json()) as { reviewMode: boolean }).reviewMode).toBe(false);
     expect(persisted[1]).toEqual({
       baseUrl: 'https://default.example/v1',
       model: 'm1',
       reviewMode: false,
+      maxInputTokens: TEST_TOKENS.maxInputTokens,
+      maxOutputTokens: TEST_TOKENS.maxOutputTokens,
     });
     expect(
       (await (await fetch(new URL('/api/settings', base))).json()) as { reviewMode: boolean },
     ).toEqual(expect.objectContaining({ reviewMode: false }));
 
-    const bad = await postJson(base, '/api/settings', { reviewMode: 'yes' });
+    const bad = await postJson(base, '/api/settings', { reviewMode: 'yes', ...TEST_TOKENS });
     expect(bad.status).toBe(400);
   });
 
@@ -252,7 +375,11 @@ describe('ui/server：reviewMode（R2-S2 评审哨兵开关）', () => {
       tools: defineRegistry([runCommandTool()], { sessionId: 's1' }),
       llm,
       model: 'm0',
-      settings: { reviewMode: false },
+      settings: {
+        reviewMode: false,
+        baseUrl: 'https://default.example/v1',
+        model: 'm0',
+      },
       // 本用例只锁哨兵开关链路：echo 属 ask 级 → 审批直放（审批链在 approval 测试覆盖）
       approvalPolicy: () => false,
     });
@@ -286,10 +413,10 @@ describe('ui/server：reviewMode（R2-S2 评审哨兵开关）', () => {
 });
 
 // ---------------------------------------------------------------------------
-// A 档：maxInputTokens / maxOutputTokens（严格正整数；未设不传；即时作用于后续 run）
+// A/B 档：maxInputTokens / maxOutputTokens（必填；GET 缺省回填+提示键；即时生效）
 // ---------------------------------------------------------------------------
 
-describe('ui/server：settings 输入/输出上限（A 档）', () => {
+describe('ui/server：settings 输入/输出上限（A/B 档必填）', () => {
   const servers: DevmateServer[] = [];
   const clients: SseClient[] = [];
 
@@ -298,7 +425,7 @@ describe('ui/server：settings 输入/输出上限（A 档）', () => {
     for (const server of servers.splice(0)) await server.close();
   });
 
-  it('l1) POST 上限 → GET 回显（只回已设值）；未设恒不带键', async () => {
+  it('b1) GET 存量缺失 → 恒回显缺省（输出 8192=DEFAULT_MAX_TOKENS；输入=供应商 preset 128000）且带 `*Default` 提示键', async () => {
     const { base, server } = await startServer(baseDeps(new FakeLlm([{ content: 'x' }])));
     servers.push(server);
 
@@ -306,8 +433,15 @@ describe('ui/server：settings 输入/输出上限（A 档）', () => {
       string,
       unknown
     >;
-    expect(initial.maxInputTokens).toBeUndefined();
-    expect(initial.maxOutputTokens).toBeUndefined();
+    expect(initial.maxInputTokens).toBe(DEFAULT_PRESET_WINDOW);
+    expect(initial.maxOutputTokens).toBe(DEFAULT_OUTPUT_TOKENS);
+    expect(initial.maxInputTokensDefault).toBe(true);
+    expect(initial.maxOutputTokensDefault).toBe(true);
+  });
+
+  it('b2) 显式存储值 → GET 恒回显现值；`*Default` 键消失（保存后缺省升格为存量）', async () => {
+    const { base, server } = await startServer(baseDeps(new FakeLlm([{ content: 'x' }])));
+    servers.push(server);
 
     await postJson(base, '/api/settings', { maxInputTokens: 4096, maxOutputTokens: 2048 });
     const after = (await (await fetch(new URL('/api/settings', base))).json()) as Record<
@@ -316,9 +450,11 @@ describe('ui/server：settings 输入/输出上限（A 档）', () => {
     >;
     expect(after.maxInputTokens).toBe(4096);
     expect(after.maxOutputTokens).toBe(2048);
+    expect(after.maxInputTokensDefault).toBeUndefined();
+    expect(after.maxOutputTokensDefault).toBeUndefined();
 
-    // 未触碰字段不被回写（只 POST 一个）
-    await postJson(base, '/api/settings', { maxInputTokens: 8192 });
+    // 只改输入（上限对恒携带）：输出保持现值不被覆盖
+    await postJson(base, '/api/settings', { maxInputTokens: 8192, maxOutputTokens: 2048 });
     const partial = (await (await fetch(new URL('/api/settings', base))).json()) as Record<
       string,
       unknown
@@ -327,18 +463,48 @@ describe('ui/server：settings 输入/输出上限（A 档）', () => {
     expect(partial.maxOutputTokens).toBe(2048);
   });
 
-  it('l2) 违反严格正整数的值 → 400', async () => {
+  it('b3) POST 缺任一上限 → 400 code=max-input-output-required', async () => {
+    const { base, server } = await startServer(baseDeps(new FakeLlm([{ content: 'x' }])));
+    servers.push(server);
+
+    const missingIn = await postJson(base, '/api/settings', { maxOutputTokens: 2048 });
+    expect(missingIn.status).toBe(400);
+    expect(((await missingIn.json()) as { code: string }).code).toBe('max-input-output-required');
+
+    const missingOut = await postJson(base, '/api/settings', { maxInputTokens: 4096 });
+    expect(missingOut.status).toBe(400);
+    expect(((await missingOut.json()) as { code: string }).code).toBe('max-input-output-required');
+
+    // 单字段补丁（等 POST 语义）也恒要求上限对
+    const patch = await postJson(base, '/api/settings', { reasoning: 'high' });
+    expect(patch.status).toBe(400);
+    expect(((await patch.json()) as { code: string }).code).toBe('max-input-output-required');
+
+    const empty = await postJson(base, '/api/settings', {});
+    expect(empty.status).toBe(400);
+    expect(((await empty.json()) as { code: string }).code).toBe('max-input-output-required');
+  });
+
+  it('b4) 非严格正整数（0/-1/1.5/字符串/布尔）→ 400 code=invalid', async () => {
     const { base, server } = await startServer(baseDeps(new FakeLlm([{ content: 'x' }])));
     servers.push(server);
     for (const bad of [0, -1, 1.5, '4096', true]) {
-      const res = await postJson(base, '/api/settings', { maxInputTokens: bad });
+      const res = await postJson(base, '/api/settings', {
+        maxInputTokens: bad,
+        maxOutputTokens: 2048,
+      });
       expect(res.status, `maxInputTokens=${String(bad)}`).toBe(400);
-      const res2 = await postJson(base, '/api/settings', { maxOutputTokens: bad });
+      expect(((await res.json()) as { code: string }).code).toBe('invalid');
+      const res2 = await postJson(base, '/api/settings', {
+        maxInputTokens: 4096,
+        maxOutputTokens: bad,
+      });
       expect(res2.status, `maxOutputTokens=${String(bad)}`).toBe(400);
+      expect(((await res2.json()) as { code: string }).code).toBe('invalid');
     }
   });
 
-  it('l3) 生效：POST maxOutputTokens 后下一条 run 的请求带 maxTokens；未设置时不带', async () => {
+  it('b5) 生效：POST maxOutputTokens 后下一条 run 的请求带 maxTokens；POST 前按缺省（未设不发送）', async () => {
     const fake = new FakeLlm([
       { content: 'a', usage: { promptTokens: 1, completionTokens: 1, totalTokens: 2 } },
       { content: 'b', usage: { promptTokens: 1, completionTokens: 1, totalTokens: 2 } },
@@ -346,7 +512,7 @@ describe('ui/server：settings 输入/输出上限（A 档）', () => {
     const { base, server } = await startServer(baseDeps(fake));
     servers.push(server);
 
-    // 未设置：请求不带 maxTokens / maxInputTokens（缺省=厂商默认）
+    // 未设置（缺省回填仅是 GET 回显——不自动注入 run）：请求不带 maxTokens / maxInputTokens
     const r1 = await postJson(base, '/api/chat', { text: 'x' });
     expect(r1.status).toBe(200);
     const s1 = (await r1.json()) as { sessionId: string };
@@ -361,6 +527,41 @@ describe('ui/server：settings 输入/输出上限（A 档）', () => {
     await waitRun(fake, 2);
     expect(fake.requests[1]!.maxTokens).toBe(2222);
     expect(fake.requests[1]!.maxInputTokens).toBe(1111);
+  });
+
+  it('b6) 持久化往返：persistSettings 携带上限对；重读注入（CLI 读回键）后 GET 一致', async () => {
+    const persisted: Array<Record<string, unknown>> = [];
+    const { base, server } = await startServer({
+      ...baseDeps(new FakeLlm([{ content: 'x' }])),
+      persistSettings: (s: unknown) => {
+        persisted.push(JSON.parse(JSON.stringify(s)) as Record<string, unknown>);
+      },
+    });
+    servers.push(server);
+
+    await postJson(base, '/api/settings', { maxInputTokens: 1111, maxOutputTokens: 2222 });
+    expect(persisted[persisted.length - 1]!).toMatchObject({
+      maxInputTokens: 1111,
+      maxOutputTokens: 2222,
+    });
+    // 模拟 CLI 读回注入（web.ts 同键读回 → settings 初值）
+    const { base: base2, server: server2 } = await startServer({
+      ...baseDeps(new FakeLlm([{ content: 'x' }])),
+      settings: {
+        baseUrl: 'https://default.example/v1',
+        model: 'm0',
+        maxInputTokens: 1111,
+        maxOutputTokens: 2222,
+      },
+    });
+    servers.push(server2);
+    const got = (await (await fetch(new URL('/api/settings', base2))).json()) as Record<
+      string,
+      unknown
+    >;
+    expect(got.maxInputTokens).toBe(1111);
+    expect(got.maxOutputTokens).toBe(2222);
+    expect(got.maxOutputTokensDefault).toBeUndefined();
   });
 });
 

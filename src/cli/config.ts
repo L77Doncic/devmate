@@ -19,6 +19,7 @@
 import { chmodSync, existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { defaultProviderPreset } from '../core/llm/presets.js';
+import { sanitizeProviderModel } from '../core/llm/provider-adapter.js';
 import { maskApiKey } from '../shared/masking.js';
 import type { ReasoningEffort } from '../shared/llm-types.js';
 import type { PermissionPreset } from '../ui/server/index.js';
@@ -41,10 +42,12 @@ export interface StoredConfig {
   reasoning?: ReasoningEffort;
   /** 上下文窗口覆盖（C 档：settings windowTokens 持久化；缺省 = 供应商 preset 估算）。 */
   windowTokens?: number;
-  /** 请求侧输入上限（A 档：settings maxInputTokens 持久化；缺省不传——vendor 默认/不发送）。
+  /** 请求侧输入上限（A/B 档：settings maxInputTokens 持久化——**必填**口径以
+   *  settings POST 为准；此处可缺省（缺省回填供应商 preset，见服务端 GET）。
    *  只对白名单供应商生效（DashScope/Qwen），见 deepseek-vision.md §8。 */
   maxInputTokens?: number;
-  /** 请求侧输出上限（A 档：settings maxOutputTokens 持久化；缺省 = 现有 DEFAULT_MAX_TOKENS 估价/不发送）。 */
+  /** 请求侧输出上限（A/B 档：settings maxOutputTokens 持久化——**必填**口径以
+   *  settings POST 为准；此处可缺省（缺省回填 DEFAULT_MAX_TOKENS=8192）。 */
   maxOutputTokens?: number;
   /** 权限预设（settings permission 持久化；缺省 'workspace-write'——服务端兜底）。 */
   permission?: PermissionPreset;
@@ -113,7 +116,9 @@ export function loadConfig(configPath: string, env: Record<string, string | unde
 
   const cfg: CliConfig = {
     baseUrl: env[ENV_BASE_URL] || stored.baseUrl || preset.baseUrl,
-    model: env[ENV_MODEL] || stored.model || preset.defaultModel,
+    // 模型名净化（全链根除 2026-08-30 用户实测残留）：env/config 里的 `[N]m/k` UI 标记
+    // 后缀在读取即剥离——banner/引擎/设置初值全链恒净化名（服务端 POST 亦净化，双保险）。
+    model: sanitizeProviderModel(env[ENV_MODEL] || stored.model || preset.defaultModel),
   };
   const apiKey = env[ENV_API_KEY] || stored.apiKey;
   if (apiKey !== undefined) cfg.apiKey = apiKey;

@@ -1,18 +1,22 @@
 /**
  * # settings.js — 设置读写（get/post /api/settings）与密钥掩码（纯逻辑可注入 fetch）
  *
- * 协议（S12/C 档）：GET /api/settings → {baseUrl, model, apiKey?: string|null, reasoning?,
- * window?: number, permission?, permissionConfirmedAt?, methodFirst?}（apiKey **掩码**，
- * 服务端永不回明文；reasoning = off/low/medium/high 缺省 medium；window = 上下文窗口覆盖，
- * 未配置 → 缺省不带键 = 估算模式；permission = read-only/workspace-write/full-access 缺省
- * workspace-write —— 枚举/标签/风险门的单一权威源 = permissions.js；矩阵契约（本波更新）：
- * read-only = 写入与危险命令逐项确认（ask）/ workspace-write = 工作区命令直接执行零弹窗
- * （含破坏性命令 —— 请在信任的工作区内使用）/ full-access = 全部放行不再问询；
+ * 协议（S12/C 档 + A/B 档修正 2026-08-30）：GET /api/settings → {baseUrl, model,
+ * apiKey?: string|null, reasoning?, window?, maxInputTokens, maxOutputTokens,
+ * maxInputTokensDefault?, maxOutputTokensDefault?, permission?, permissionConfirmedAt?,
+ * methodFirst?, reviewMode?}（apiKey **掩码**，服务端永不回明文；model **恒净化名**
+ * ——UI 标记后缀 `[N]m/k` 全链剥离（存量残留 → modelAutoCorrected 供「已自动校正」提示）；
+ * reasoning = off/low/medium/high 缺省 medium；window = 上下文窗口覆盖，未配置 → 缺省
+ * 不带键 = 估算模式；maxInputTokens/maxOutputTokens **恒回显**（B 档必填——存量缺失回填
+ * 缺省：输出 8192=DEFAULT_MAX_TOKENS、输入=供应商 preset，并挂 `*Default=true` 提示键
+ * 「已用默认，请修改保存」——不静默）；permission = read-only/workspace-write/full-access
+ * 缺省 workspace-write —— 枚举/标签/风险门的单一权威源 = permissions.js；
  * permissionConfirmedAt = full-access 风险确认记录（epoch ms），无记录不带键；
- * methodFirst = R2-S1 方法论前置门开关，缺省 true（布尔；旧服务端无该键 → 前端归一为缺省 true））；
- * POST /api/settings {baseUrl, model, apiKey?, reasoning?, windowTokens?, permission?,
- * methodFirst?} → 同形状（同样只回掩码；reasoning/windowTokens/permission/methodFirst
- * 为补丁字段，未触碰保持现值）。
+ * methodFirst/reviewMode = 前置门/评审哨兵开关，缺省 true）。
+ * POST /api/settings {baseUrl, model, apiKey?, maxInputTokens, maxOutputTokens, reasoning?,
+ * windowTokens?, permission?, methodFirst?} → 同形状；**上限对必填**（缺任一 → 服务端
+ * 400 max-input-output-required；非正整数 → invalid——本地先拦）；reasoning/
+ * windowTokens/permission/methodFirst 为补丁字段，未触碰保持现值。
  *
  * ## 密钥纪律
  * - api_key 只允许**保存时**单向上行（用户输入 → POST）；响应到达后立即丢弃明文，
@@ -88,13 +92,45 @@ export function normalizeWindow(value) {
 
 /**
  * 请求侧输入/输出上限归一（A 档，同 normalizeWindow 纪律）：正整数 number 原样；
- * 其它 → null（null = 未设置：输入框留空——「留空=厂商默认」，不冒充数值）。
- * 理论边界语义（MAX 值域）不做本地钳制——服务端只要求严格正整数；超巨型值由
- * 请求侧供应商 400（max_tokens 超模型上限等）天然兜底，本地不猜厂商上限。
+ * 其它 → null。B 档（2026-08-30 用户强制）：上限**必填**——服务端 GET 恒回显
+ * （存量缺失回填缺省 + `*Default` 提示键），POST 恒要求两者；normalize 只做值域
+ * 归类（null = 数据缺失/坏值），展示层经 tokenLimitError 做必填校验。
  */
 export function normalizeTokenLimit(value) {
   if (typeof value !== 'number' || !Number.isInteger(value) || value < 1) return null;
   return value;
+}
+
+/**
+ * 输入/输出上限必填校验（B 档）；返回错误文案（`''` = 合法）。空串/非 [0-9]+ /
+ * 非正整数 → 错误文案（label 用于区分「输入上限/输出上限」红字）；与服务端
+ * 「严格正整数必填」同口径（服务端 400 code=invalid/max-input-output-required 兜底）。
+ */
+export function tokenLimitError(value, label = '输入/输出上限') {
+  const raw = String(value ?? '').trim();
+  if (raw === '') return `${label}必填（正整数）`;
+  if (!/^[0-9]+$/.test(raw)) return `${label}必须是正整数`;
+  const n = Number(raw);
+  if (!Number.isSafeInteger(n) || n < 1) return `${label}必须是正整数`;
+  return '';
+}
+
+// ---------------------------------------------------------------------------
+// 模型名净化（A 档：`[N]m`/`[N]k` UI 标记后缀全链根除——2026-08-30 用户实测残留）
+// ---------------------------------------------------------------------------
+
+/** 尾部 UI 标记后缀语法（镜像 core/llm/provider-adapter.ts 的 MODEL_WINDOW_HINT_RE；
+ * 大小写宽容、可多个连续、仅末尾）。权威单一来源仍是 provider-adapter.ts。 */
+export const MODEL_WINDOW_HINT_RE = /\[([0-9]+(?:\.[0-9]+)?)([kKmM])\]$/;
+
+/** 模型名净化（镜像 sanitizeProviderModel——浏览器零构建不能 import .ts，只读镜像）。 */
+export function sanitizeModel(model) {
+  let out = String(model ?? '');
+  for (;;) {
+    const next = out.replace(MODEL_WINDOW_HINT_RE, '');
+    if (next === out) return out;
+    out = next;
+  }
 }
 
 /**
@@ -166,12 +202,20 @@ export function maskApiKey(key) {
 
 function normalize(json) {
   const j = json ?? {};
+  // 模型名净化回显（A 档）：GET 值恒净化（服务端亦净化——双保险）；
+  // 残留带后缀（旧服务端/静态预览）→ 净化 + modelAutoCorrected 供「已自动校正」提示一次
+  const rawModel = typeof j.model === 'string' && j.model.trim() ? j.model.trim() : '';
   return {
     baseUrl:
       typeof j.baseUrl === 'string' && j.baseUrl.trim()
         ? j.baseUrl.trim()
         : DEFAULT_SETTINGS.baseUrl,
-    model: typeof j.model === 'string' && j.model.trim() ? j.model.trim() : DEFAULT_SETTINGS.model,
+    model: rawModel ? sanitizeModel(rawModel) : DEFAULT_SETTINGS.model,
+    // 服务端 modelSanitized=true（存量尾标已在读取时剥离）为权威；旧服务端无该键 →
+    // 本地正则兜底（静态预览仍能理性提示）。
+    modelAutoCorrected:
+      j.modelSanitized === true ||
+      Boolean(rawModel && /\[[0-9]+(?:\.[0-9]+)?[kKmM]\]$/.test(rawModel)),
     // 兼容两种字段名兜底：apiKey（协议）/ apiKeyMasked
     keyConfigured: Boolean(j.apiKey || j.apiKeyMasked),
     apiKeyMasked: maskApiKey(j.apiKey || j.apiKeyMasked || ''),
@@ -182,9 +226,12 @@ function normalize(json) {
     // （服务端 GET 回 `window` 键；容错 accept `windowTokens` —— 双名兜底）。
     reasoning: normalizeReasoning(j.reasoning),
     windowTokens: normalizeWindow(j.window ?? j.windowTokens),
-    // A 档：请求侧输入/输出上限（服务端只回「已设置」值——未设不带键 → null = 输入框留空）
+    // A/B 档：请求侧输入/输出上限——服务端 GET 恒回显（缺失回填缺省+`*Default` 键；
+    // 前端据此提示「已用默认，请修改保存」——不静默）。归一失败 → null（展示层红字拦）。
     maxInputTokens: normalizeTokenLimit(j.maxInputTokens),
     maxOutputTokens: normalizeTokenLimit(j.maxOutputTokens),
+    maxInputTokensDefault: j.maxInputTokensDefault === true && j.maxInputTokens !== undefined,
+    maxOutputTokensDefault: j.maxOutputTokensDefault === true && j.maxOutputTokens !== undefined,
     // 权限预设（缺省 workspace-write；枚举/标签权威 = permissions.js）与风险确认记录
     // （无记录 → null —— 前端只在 full-access 且已确认时跳过风险门）
     permission: normalizePermission(j.permission),
@@ -205,27 +252,30 @@ export async function loadSettings({ fetchImpl = globalThis.fetch } = {}) {
 
 /**
  * POST /api/settings。apiKey 传入且非空才上行；响应掩码即返回值。
- * A 档：maxInputTokens/maxOutputTokens 只在非空（正整数）时上行——空白输入不携带
- * （服务端补丁语义「未触碰保持现值」+ GET 只回显已设值 ⇒ 已设域无法经 API 撤销，
- * 与 windowTokens 同口径；清除可手改 ~/.devmate/config.json——ADR-0015 记录）。
+ * A 档：模型名发送前再净化（sanitizeModel——服务端亦净化，双保险幂等）。
+ * B 档（2026-08-30 用户强制）：maxInputTokens/maxOutputTokens **必填**——缺失/非法
+ * 本地即抛错（服务端 400 code=max-input-output-required/invalid 兜底）；
+ * 值归一为 Number 上行（模型输入透传字符串 → 400 由服务端兜底——本地先拦）。
  * @param {{ baseUrl: string; model: string; apiKey?: string;
- *   maxInputTokens?: number | null; maxOutputTokens?: number | null }} input
+ *   maxInputTokens: number | string | null | undefined;
+ *   maxOutputTokens: number | string | null | undefined }} input
  * @param {{ fetchImpl?: typeof globalThis.fetch }} [opts]
  */
 export async function saveSettings(
   { baseUrl, model, apiKey, maxInputTokens, maxOutputTokens },
   { fetchImpl = globalThis.fetch } = {},
 ) {
+  const inputErr = tokenLimitError(maxInputTokens, '输入上限');
+  const outputErr = tokenLimitError(maxOutputTokens, '输出上限');
+  if (inputErr || outputErr) {
+    throw new Error(`输入/输出上限必填（正整数）：${inputErr || outputErr}`);
+  }
   const body = {
     baseUrl: String(baseUrl ?? '').trim() || DEFAULT_SETTINGS.baseUrl,
-    model: String(model ?? '').trim() || DEFAULT_SETTINGS.model,
+    model: sanitizeModel(String(model ?? '').trim() || DEFAULT_SETTINGS.model),
+    maxInputTokens: Number(String(maxInputTokens).trim()),
+    maxOutputTokens: Number(String(maxOutputTokens).trim()),
   };
-  if (maxInputTokens !== undefined && maxInputTokens !== null) {
-    body.maxInputTokens = maxInputTokens;
-  }
-  if (maxOutputTokens !== undefined && maxOutputTokens !== null) {
-    body.maxOutputTokens = maxOutputTokens;
-  }
   const key = String(apiKey ?? '').trim();
   if (key) body.apiKey = key;
   const res = await fetchImpl('/api/settings', {
@@ -242,17 +292,42 @@ export async function saveSettings(
 }
 
 /**
- * 思考强度单独提交（composer 分段 pill 组：点击即 POST，防抖在 app.js）：
- * 只上行 {reasoning} 一个字段 —— 服务端补丁语义（未触碰字段保持现值）。
- * 返回归一化后的完整设置快照（含掩码/窗口/工作区字段）。失败抛错（调用方回滚 toast）。
+ * 必填上限对（B 档；单字段补丁 POST 共用）：校验并返回
+ * {maxInputTokens, maxOutputTokens}（都是 Number）；缺失/非法 → 抛错
+ * （与服务端 400 code=max-input-output-required/invalid 同口径，本地先拦）。
  */
-export async function saveReasoning(reasoning, { fetchImpl = globalThis.fetch } = {}) {
+function requiredTokenBody(maxInputTokens, maxOutputTokens) {
+  const inputErr = tokenLimitError(maxInputTokens, '输入上限');
+  const outputErr = tokenLimitError(maxOutputTokens, '输出上限');
+  if (inputErr || outputErr) {
+    throw new Error(`输入/输出上限必填（正整数）：${inputErr || outputErr}`);
+  }
+  return {
+    maxInputTokens: Number(String(maxInputTokens).trim()),
+    maxOutputTokens: Number(String(maxOutputTokens).trim()),
+  };
+}
+
+/**
+ * 思考强度单独提交（composer 分段 pill 组：点击即 POST，防抖在 app.js）：
+ * 只上行 {reasoning} + 必填上限对（B 档：/api/settings POST 恒要求
+ * maxInputTokens/maxOutputTokens——调用方传当前值；服务端补丁语义其余字段保持现值）。
+ * 返回归一化后的完整设置快照（含掩码/窗口/工作区字段）。失败抛错（调用方回滚 toast）。
+ * @param {{ maxInputTokens: number | string | null | undefined;
+ *   maxOutputTokens: number | string | null | undefined;
+ *   fetchImpl?: typeof globalThis.fetch }} [opts]
+ */
+export async function saveReasoning(reasoning, opts = {}) {
+  const { maxInputTokens, maxOutputTokens, fetchImpl = globalThis.fetch } = opts;
   const value = normalizeReasoning(reasoning);
   const res = await fetchImpl('/api/settings', {
     method: 'POST',
     headers: { 'content-type': 'application/json' },
     credentials: 'same-origin',
-    body: JSON.stringify({ reasoning: value }),
+    body: JSON.stringify({
+      reasoning: value,
+      ...requiredTokenBody(maxInputTokens, maxOutputTokens),
+    }),
   });
   if (!res.ok) throw new Error(`HTTP ${res.status}`);
   return normalize(await res.json());
@@ -264,14 +339,21 @@ export async function saveReasoning(reasoning, { fetchImpl = globalThis.fetch } 
  * 只上行 {permission} 一个字段（服务端补丁语义；切到 full-access 时服务端记录
  * permissionConfirmedAt —— 后端记录、不强制，前端只消费回读值）。
  * 返回归一化后的完整设置快照（含掩码/窗口/权限字段）。失败抛错（调用方回滚重读+toast）。
+ * @param {{ maxInputTokens: number | string | null | undefined;
+ *   maxOutputTokens: number | string | null | undefined;
+ *   fetchImpl?: typeof globalThis.fetch }} [opts]
  */
-export async function savePermission(permission, { fetchImpl = globalThis.fetch } = {}) {
+export async function savePermission(permission, opts = {}) {
+  const { maxInputTokens, maxOutputTokens, fetchImpl = globalThis.fetch } = opts;
   const value = normalizePermission(permission);
   const res = await fetchImpl('/api/settings', {
     method: 'POST',
     headers: { 'content-type': 'application/json' },
     credentials: 'same-origin',
-    body: JSON.stringify({ permission: value }),
+    body: JSON.stringify({
+      permission: value,
+      ...requiredTokenBody(maxInputTokens, maxOutputTokens),
+    }),
   });
   if (!res.ok) throw new Error(`HTTP ${res.status}`);
   return normalize(await res.json());
@@ -281,14 +363,21 @@ export async function savePermission(permission, { fetchImpl = globalThis.fetch 
  * 方法论先行开关单独提交（设置页开关：change 即 POST，防抖在 app.js）：
  * 只上行 {methodFirst} 一个字段（服务端补丁语义）。值先归一（缺省 true 兜底）。
  * 返回归一化后的完整设置快照。失败抛错（调用方回滚重读 + toast）。
+ * @param {{ maxInputTokens: number | string | null | undefined;
+ *   maxOutputTokens: number | string | null | undefined;
+ *   fetchImpl?: typeof globalThis.fetch }} [opts]
  */
-export async function saveMethodFirst(methodFirst, { fetchImpl = globalThis.fetch } = {}) {
+export async function saveMethodFirst(methodFirst, opts = {}) {
+  const { maxInputTokens, maxOutputTokens, fetchImpl = globalThis.fetch } = opts;
   const value = normalizeMethodFirst(methodFirst);
   const res = await fetchImpl('/api/settings', {
     method: 'POST',
     headers: { 'content-type': 'application/json' },
     credentials: 'same-origin',
-    body: JSON.stringify({ methodFirst: value }),
+    body: JSON.stringify({
+      methodFirst: value,
+      ...requiredTokenBody(maxInputTokens, maxOutputTokens),
+    }),
   });
   if (!res.ok) throw new Error(`HTTP ${res.status}`);
   return normalize(await res.json());
@@ -298,14 +387,21 @@ export async function saveMethodFirst(methodFirst, { fetchImpl = globalThis.fetc
  * 收尾评审开关单独提交（设置页开关：change 即 POST，防抖在 app.js）：
  * 只上行 {reviewMode} 一个字段（服务端补丁语义）。值先归一（缺省 true 兜底）。
  * 返回归一化后的完整设置快照。失败抛错（调用方回滚重读 + toast）。
+ * @param {{ maxInputTokens: number | string | null | undefined;
+ *   maxOutputTokens: number | string | null | undefined;
+ *   fetchImpl?: typeof globalThis.fetch }} [opts]
  */
-export async function saveReviewMode(reviewMode, { fetchImpl = globalThis.fetch } = {}) {
+export async function saveReviewMode(reviewMode, opts = {}) {
+  const { maxInputTokens, maxOutputTokens, fetchImpl = globalThis.fetch } = opts;
   const value = normalizeReviewMode(reviewMode);
   const res = await fetchImpl('/api/settings', {
     method: 'POST',
     headers: { 'content-type': 'application/json' },
     credentials: 'same-origin',
-    body: JSON.stringify({ reviewMode: value }),
+    body: JSON.stringify({
+      reviewMode: value,
+      ...requiredTokenBody(maxInputTokens, maxOutputTokens),
+    }),
   });
   if (!res.ok) throw new Error(`HTTP ${res.status}`);
   return normalize(await res.json());

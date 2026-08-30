@@ -33,6 +33,9 @@ function depsFor(extra: Partial<DevmateServerDeps> = {}): DevmateServerDeps {
   };
 }
 
+/** B 档：/api/settings POST 恒要求的必填上限对（2026-08-30 用户强制）。 */
+const TOKENS = { maxInputTokens: 4096, maxOutputTokens: 2048 };
+
 describe('ui/server：settings reasoning / window', () => {
   const servers: DevmateServer[] = [];
   const tempDirs: string[] = [];
@@ -62,7 +65,7 @@ describe('ui/server：settings reasoning / window', () => {
     expect(before.window).toBe(128000); // deepseek preset contextWindowTokens（估算，可在设置覆盖）
     expect(typeof before.baseUrl).toBe('string');
 
-    const res = await postJson(base, '/api/settings', { reasoning: 'high' });
+    const res = await postJson(base, '/api/settings', { reasoning: 'high', ...TOKENS });
     expect(res.status).toBe(200);
     const saved = (await res.json()) as { reasoning: string; window?: number };
     expect(saved.reasoning).toBe('high');
@@ -74,7 +77,7 @@ describe('ui/server：settings reasoning / window', () => {
     };
     expect(after.reasoning).toBe('high');
 
-    const win = await postJson(base, '/api/settings', { windowTokens: 32000 });
+    const win = await postJson(base, '/api/settings', { windowTokens: 32000, ...TOKENS });
     expect(((await win.json()) as { window: number }).window).toBe(32000);
     await deps.dispose?.();
   });
@@ -83,11 +86,11 @@ describe('ui/server：settings reasoning / window', () => {
     const { base, server } = await startServer(depsFor());
     servers.push(server);
 
-    const badEffort = await postJson(base, '/api/settings', { reasoning: 'turbo' });
+    const badEffort = await postJson(base, '/api/settings', { reasoning: 'turbo', ...TOKENS });
     expect(badEffort.status).toBe(400);
-    const badNum = await postJson(base, '/api/settings', { windowTokens: -5 });
+    const badNum = await postJson(base, '/api/settings', { windowTokens: -5, ...TOKENS });
     expect(badNum.status).toBe(400);
-    const badType = await postJson(base, '/api/settings', { windowTokens: 'big' });
+    const badType = await postJson(base, '/api/settings', { windowTokens: 'big', ...TOKENS });
     expect(badType.status).toBe(400);
     const frag = await postJson(base, '/api/settings', {});
     expect(frag.status).toBe(400);
@@ -105,28 +108,45 @@ describe('ui/server：settings reasoning / window', () => {
     );
     servers.push(server);
 
-    await postJson(base, '/api/settings', { model: 'm1' });
-    expect(persisted[0]).toEqual({ baseUrl: 'https://p.example/v1', model: 'm1' }); // 未触碰不掺杂
+    await postJson(base, '/api/settings', { model: 'm1', ...TOKENS });
+    // 未触碰字段不掺杂；上限对为准入必带项（B 档）——快照恒含
+    expect(persisted[0]).toEqual({
+      baseUrl: 'https://p.example/v1',
+      model: 'm1',
+      maxInputTokens: TOKENS.maxInputTokens,
+      maxOutputTokens: TOKENS.maxOutputTokens,
+    });
 
-    await postJson(base, '/api/settings', { reasoning: 'low' });
+    await postJson(base, '/api/settings', { reasoning: 'low', ...TOKENS });
     expect(persisted[1]).toEqual({
       baseUrl: 'https://p.example/v1',
       model: 'm1',
       reasoning: 'low',
+      maxInputTokens: TOKENS.maxInputTokens,
+      maxOutputTokens: TOKENS.maxOutputTokens,
     });
 
-    await postJson(base, '/api/settings', { windowTokens: 16000, reasoning: 'off' });
+    await postJson(base, '/api/settings', { windowTokens: 16000, reasoning: 'off', ...TOKENS });
     expect(persisted[2]).toEqual({
       baseUrl: 'https://p.example/v1',
       model: 'm1',
       windowTokens: 16000,
       reasoning: 'off',
+      maxInputTokens: TOKENS.maxInputTokens,
+      maxOutputTokens: TOKENS.maxOutputTokens,
     });
 
     // 快照形状：SettingsSnapshot 类型面（前端/CLI 合并写直接消费）
     const snapshots = persisted.map((p) => Object.keys(p).sort());
-    expect(snapshots[0]).toEqual(['baseUrl', 'model']);
-    expect(snapshots[2]).toEqual(['baseUrl', 'model', 'reasoning', 'windowTokens']);
+    expect(snapshots[0]).toEqual(['baseUrl', 'maxInputTokens', 'maxOutputTokens', 'model']);
+    expect(snapshots[2]).toEqual([
+      'baseUrl',
+      'maxInputTokens',
+      'maxOutputTokens',
+      'model',
+      'reasoning',
+      'windowTokens',
+    ]);
   });
 
   it('r4) run 从当前设置读 reasoning → ChatRequest.reasoningEffort；windowTokens → runOptions.windowTokens', async () => {

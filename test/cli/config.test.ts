@@ -132,6 +132,18 @@ describe('loadConfig：三源合并（env > 文件 > preset 默认）', () => {
     expect(cfg.apiKey).toBe('sk-only-key');
   });
 
+  it('模型名读取即净化（A 档）：文件/env 带 `[1m]` UI 标记后缀 → CLI 生效模型名剥离（全链根除）', () => {
+    const configPath = join(tmpHome, '.devmate', 'config.json');
+    saveConfig(configPath, { model: 'deepseek-v4-flash[1m]' });
+    const fromFile = loadConfig(configPath, {});
+    expect(fromFile.model).toBe('deepseek-v4-flash');
+    const fromEnv = loadConfig(configPath, { DEV_MATE_MODEL: 'my/stack[2m]' });
+    expect(fromEnv.model).toBe('my/stack');
+    // 非尾部标注不误伤（模型 ID 本体可含 `[`/`m`）
+    saveConfig(configPath, { model: 'my-model-1m' });
+    expect(loadConfig(configPath, {}).model).toBe('my-model-1m');
+  });
+
   it('损坏 JSON → ConfigError 且消息含文件路径', () => {
     const configPath = join(tmpHome, '.devmate', 'config.json');
     mkdirSync(join(tmpHome, '.devmate'), { recursive: true });

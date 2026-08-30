@@ -43,6 +43,7 @@ import {
   discoverWindow,
   getProviderPreset,
   defaultProviderPreset,
+  sanitizeProviderModel,
 } from '../../core/llm/index.js';
 import type { DiscoverWindowResult, ProviderId, ProviderPreset } from '../../core/llm/index.js';
 // 内容寻址附件存储（ADR-0015）：assembleDeps 注入 <sessionsDir>/attachments 的实例
@@ -110,6 +111,9 @@ export interface DevmateConfig {
   apiKey?: string | undefined;
   /** 供应商 preset id；缺省 = 主默认 deepseek（ADR-0002）。 */
   providerId?: ProviderId | undefined;
+  /** 读取层标记：config.model 原始值带 `[N]m/k` 尾标（CLI loadConfig 已净化——原样在
+   *  stored 里仍可见）。服务端据此在 GET 挂 modelSanitized=true（前端提示一次）。 */
+  modelWasSanitized?: boolean | undefined;
   costLimitUsd?: number | undefined;
   maxSteps?: number | undefined;
   windowTokens?: number | undefined;
@@ -1028,6 +1032,12 @@ export async function assembleDeps(config: DevmateConfig): Promise<DevmateServer
     config.providerId !== undefined
       ? getProviderPreset(config.providerId)
       : defaultProviderPreset();
+  // 模型名净化（全链根除 2026-08-30 用户实测残留）：装配期一次净化——后续所有消费
+  // （settings 种子/摘要器模型/网关探测匹配/子代理池/引擎初值）恒净化名；发送侧
+  // provider-adapter 的 sanitizeProviderModel 幂等兜底（两次净化同结果）。
+  // 被剥离即标记 modelWasSanitized —— 服务端 GET 挂 modelSanitized=true（前端提示一次）。
+  const startupModel = sanitizeProviderModel(config.model);
+  const startupModelSanitized = startupModel !== config.model || config.modelWasSanitized === true;
   // 每次 run 从当前设置重建（baseUrl/apiKey 由 settingsRef 决定；preset 行为参数不变）
   const createLlm = (settings: { baseUrl: string; apiKey: string | undefined }): LlmAdapter => {
     const wiredProvider: ProviderPreset = { ...provider, baseUrl: settings.baseUrl };
@@ -1052,7 +1062,7 @@ export async function assembleDeps(config: DevmateConfig): Promise<DevmateServer
     void discoverWindow({
       baseUrl: config.baseUrl ?? provider.baseUrl,
       apiKey: config.apiKey,
-      model: config.model,
+      model: startupModel,
       ...(discoveryOpts?.fetchImpl !== undefined ? { fetchImpl: discoveryOpts.fetchImpl } : {}),
       ...(discoveryOpts?.timeoutMs !== undefined ? { timeoutMs: discoveryOpts.timeoutMs } : {}),
     })
@@ -1083,7 +1093,7 @@ export async function assembleDeps(config: DevmateConfig): Promise<DevmateServer
   // 未 attach 回退配置初值）——改 /api/workflow 后后续 spawn 即时生效（动态读取语义）。
   const subagentPool = createSubagentPool({
     llm: initialLlm,
-    model: config.model,
+    model: startupModel,
     config: () => (workflowRef.get !== null ? workflowRef.get() : initialWorkflow),
   });
 
@@ -1135,7 +1145,7 @@ export async function assembleDeps(config: DevmateConfig): Promise<DevmateServer
   });
 
   const runOptions: Partial<RunOptions> = {
-    summarizer: makeSummarizer(initialLlm, config.model),
+    summarizer: makeSummarizer(initialLlm, startupModel),
   };
   if (config.costLimitUsd !== undefined) runOptions.costLimitUsd = config.costLimitUsd;
   if (config.maxSteps !== undefined) runOptions.maxSteps = config.maxSteps;
@@ -1243,7 +1253,7 @@ export async function assembleDeps(config: DevmateConfig): Promise<DevmateServer
     llm: initialLlm,
     createLlm,
     createSummarizer: makeSummarizer,
-    model: config.model,
+    model: startupModel,
     // 三源取窗 · 网关层：探测结果读取器（服务端 GET /api/settings 与每次 run 现读；
     // 未探测/未完成/关闭 → null ——服务端按「覆盖 > preset」兜底）+ 设置变更重探
     // （POST /api/settings 触碰 baseUrl/apiKey/model 后服务端调用；关闭时不注入）。
@@ -1251,7 +1261,8 @@ export async function assembleDeps(config: DevmateConfig): Promise<DevmateServer
     ...(discoveryOff ? {} : { probeWindow }),
     settings: {
       baseUrl: config.baseUrl ?? provider.baseUrl,
-      model: config.model,
+      model: startupModel,
+      ...(startupModelSanitized ? { modelWasSanitized: true } : {}),
       // C 档：思考强度初值（缺省 'medium'）+ 窗口覆盖（缺省 = preset 估算——见 presets
       // contextWindowTokens 的「估算，可在设置覆盖」注释；GET /api/settings 的 window）
       reasoning: config.reasoning ?? 'medium',

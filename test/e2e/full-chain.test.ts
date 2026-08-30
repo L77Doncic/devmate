@@ -47,7 +47,7 @@ import { mkdtemp, rm, writeFile, mkdir, readFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
-import { mergeConfig } from '../../src/cli/config.js';
+import { loadStoredConfig, mergeConfig } from '../../src/cli/config.js';
 import { runWeb } from '../../src/cli/web.js';
 import { createJail } from '../../src/core/jail/index.js';
 import type { ToolRegistry } from '../../src/core/loop/index.js';
@@ -755,7 +755,7 @@ describe('E2E-D：全程无泄漏（api key 掩码 · 内存统计字段）', ()
 
     // POST 触碰到新密钥 → 响应即掩码；GET 再读仍掩码；全文无原文
     const SECRET = 'sk-SUPERSECRET-0123456789';
-    const posted = await postJson(base, '/api/settings', { apiKey: SECRET });
+    const posted = await postJson(base, '/api/settings', { apiKey: SECRET, maxInputTokens: 4096, maxOutputTokens: 2048 });
     expect(posted.status).toBe(200);
     const postedBody = JSON.stringify(await posted.json());
     expect(postedBody).toContain('sk-S****6789');
@@ -891,10 +891,11 @@ describe('E2E-F：CLI web 设置读回（permission/reasoning/windowTokens）', 
 });
 
 // ---------------------------------------------------------------------------
-// E2E-G：模型名尾标注全链（B 档取样）——发送净化保留（窗口标注层已取消）
+// E2E-G：模型名 `[N]m/k` UI 标记后缀全链净化（2026-08-30 用户实测修正），
+// assembleDeps + FakeLlm：GET/POST 响应恒净化名；窗口按净化名取；保存净化持久化
 // ---------------------------------------------------------------------------
 
-describe('E2E-G：模型名尾标注（发送净化；窗口标注层已取消——2026-08-30 用户裁定），assembleDeps + FakeLlm', () => {
+describe('E2E-G：模型名尾标注全链净化（GET/POST 净化名 + 窗口按净化 + 保存净化持久化）', () => {
   let dir: string;
   let deps: DevmateServerDeps;
   let handle: TestServerHandle | null = null;
@@ -906,7 +907,7 @@ describe('E2E-G：模型名尾标注（发送净化；窗口标注层已取消�
     deps = await assembleDeps({
       workspaceRoot: dir,
       sessionsDir: join(dir, 'sessions'),
-      // B 档：模型名带尾标注 —— 发送值时净化（无 apiKey → 无网关探测；窗口 = preset 128000）
+      // B 档：模型名带尾标注 —— 全链净化（无 apiKey → 无网关探测；窗口 = preset 128000）
       model: 'deepseek-v4-flash[128k]',
     });
     deps.llm = fake;
@@ -919,16 +920,22 @@ describe('E2E-G：模型名尾标注（发送净化；窗口标注层已取消�
     await rm(dir, { recursive: true, force: true });
   });
 
-  it('G1) GET /api/settings window=128000（preset 兜底）；chat 全链完成（净化仅发送值，引擎侧模型名原样）', async () => {
+  it('G1) GET 净化名 + window=128000（preset 兜底）；chat 全链完成（run/引擎侧恒净化名）', async () => {
     const base = handle!.base;
-    // 取窗：无显式覆盖 / 无网关探测（未注入 apiKey）→ preset 128000 兜底
+    // 取窗：无显式覆盖 / 无网关探测（未注入 apiKey）→ preset 128000 兜底；
+    // 模型名：GET 恒净化名（存量尾标净化显示——不再含 [N]m/k）
     const settings = (await (await fetch(new URL('/api/settings', base))).json()) as {
       window?: number;
+      model: string;
+      modelSanitized?: boolean;
     };
     expect(settings.window).toBe(128_000);
+    expect(settings.model).toBe('deepseek-v4-flash');
+    expect(settings.model).not.toMatch(/\[(?:[0-9.]+)(?:[km])/i);
+    expect(settings.modelSanitized).toBe(true); // 存量尾标已自动校正（前端提示前提）
 
-    // 全链：POST /api/chat → run 完成（FakeLlm 收到引擎侧模型名 = 配置原样 [128k]；
-    // 净化发生在 adapter 发送值层 —— provider-adapter.test / client.test 已对 wire 断言）
+    // 全链：POST /api/chat → run 完成（FakeLlm 收到引擎侧模型名 = 净化名；
+    // 适配层发送值再净化——幂等，provider-adapter.test / client.test 已对 wire 断言）
     const res = await postJson(base, '/api/chat', { text: '抽样' });
     expect(res.status).toBe(200);
     const { sessionId } = (await res.json()) as { sessionId: string };
@@ -941,8 +948,45 @@ describe('E2E-G：模型名尾标注（发送净化；窗口标注层已取消�
       'usage',
       'run-status',
     ]);
-    expect(fake.requests[0]?.model).toBe('deepseek-v4-flash[128k]');
+    expect(fake.requests[0]?.model).toBe('deepseek-v4-flash');
     expect(client.frames[4]!.data).toMatchObject({ status: 'completed' });
+  });
+
+  it('G2) POST 模型名带 `[1m]` 尾标 → 保存即净化：响应/GET 净化名 + 真实 config 落盘净化（重启读回同）', async () => {
+    const configPath = join(dir, 'devmate-config.json');
+    const depsG2 = await assembleDeps({
+      workspaceRoot: dir,
+      sessionsDir: join(dir, 'sessions'),
+      model: 'deepseek-v4-flash',
+    });
+    depsG2.llm = new FakeLlm([{ content: 'ok' }]);
+    depsG2.createLlm = () => depsG2.llm!;
+    const persisted: Array<Record<string, unknown>> = [];
+    depsG2.persistSettings = (s: unknown) => {
+      persisted.push(JSON.parse(JSON.stringify(s)) as Record<string, unknown>);
+      mergeConfig(configPath, s as Parameters<typeof mergeConfig>[1]);
+    };
+    const h2 = await startServer(depsG2);
+    try {
+      const res = await postJson(h2.base, '/api/settings', {
+        baseUrl: 'https://api.deepseek.com',
+        model: 'deepseek-v4-flash[1m]',
+        maxInputTokens: 4096,
+        maxOutputTokens: 2048,
+      });
+      expect(res.status).toBe(200);
+      expect(((await res.json()) as { model: string }).model).toBe('deepseek-v4-flash');
+      expect(persisted.at(-1)).toMatchObject({ model: 'deepseek-v4-flash' });
+      const stored = loadStoredConfig(configPath);
+      expect(stored.model).toBe('deepseek-v4-flash'); // 持久化净化值（config 无残留后缀）
+      const got = (await (await fetch(new URL('/api/settings', h2.base))).json()) as {
+        model: string;
+      };
+      expect(got.model).toBe('deepseek-v4-flash');
+    } finally {
+      await h2.server.close();
+      await depsG2.dispose?.();
+    }
   });
 });
 

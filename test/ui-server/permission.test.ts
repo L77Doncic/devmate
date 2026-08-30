@@ -31,6 +31,9 @@ import { assembleDeps } from '../../src/ui/server/deps.js';
 import { FakeLlm, type FakeScript } from '../loop/support.js';
 import { postJson, SseClient, startServer, waitForFrames } from './support.js';
 
+/** B 档：/api/settings POST 恒要求的必填上限对（2026-08-30 用户强制）。 */
+const TOKENS = { maxInputTokens: 4096, maxOutputTokens: 2048 };
+
 const call = (name: string, arguments_ = '{}'): ToolCall => ({
   id: 'c1',
   name,
@@ -156,7 +159,7 @@ describe('ui/server：settings permission 契约', () => {
     servers.push(server);
 
     for (const preset of ['read-only', 'workspace-write', 'full-access'] as const) {
-      const res = await postJson(base, '/api/settings', { permission: preset });
+      const res = await postJson(base, '/api/settings', { permission: preset, ...TOKENS });
       expect(res.status, preset).toBe(200);
       const saved = (await res.json()) as { permission: string };
       expect(saved.permission).toBe(preset);
@@ -167,11 +170,14 @@ describe('ui/server：settings permission 契约', () => {
     }
 
     for (const bad of ['admin', 'Read-Only', '', 1]) {
-      const res = await postJson(base, '/api/settings', { permission: bad });
+      const res = await postJson(base, '/api/settings', { permission: bad, ...TOKENS });
       expect(res.status, String(bad)).toBe(400);
       expect(((await res.json()) as { error: string }).error).toBeTypeOf('string');
     }
-    const badConfirmed = await postJson(base, '/api/settings', { permissionConfirmedAt: -1 });
+    const badConfirmed = await postJson(base, '/api/settings', {
+      permissionConfirmedAt: -1,
+      ...TOKENS,
+    });
     expect(badConfirmed.status).toBe(400);
   });
 
@@ -187,24 +193,37 @@ describe('ui/server：settings permission 契约', () => {
     );
     servers.push(server);
 
-    await postJson(base, '/api/settings', { model: 'm1' });
-    expect(Object.keys(persisted[0]!).sort()).toEqual(['baseUrl', 'model']);
+    await postJson(base, '/api/settings', { model: 'm1', ...TOKENS });
+    expect(Object.keys(persisted[0]!).sort()).toEqual([
+      'baseUrl',
+      'maxInputTokens',
+      'maxOutputTokens',
+      'model',
+    ]);
 
-    await postJson(base, '/api/settings', { permission: 'read-only' });
+    await postJson(base, '/api/settings', { permission: 'read-only', ...TOKENS });
     expect(persisted[1]).toMatchObject({
       baseUrl: 'https://p.example/v1',
       model: 'm1',
       permission: 'read-only',
     });
-    expect(Object.keys(persisted[1]!).sort()).toEqual(['baseUrl', 'model', 'permission']);
+    expect(Object.keys(persisted[1]!).sort()).toEqual([
+      'baseUrl',
+      'maxInputTokens',
+      'maxOutputTokens',
+      'model',
+      'permission',
+    ]);
 
-    await postJson(base, '/api/settings', { permissionConfirmedAt: 1234567890 });
+    await postJson(base, '/api/settings', { permissionConfirmedAt: 1234567890, ...TOKENS });
     expect(persisted[2]).toMatchObject({
       permissionConfirmedAt: 1234567890,
       model: 'm1',
     });
     expect(Object.keys(persisted[2]!).sort()).toEqual([
       'baseUrl',
+      'maxInputTokens',
+      'maxOutputTokens',
       'model',
       'permissionConfirmedAt',
     ]);
@@ -214,7 +233,7 @@ describe('ui/server：settings permission 契约', () => {
     const { base, server } = await startServer(simpleDeps());
     servers.push(server);
 
-    const first = await postJson(base, '/api/settings', { permission: 'full-access' });
+    const first = await postJson(base, '/api/settings', { permission: 'full-access', ...TOKENS });
     expect(first.status).toBe(200);
     const saved = (await first.json()) as { permissionConfirmedAt: number };
     const t1 = saved.permissionConfirmedAt;
@@ -222,7 +241,7 @@ describe('ui/server：settings permission 契约', () => {
     expect(t1).toBeGreaterThan(0);
 
     // 再次切换 full-access（已是）不覆盖已有记录
-    await postJson(base, '/api/settings', { permission: 'full-access' });
+    await postJson(base, '/api/settings', { permission: 'full-access', ...TOKENS });
     const again = (await (await fetch(new URL('/api/settings', base))).json()) as {
       permissionConfirmedAt: number;
     };
@@ -232,6 +251,7 @@ describe('ui/server：settings permission 契约', () => {
     await postJson(base, '/api/settings', {
       permission: 'full-access',
       permissionConfirmedAt: 1234567890,
+      ...TOKENS,
     });
     const explicit = (await (await fetch(new URL('/api/settings', base))).json()) as {
       permissionConfirmedAt: number;
@@ -351,7 +371,9 @@ describe('ui/server：权限矩阵真装配决策（assembleDeps + fake llm）',
       { content: 'done' },
     ]);
     servers.push(server);
-    expect((await postJson(base, '/api/settings', { permission: 'read-only' })).status).toBe(200);
+    expect(
+      (await postJson(base, '/api/settings', { permission: 'read-only', ...TOKENS })).status,
+    ).toBe(200);
     const sessionId = await chatSession(base);
 
     const client = await SseClient.connect(base, sessionId);
@@ -381,7 +403,9 @@ describe('ui/server：权限矩阵真装配决策（assembleDeps + fake llm）',
       { content: 'done' },
     ]);
     servers.push(server);
-    expect((await postJson(base, '/api/settings', { permission: 'read-only' })).status).toBe(200);
+    expect(
+      (await postJson(base, '/api/settings', { permission: 'read-only', ...TOKENS })).status,
+    ).toBe(200);
     const sessionId = await chatSession(base);
 
     const client = await SseClient.connect(base, sessionId);
@@ -403,7 +427,9 @@ describe('ui/server：权限矩阵真装配决策（assembleDeps + fake llm）',
       { content: 'done' },
     ]);
     servers.push(server);
-    expect((await postJson(base, '/api/settings', { permission: 'read-only' })).status).toBe(200);
+    expect(
+      (await postJson(base, '/api/settings', { permission: 'read-only', ...TOKENS })).status,
+    ).toBe(200);
     const sessionId = await chatSession(base);
 
     const client = await SseClient.connect(base, sessionId);
@@ -439,7 +465,9 @@ describe('ui/server：权限矩阵真装配决策（assembleDeps + fake llm）',
       { content: 'done' },
     ]);
     servers.push(server);
-    expect((await postJson(base, '/api/settings', { permission: 'full-access' })).status).toBe(200);
+    expect(
+      (await postJson(base, '/api/settings', { permission: 'full-access', ...TOKENS })).status,
+    ).toBe(200);
     const sessionId = await chatSession(base);
 
     const client = await SseClient.connect(base, sessionId);

@@ -3246,6 +3246,16 @@ pre {
 .field-help.dim {
   color: var(--dsw-alias-label-caption);
 }
+/* B 档：必填项红字（输入/输出上限校验错误——空/非正 → 提示 + 保存禁用） */
+.field-help.err {
+  color: var(--dsw-alias-state-error-primary);
+  font-weight: 500;
+}
+/* B 档：标签内必填星标（输入/输出上限随 GET 回填缺省也须保存绑定） */
+.req-mark {
+  color: var(--dsw-alias-state-error-primary);
+  margin-left: 2px;
+}
 .key-state {
   color: var(--dsw-alias-state-success-primary);
   font-weight: 500;

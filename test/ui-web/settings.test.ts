@@ -1,6 +1,11 @@
 /**
  * settings.js 单测：默认值（以 S2 presets 为准）、掩码、读写 /api/settings（注入 fetch）。
  * 密钥纪律钉点：POST 之后返回值不含明文；掩码只保留首尾四位。
+ * A 档（2026-08-30 用户实测修正）：模型名 `[N]m/k` UI 标记后缀全链净化——GET 回显净化 +
+ * modelAutoCorrected 标记；POST 保存再净化（双保险）。
+ * B 档（2026-08-30 用户强制）：maxInputTokens/maxOutputTokens **必填**——GET 恒回显
+ * （缺失回填缺省 + `*Default` 提示键）；POST（含单字段补丁）恒要求两者；
+ * tokenLimitError 提供展示层红字/禁存判据。
  */
 import { describe, expect, it } from 'vitest';
 import {
@@ -81,72 +86,63 @@ describe('loadSettings', () => {
       ),
     });
     expect(res.keyConfigured).toBe(false);
-    expect(res.apiKeyMasked).toBe('');
   });
 
-  it('空字段回落到默认值', async () => {
+  it('缺失模型字段 → 主默认兜底', async () => {
     const res = await loadSettings({ fetchImpl: asFetch(async () => okResponse({})) });
-    expect(res.baseUrl).toBe(DEFAULT_SETTINGS.baseUrl);
     expect(res.model).toBe(DEFAULT_SETTINGS.model);
   });
 
-  it('workspaceDir：服务端提供即透传；缺失/坏值为 null（显示字段，设置抽屉降级占位）', async () => {
-    const withDir = await loadSettings({
+  it('模型名净化（A 档）：GET 值带 `[N]m/k` 尾标 → 回显净化值 + modelAutoCorrected；服务端 modelSanitized=true 为权威标记；无尾标 → false', async () => {
+    const res = await loadSettings({
       fetchImpl: asFetch(async () =>
-        okResponse({ baseUrl: 'https://x', model: 'm', workspaceDir: '/work/devmate' }),
+        okResponse({ baseUrl: 'https://x', model: 'deepseek-v4-flash[1m]' }),
       ),
     });
-    expect(withDir.workspaceDir).toBe('/work/devmate');
-    const without = await loadSettings({ fetchImpl: asFetch(async () => okResponse({})) });
-    expect(without.workspaceDir).toBeNull();
-    const bad = await loadSettings({
+    expect(res.model).toBe('deepseek-v4-flash');
+    expect(res.modelAutoCorrected).toBe(true);
+    // 服务端已净化（存量尾标在读取层剥离）→ 值无尾标、标记由服务端给出
+    const live = await loadSettings({
       fetchImpl: asFetch(async () =>
-        okResponse({ baseUrl: 'https://x', model: 'm', workspaceDir: '   ' }),
+        okResponse({ baseUrl: 'https://x', model: 'm2', modelSanitized: true }),
       ),
     });
-    expect(bad.workspaceDir).toBeNull();
+    expect(live.model).toBe('m2');
+    expect(live.modelAutoCorrected).toBe(true);
+    const clean = await loadSettings({
+      fetchImpl: asFetch(async () => okResponse({ baseUrl: 'https://x', model: 'm2' })),
+    });
+    expect(clean.model).toBe('m2');
+    expect(clean.modelAutoCorrected).toBe(false);
   });
 
-  it('reasoning：四档透传；缺失/非法归一 medium（缺省语义）', async () => {
-    const high = await loadSettings({
+  it('上限缺省回填提示键（B 档）：服务端 `*Default=true` → 透传（前端「已用默认」提示依据）；无键 → false', async () => {
+    const res = await loadSettings({
       fetchImpl: asFetch(async () =>
-        okResponse({ baseUrl: 'https://x', model: 'm', reasoning: 'high' }),
+        okResponse({
+          baseUrl: 'https://x',
+          model: 'm',
+          maxInputTokens: 128000,
+          maxOutputTokens: 8192,
+          maxInputTokensDefault: true,
+          maxOutputTokensDefault: true,
+        }),
       ),
     });
-    expect(high.reasoning).toBe('high');
-    const missing = await loadSettings({ fetchImpl: asFetch(async () => okResponse({})) });
-    expect(missing.reasoning).toBe('medium');
-    const bad = await loadSettings({
+    expect(res.maxInputTokens).toBe(128000);
+    expect(res.maxOutputTokens).toBe(8192);
+    expect(res.maxInputTokensDefault).toBe(true);
+    expect(res.maxOutputTokensDefault).toBe(true);
+    const stored = await loadSettings({
       fetchImpl: asFetch(async () =>
-        okResponse({ baseUrl: 'https://x', model: 'm', reasoning: 'ultra' }),
+        okResponse({ baseUrl: 'https://x', model: 'm', maxInputTokens: 1, maxOutputTokens: 2 }),
       ),
     });
-    expect(bad.reasoning).toBe('medium');
+    expect(stored.maxInputTokensDefault).toBe(false);
+    expect(stored.maxOutputTokensDefault).toBe(false);
   });
 
-  it('window：正整数透传为 windowTokens；缺失/非法（非数字/0/负/小数/字符串）→ null', async () => {
-    const withWindow = await loadSettings({
-      fetchImpl: asFetch(async () =>
-        okResponse({ baseUrl: 'https://x', model: 'm', window: 64000 }),
-      ),
-    });
-    expect(withWindow.windowTokens).toBe(64000);
-    // windowTokens 双名兜底（服务端仅回 window；容错 accept 二者）
-    const alias = await loadSettings({
-      fetchImpl: asFetch(async () =>
-        okResponse({ baseUrl: 'https://x', model: 'm', windowTokens: 128000 }),
-      ),
-    });
-    expect(alias.windowTokens).toBe(128000);
-    const missing = await loadSettings({ fetchImpl: asFetch(async () => okResponse({})) });
-    expect(missing.windowTokens).toBeNull();
-    const bad = await loadSettings({
-      fetchImpl: asFetch(async () => okResponse({ baseUrl: 'https://x', model: 'm', window: 0 })),
-    });
-    expect(bad.windowTokens).toBeNull();
-  });
-
-  it('HTTP 错误上抛', async () => {
+  it('服务端错误 → 上抛（HTTP 状态）', async () => {
     await expect(
       loadSettings({
         fetchImpl: asFetch(async () => ({ ok: false, status: 500, json: async () => ({}) })),
@@ -156,10 +152,16 @@ describe('loadSettings', () => {
 });
 
 describe('saveSettings', () => {
-  it('POST JSON：只在 key 非空时带上行；返回掩码', async () => {
+  it('POST JSON：必填上限对恒上行（B 档）；模型名发送前净化（A 档）；只在 key 非空时带上行；返回掩码', async () => {
     let posted: unknown = null;
     const saved = await saveSettings(
-      { baseUrl: 'https://api.deepseek.com', model: 'deepseek-v4-flash', apiKey: 'sk-abc123456' },
+      {
+        baseUrl: 'https://api.deepseek.com',
+        model: 'deepseek-v4-flash[1m]',
+        apiKey: 'sk-abc123456',
+        maxInputTokens: 4096,
+        maxOutputTokens: 2048,
+      },
       {
         fetchImpl: asFetch(async (_url: string, opts: any) => {
           posted = JSON.parse(opts.body);
@@ -167,6 +169,8 @@ describe('saveSettings', () => {
             baseUrl: 'https://api.deepseek.com',
             model: 'deepseek-v4-flash',
             apiKey: 'sk-a…3456',
+            maxInputTokens: 4096,
+            maxOutputTokens: 2048,
           });
         }),
       },
@@ -174,17 +178,26 @@ describe('saveSettings', () => {
     expect(posted).toEqual({
       baseUrl: 'https://api.deepseek.com',
       model: 'deepseek-v4-flash',
+      maxInputTokens: 4096,
+      maxOutputTokens: 2048,
       apiKey: 'sk-abc123456',
     });
     expect(saved.keyConfigured).toBe(true);
+    expect(saved.model).toBe('deepseek-v4-flash');
     // 响应后不保留明文（模块内已丢弃）：序列化结果里没有完整 key
     expect(JSON.stringify(saved)).not.toContain('sk-abc123456');
   });
 
-  it('apiKey 为空 → 不发送 key 字段（不改密钥）', async () => {
+  it('apiKey 为空 → 不发送 key 字段（不改密钥）；上限对仍必发', async () => {
     let posted: unknown = null;
     await saveSettings(
-      { baseUrl: 'https://new', model: 'm2', apiKey: '' },
+      {
+        baseUrl: 'https://new',
+        model: 'm2',
+        apiKey: '',
+        maxInputTokens: 4096,
+        maxOutputTokens: 2048,
+      },
       {
         fetchImpl: asFetch(async (_url: string, opts: any) => {
           posted = JSON.parse(opts.body);
@@ -193,14 +206,42 @@ describe('saveSettings', () => {
       },
     );
     const rec = posted as Record<string, unknown>;
-    expect(rec).toEqual({ baseUrl: 'https://new', model: 'm2' });
+    expect(rec).toEqual({
+      baseUrl: 'https://new',
+      model: 'm2',
+      maxInputTokens: 4096,
+      maxOutputTokens: 2048,
+    });
     expect('apiKey' in rec).toBe(false);
+  });
+
+  it('上限缺任一/非法（空/null/0/-1/字符串）→ 本地抛错（不 POST——服务端 400 兜底）', async () => {
+    let called = false;
+    const fetchImpl = asFetch(async () => {
+      called = true;
+      return okResponse({});
+    });
+    for (const bad of [undefined, null, '', 0, -1, 1.5, 'x']) {
+      await expect(
+        saveSettings(
+          { baseUrl: 'https://x', model: 'm', maxInputTokens: 4096, maxOutputTokens: bad },
+          { fetchImpl },
+        ),
+      ).rejects.toThrow(/必填|正整数/);
+      await expect(
+        saveSettings(
+          { baseUrl: 'https://x', model: 'm', maxInputTokens: bad, maxOutputTokens: 2048 },
+          { fetchImpl },
+        ),
+      ).rejects.toThrow(/必填|正整数/);
+    }
+    expect(called).toBe(false); // 本地先拦：零上行
   });
 
   it('默认值兜底 + 非 2xx 上抛', async () => {
     let posted: unknown = null;
     await saveSettings(
-      { baseUrl: '', model: '', apiKey: 'k' },
+      { baseUrl: '', model: '', apiKey: 'k', maxInputTokens: 1000, maxOutputTokens: 2000 },
       {
         fetchImpl: asFetch(async (_u: string, opts: any) => {
           posted = JSON.parse(opts.body);
@@ -215,7 +256,7 @@ describe('saveSettings', () => {
     expect((posted as Record<string, unknown>).baseUrl).toBe(DEFAULT_SETTINGS.baseUrl);
     await expect(
       saveSettings(
-        { baseUrl: 'x', model: 'y', apiKey: '' },
+        { baseUrl: 'x', model: 'y', apiKey: '', maxInputTokens: 1, maxOutputTokens: 2 },
         {
           fetchImpl: asFetch(async () => ({
             ok: false,
@@ -295,9 +336,11 @@ describe('reasoning 常量与 saveReasoning（分段 pill 提交）', () => {
     expect(normalizeWindow(null)).toBeNull();
   });
 
-  it('saveReasoning：POST 恰一个 {reasoning} 补丁字段；返回归一快照', async () => {
+  it('saveReasoning：POST {reasoning} + 必填上限对（B 档）；返回归一快照', async () => {
     let posted: unknown = null;
     const saved = await saveReasoning('high', {
+      maxInputTokens: 4096,
+      maxOutputTokens: 2048,
       fetchImpl: asFetch(async (_url: string, opts: any) => {
         posted = JSON.parse(opts.body);
         return okResponse({
@@ -307,14 +350,30 @@ describe('reasoning 常量与 saveReasoning（分段 pill 提交）', () => {
         });
       }),
     });
-    expect(posted).toEqual({ reasoning: 'high' });
+    expect(posted).toEqual({ reasoning: 'high', maxInputTokens: 4096, maxOutputTokens: 2048 });
     expect(saved.reasoning).toBe('high');
     expect('apiKey' in (posted as Record<string, unknown>)).toBe(false);
   });
 
-  it('saveReasoning：非 2xx 上抛（调用方回滚 toast 前提）', async () => {
+  it('saveReasoning：上限对缺失/非法 → 本地抛错（不 POST）；非 2xx → 上抛（调用方回滚前提）', async () => {
+    let called = false;
+    for (const bad of [null, undefined, 0, 'x']) {
+      await expect(
+        saveReasoning('low', {
+          maxInputTokens: bad,
+          maxOutputTokens: bad,
+          fetchImpl: asFetch(async () => {
+            called = true;
+            return okResponse({});
+          }),
+        }),
+      ).rejects.toThrow(/必填|正整数/);
+    }
+    expect(called).toBe(false);
     await expect(
       saveReasoning('low', {
+        maxInputTokens: 1,
+        maxOutputTokens: 2,
         fetchImpl: asFetch(async () => ({ ok: false, status: 500, json: async () => ({}) })),
       }),
     ).rejects.toThrow(/500/);
@@ -356,9 +415,11 @@ describe('permission 预设（chip 提交/回滚契约；枚举权威 = permissi
     expect(bad.permissionConfirmedAt).toBeNull();
   });
 
-  it('savePermission：POST 恰一个 {permission} 补丁字段；返回归一快照（确认后服务端回 confirmedAt）', async () => {
+  it('savePermission：POST {permission} + 必填上限对；返回归一快照（确认后服务端回 confirmedAt）', async () => {
     let posted: unknown = null;
     const saved = await savePermission('full-access', {
+      maxInputTokens: 4096,
+      maxOutputTokens: 2048,
       fetchImpl: asFetch(async (_url: string, opts: any) => {
         posted = JSON.parse(opts.body);
         return okResponse({
@@ -369,7 +430,11 @@ describe('permission 预设（chip 提交/回滚契约；枚举权威 = permissi
         });
       }),
     });
-    expect(posted).toEqual({ permission: 'full-access' });
+    expect(posted).toEqual({
+      permission: 'full-access',
+      maxInputTokens: 4096,
+      maxOutputTokens: 2048,
+    });
     expect(saved.permission).toBe('full-access');
     expect(saved.permissionConfirmedAt).toBe(1_728_000_000_000);
     expect('apiKey' in (posted as Record<string, unknown>)).toBe(false);
@@ -378,17 +443,25 @@ describe('permission 预设（chip 提交/回滚契约；枚举权威 = permissi
   it('savePermission：非法档位先归一（如大写/未知 → workspace-write 上行）', async () => {
     let posted: unknown = null;
     await savePermission('FULL-ACCESS', {
+      maxInputTokens: 1,
+      maxOutputTokens: 2,
       fetchImpl: asFetch(async (_url: string, opts: any) => {
         posted = JSON.parse(opts.body);
         return okResponse({ baseUrl: 'x', model: 'm', permission: 'workspace-write' });
       }),
     });
-    expect(posted).toEqual({ permission: 'workspace-write' });
+    expect(posted).toEqual({
+      permission: 'workspace-write',
+      maxInputTokens: 1,
+      maxOutputTokens: 2,
+    });
   });
 
   it('savePermission：非 2xx 上抛 —— 调用方回滚路径（重读 GET + toast）的失败前提', async () => {
     await expect(
       savePermission('read-only', {
+        maxInputTokens: 1,
+        maxOutputTokens: 2,
         fetchImpl: asFetch(async () => ({ ok: false, status: 400, json: async () => ({}) })),
       }),
     ).rejects.toThrow(/400/);
@@ -452,9 +525,11 @@ describe('methodFirst（R2-S1 方法论前置门开关：缺省 true / 布尔补
     expect(legacy.methodFirst).toBe(true);
   });
 
-  it('saveMethodFirst：POST 恰一个 {methodFirst} 布尔补丁；返回归一快照回显', async () => {
+  it('saveMethodFirst：POST {methodFirst} + 必填上限对；返回归一快照回显', async () => {
     let posted: unknown = null;
     const saved = await saveMethodFirst(false, {
+      maxInputTokens: 4096,
+      maxOutputTokens: 2048,
       fetchImpl: asFetch(async (_url: string, opts: any) => {
         posted = JSON.parse(opts.body);
         return okResponse({
@@ -464,7 +539,7 @@ describe('methodFirst（R2-S1 方法论前置门开关：缺省 true / 布尔补
         });
       }),
     });
-    expect(posted).toEqual({ methodFirst: false });
+    expect(posted).toEqual({ methodFirst: false, maxInputTokens: 4096, maxOutputTokens: 2048 });
     expect(saved.methodFirst).toBe(false);
     // 未触碰字段不下行（补丁语义：不动 baseUrl/model/apiKey）
     const rec = posted as Record<string, unknown>;
@@ -475,17 +550,21 @@ describe('methodFirst（R2-S1 方法论前置门开关：缺省 true / 布尔补
   it('saveMethodFirst：值先归一（坏值 → true）再上行', async () => {
     let posted: unknown = null;
     await saveMethodFirst('off' as unknown as boolean, {
+      maxInputTokens: 1,
+      maxOutputTokens: 2,
       fetchImpl: asFetch(async (_url: string, opts: any) => {
         posted = JSON.parse(opts.body);
         return okResponse({ baseUrl: 'x', model: 'm', methodFirst: true });
       }),
     });
-    expect(posted).toEqual({ methodFirst: true });
+    expect(posted).toEqual({ methodFirst: true, maxInputTokens: 1, maxOutputTokens: 2 });
   });
 
   it('saveMethodFirst：非 2xx 上抛 —— 调用方回滚（重读 GET + toast「已还原」）前提', async () => {
     await expect(
       saveMethodFirst(true, {
+        maxInputTokens: 1,
+        maxOutputTokens: 2,
         fetchImpl: asFetch(async () => ({ ok: false, status: 500, json: async () => ({}) })),
       }),
     ).rejects.toThrow(/500/);
@@ -533,9 +612,11 @@ describe('reviewMode（R2-S2 收尾评审哨兵开关：缺省 true / 布尔补�
     expect(legacy.reviewMode).toBe(true);
   });
 
-  it('saveReviewMode：POST 恰一个 {reviewMode} 布尔补丁；返回归一快照回显', async () => {
+  it('saveReviewMode：POST {reviewMode} + 必填上限对；返回归一快照回显', async () => {
     let posted: unknown = null;
     const saved = await saveReviewMode(false, {
+      maxInputTokens: 4096,
+      maxOutputTokens: 2048,
       fetchImpl: asFetch(async (_url: string, opts: any) => {
         posted = JSON.parse(opts.body);
         return okResponse({
@@ -545,7 +626,7 @@ describe('reviewMode（R2-S2 收尾评审哨兵开关：缺省 true / 布尔补�
         });
       }),
     });
-    expect(posted).toEqual({ reviewMode: false });
+    expect(posted).toEqual({ reviewMode: false, maxInputTokens: 4096, maxOutputTokens: 2048 });
     expect(saved.reviewMode).toBe(false);
     // 未触碰字段不下行（补丁语义：不动 baseUrl/model/apiKey）
     const rec = posted as Record<string, unknown>;
@@ -556,17 +637,21 @@ describe('reviewMode（R2-S2 收尾评审哨兵开关：缺省 true / 布尔补�
   it('saveReviewMode：值先归一（坏值 → true）再上行', async () => {
     let posted: unknown = null;
     await saveReviewMode('off' as unknown as boolean, {
+      maxInputTokens: 1,
+      maxOutputTokens: 2,
       fetchImpl: asFetch(async (_url: string, opts: any) => {
         posted = JSON.parse(opts.body);
         return okResponse({ baseUrl: 'x', model: 'm', reviewMode: true });
       }),
     });
-    expect(posted).toEqual({ reviewMode: true });
+    expect(posted).toEqual({ reviewMode: true, maxInputTokens: 1, maxOutputTokens: 2 });
   });
 
   it('saveReviewMode：非 2xx 上抛 —— 调用方回滚（重读 GET + toast「已还原」）前提', async () => {
     await expect(
       saveReviewMode(true, {
+        maxInputTokens: 1,
+        maxOutputTokens: 2,
         fetchImpl: asFetch(async () => ({ ok: false, status: 500, json: async () => ({}) })),
       }),
     ).rejects.toThrow(/500/);
@@ -578,8 +663,8 @@ describe('reviewMode（R2-S2 收尾评审哨兵开关：缺省 true / 布尔补�
   });
 });
 
-describe('A 档：normalizeTokenLimit / saveSettings 上限字段（ADR-0015）', () => {
-  it('normalizeTokenLimit：正整数原样；非法/缺失 → null（null = 未设置=留空）', async () => {
+describe('A/B 档：normalizeTokenLimit / tokenLimitError（必填校验判据）/ saveSettings 上限字段（ADR-0015）', () => {
+  it('normalizeTokenLimit：正整数原样；非法/缺失 → null（null = 数据未到/坏值）', async () => {
     const { normalizeTokenLimit } = await import('../../src/ui/web/settings.js');
     expect(normalizeTokenLimit(4096)).toBe(4096);
     expect(normalizeTokenLimit(1)).toBe(1);
@@ -589,44 +674,28 @@ describe('A 档：normalizeTokenLimit / saveSettings 上限字段（ADR-0015）'
     expect(normalizeTokenLimit(undefined)).toBeNull();
   });
 
-  it('saveSettings：maxInputTokens/maxOutputTokens 只在非空值上行；null/undefined → 不带键', async () => {
-    const seen: Array<{ body: unknown }> = [];
-    const fetchImpl = async (_url: string, init: RequestInit) => {
-      seen.push({ body: JSON.parse(String(init.body)) });
-      return new Response(
-        JSON.stringify({
-          baseUrl: 'https://api.deepseek.com',
-          model: 'deepseek-v4-flash',
-          maxInputTokens: 4096,
-          maxOutputTokens: 2048,
-        }),
-        { status: 200, headers: { 'content-type': 'application/json' } },
-      );
-    };
-    await saveSettings(
-      {
-        baseUrl: 'https://api.deepseek.com',
-        model: 'deepseek-v4-flash',
-        maxInputTokens: 4096,
-        maxOutputTokens: 2048,
-      },
-      { fetchImpl: fetchImpl as never },
-    );
-    expect(seen[0]!.body).toMatchObject({ maxInputTokens: 4096, maxOutputTokens: 2048 });
+  it("tokenLimitError（B 档必填校验）：正整数 → ''；空/非正/非法 → 带 label 红字文案", async () => {
+    const { tokenLimitError } = await import('../../src/ui/web/settings.js');
+    expect(tokenLimitError(4096)).toBe('');
+    expect(tokenLimitError(1)).toBe('');
+    expect(tokenLimitError('4096')).toBe('');
+    expect(tokenLimitError('')).toBe('输入/输出上限必填（正整数）');
+    expect(tokenLimitError(null)).toBe('输入/输出上限必填（正整数）');
+    expect(tokenLimitError(undefined)).toBe('输入/输出上限必填（正整数）');
+    expect(tokenLimitError(0)).toBe('输入/输出上限必须是正整数');
+    expect(tokenLimitError(-1)).toBe('输入/输出上限必须是正整数');
+    expect(tokenLimitError(1.5)).toBe('输入/输出上限必须是正整数');
+    expect(tokenLimitError('4096.5')).toBe('输入/输出上限必须是正整数');
+    expect(tokenLimitError('x', '输入上限')).toBe('输入上限必须是正整数');
+  });
 
-    const seen2: Array<{ body: unknown }> = [];
-    const fetchImpl2 = async (_url: string, init: RequestInit) => {
-      seen2.push({ body: JSON.parse(String(init.body)) });
-      return new Response(JSON.stringify({ baseUrl: 'https://api.deepseek.com', model: 'm' }), {
-        status: 200,
-        headers: { 'content-type': 'application/json' },
-      });
-    };
-    await saveSettings(
-      { baseUrl: 'https://api.deepseek.com', model: 'm', maxInputTokens: null },
-      { fetchImpl: fetchImpl2 as never },
-    );
-    expect('maxInputTokens' in (seen2[0]!.body as Record<string, unknown>)).toBe(false);
-    expect('maxOutputTokens' in (seen2[0]!.body as Record<string, unknown>)).toBe(false);
+  it('sanitizeModel（A 档镜像）：尾标逐层剥离；非尾标保留', async () => {
+    const { sanitizeModel } = await import('../../src/ui/web/settings.js');
+    expect(sanitizeModel('deepseek-v4-flash[1m]')).toBe('deepseek-v4-flash');
+    expect(sanitizeModel('my/model[128k]')).toBe('my/model');
+    expect(sanitizeModel('my/model[1m][2m]')).toBe('my/model');
+    expect(sanitizeModel('my/model-1m-v2')).toBe('my/model-1m-v2');
+    expect(sanitizeModel('my[m]model[1m]')).toBe('my[m]model');
+    expect(sanitizeModel('')).toBe('');
   });
 });

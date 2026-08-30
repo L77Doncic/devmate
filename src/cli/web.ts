@@ -21,6 +21,7 @@
  */
 import { loadConfig, loadStoredConfig, mergeConfig } from './config.js';
 import type { CliConfig, StoredConfig, StoredMcpServer, StoredWorkflowConfig } from './config.js';
+import { sanitizeProviderModel } from '../core/llm/provider-adapter.js';
 import { clampMaxParallel } from '../shared/workflow.js';
 import type { ReasoningEffort } from '../shared/llm-types.js';
 import type { PermissionPreset } from '../ui/server/index.js';
@@ -76,6 +77,9 @@ export interface ServerConfig {
   methodFirst?: boolean;
   /** 评审哨兵持久值（R2-S2 读回键；缺省 true）。 */
   reviewMode?: boolean;
+  /** 存量 config.model 带 `[N]m/k` 尾标（loadConfig 读取即净化）——传给装配层；
+   *  服务端 GET 据此挂 modelSanitized=true（前端提示「模型名已自动校正」一次）。 */
+  modelWasSanitized?: boolean;
 }
 
 /** web 子命令生效参数。 */
@@ -215,6 +219,7 @@ export function buildServerConfig(config: {
   maxOutputTokens?: number;
   methodFirst?: boolean;
   reviewMode?: boolean;
+  modelWasSanitized?: boolean;
 }): ServerConfig {
   const out: ServerConfig = {
     workspaceRoot: config.workspaceRoot,
@@ -231,6 +236,7 @@ export function buildServerConfig(config: {
   if (config.maxOutputTokens !== undefined) out.maxOutputTokens = config.maxOutputTokens;
   if (config.methodFirst !== undefined) out.methodFirst = config.methodFirst;
   if (config.reviewMode !== undefined) out.reviewMode = config.reviewMode;
+  if (config.modelWasSanitized !== undefined) out.modelWasSanitized = config.modelWasSanitized;
   return out;
 }
 
@@ -285,6 +291,11 @@ export async function runWeb(args: string[], io: RunWebIo): Promise<number> {
     ...(stored.maxOutputTokens !== undefined ? { maxOutputTokens: stored.maxOutputTokens } : {}),
     ...(stored.methodFirst !== undefined ? { methodFirst: stored.methodFirst } : {}),
     ...(stored.reviewMode !== undefined ? { reviewMode: stored.reviewMode } : {}),
+    // A 档：存量 config 的模型名带 `[N]m/k` 尾标 → loadConfig 读取即净化——留痕给
+    // 服务端（GET modelSanitized=true → 前端提示「已自动校正」一次，不静默）
+    ...(stored.model !== undefined && sanitizeProviderModel(stored.model) !== stored.model
+      ? { modelWasSanitized: true }
+      : {}),
   });
   let deps: unknown;
   try {

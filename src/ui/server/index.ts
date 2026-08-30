@@ -93,7 +93,12 @@ import type {
   ToolRegistry,
   ToolResult,
 } from '../../core/loop/index.js';
-import { hasReviewRun, hasSubstantiveWork, run } from '../../core/loop/index.js';
+import {
+  DEFAULT_MAX_TOKENS,
+  hasReviewRun,
+  hasSubstantiveWork,
+  run,
+} from '../../core/loop/index.js';
 // 命令安全分类器（S10；本模块只读消费：run_command 的 read-only/ask/deny 三判级矩阵输入）
 import { classify, type Verdict } from '../../core/tools/classify.js';
 import type { WorkflowConfig } from '../../shared/workflow.js';
@@ -109,7 +114,12 @@ import { parseMethodologyMap, parseSkillMethodologyValue } from '../../shared/me
 import { assertValidSessionId } from '../../core/session/base.js';
 import { SessionExistsError, SessionNotFoundError } from '../../core/session/errors.js';
 import type { SessionStore } from '../../core/session/index.js';
-import type { DiscoverWindowResult } from '../../core/llm/index.js';
+import {
+  PROVIDER_PRESETS,
+  defaultProviderPreset,
+  sanitizeProviderModel,
+} from '../../core/llm/index.js';
+import type { DiscoverWindowResult, ProviderPreset } from '../../core/llm/index.js';
 import type { ReasoningEffort, StreamSnapshot } from '../../shared/llm-types.js';
 import type {
   EventKind,
@@ -200,6 +210,9 @@ export interface UiSettings {
   methodFirst?: boolean;
   /** 评审哨兵开关初值（R2-S2：缺省 true；false = 不注入 RunOptions.review——哨兵关闭）。 */
   reviewMode?: boolean;
+  /** 装配期模型名是否被净化（A 档：config.model 带 `[N]m/k` 尾标——deps 读取层剥离；
+   *  服务端据此在 GET 挂 modelSanitized=true，前端提示「已自动校正」一次；用户重存后清位）。 */
+  modelWasSanitized?: boolean;
 }
 
 export interface SettingsSnapshot {
@@ -1378,6 +1391,7 @@ class HttpError extends Error {
   constructor(
     readonly status: number,
     message: string,
+    readonly code?: string,
   ) {
     super(message);
   }
@@ -1719,9 +1733,23 @@ export function createDevmateServer(deps: DevmateServerDeps): DevmateServer {
     /** 评审哨兵（R2-S2：缺省 true；false → 本 run 不注入 review gate = 哨兵关闭）。 */
     reviewMode: boolean;
   }
+  /** 读取时模型名是否被净化（存量 config 带 `[N]m/k` 尾标的历史残留）——进 GET 的
+   * modelSanitized 键（前端据此提示「模型名已自动校正」——不静默）；用户重新保存后清位。 */
+  let modelSanitizedOnRead = false;
+  {
+    // 双口径：deps 读取层（assembleDeps 见 config.model 尾标）已剥 — modelWasSanitized；
+    // 服务端直构（种子仍带尾标）→ 本地再判一次。
+    const rawSeedModel = deps.settings?.model ?? deps.model;
+    modelSanitizedOnRead =
+      deps.settings?.modelWasSanitized === true ||
+      sanitizeProviderModel(rawSeedModel) !== rawSeedModel;
+  }
   const current: CurrentSettings = {
     baseUrl: deps.settings?.baseUrl ?? '',
-    model: deps.settings?.model ?? deps.model,
+    // 模型名净化（全链根除 2026-08-30 用户实测残留）：settings 种子即净化——
+    // 存量 config 里的 `[N]m/k` UI 标记后缀在读取/回显时净化显示（POST 再存净化值回写）；
+    // run/摘要器/网关重探消费的都是净化名（适配层发送侧同样再净化——幂等）。
+    model: sanitizeProviderModel(deps.settings?.model ?? deps.model),
     reasoning: deps.settings?.reasoning ?? 'medium',
     permission: deps.settings?.permission ?? DEFAULT_PERMISSION_PRESET,
     methodFirst: deps.settings?.methodFirst ?? true,
@@ -2925,8 +2953,9 @@ export function createDevmateServer(deps: DevmateServerDeps): DevmateServer {
    * 上下文窗口取窗（三源）：用户显式覆盖 > 网关探测（source:'gateway'）> preset 估算。
    * 探测读取器现读（后台完成前 → null——回退 preset 胚）；detail 注明来源，进
    * GET /api/settings 的 windowDetail；探测失败静默（不惊扰 stats）。
-   * 模型名尾标注解析层已取消（2026-08-30 用户裁定）：窗口来源仅三源，模型名中的
-   * `[N]m`/`[N]k` 不再解析（发送净化在 provider-adapter，不在本层）。
+   * 模型名尾标注解析层已取消（2026-08-30 用户裁定）：窗口来源仅三源；模型名
+   * `[N]m`/`[N]k` 全链净化（本层 current.model 恒净化名——网关探测按净化名匹配，
+   * preset 胚与探测 detail 不变）。
    */
   function effectiveWindow(): { window?: number; detail?: string } {
     if (explicitWindowTokens && current.windowTokens !== undefined) {
@@ -2945,6 +2974,21 @@ export function createDevmateServer(deps: DevmateServerDeps): DevmateServer {
     return {};
   }
 
+  /**
+   * 供应商预设输入上限缺省值（B 档 GET 回填）：按 baseUrl 归一匹配五家 preset；
+   * 无匹配（自建网关/第三方端点）→ 主默认 preset。常量取 preset 的
+   * contextWindowTokens（估算；说明语见 windowDetail 来源标注——「估算，可在设置覆盖」）。
+   */
+  function inputTokensPresetOf(baseUrl: string): number {
+    const target = baseUrl.trim().replace(/\/+$/, '');
+    if (target !== '') {
+      for (const preset of Object.values(PROVIDER_PRESETS) as readonly ProviderPreset[]) {
+        if (preset.baseUrl.replace(/\/+$/, '') === target) return preset.contextWindowTokens;
+      }
+    }
+    return defaultProviderPreset().contextWindowTokens;
+  }
+
   function settingsResponse(): {
     baseUrl: string;
     model: string;
@@ -2952,8 +2996,11 @@ export function createDevmateServer(deps: DevmateServerDeps): DevmateServer {
     reasoning: ReasoningEffort;
     window?: number;
     windowDetail?: string;
-    maxInputTokens?: number;
-    maxOutputTokens?: number;
+    maxInputTokens: number;
+    maxOutputTokens: number;
+    maxInputTokensDefault?: boolean;
+    maxOutputTokensDefault?: boolean;
+    modelSanitized?: boolean;
     permission: PermissionPreset;
     permissionConfirmedAt?: number;
     methodFirst: boolean;
@@ -2966,8 +3013,11 @@ export function createDevmateServer(deps: DevmateServerDeps): DevmateServer {
       reasoning: ReasoningEffort;
       window?: number;
       windowDetail?: string;
-      maxInputTokens?: number;
-      maxOutputTokens?: number;
+      maxInputTokens: number;
+      maxOutputTokens: number;
+      maxInputTokensDefault?: boolean;
+      maxOutputTokensDefault?: boolean;
+      modelSanitized?: boolean;
       permission: PermissionPreset;
       permissionConfirmedAt?: number;
       methodFirst: boolean;
@@ -2979,14 +3029,22 @@ export function createDevmateServer(deps: DevmateServerDeps): DevmateServer {
       permission: current.permission, // 权限预设定案：缺省 'workspace-write'
       methodFirst: current.methodFirst, // R2-S1：方法论前置门（缺省 true）
       reviewMode: current.reviewMode, // R2-S2：评审哨兵（缺省 true）
+      // A/B 档：输入/输出上限——**恒回显**（必填口径）。存量缺失 → 回填缺省并挂
+      // `*Default` 提示键（前端据此提示「已用默认，请修改保存」——不静默；用户保存后
+      // 缺省值升格为存量，下次 GET 不再带 Default 键）。
+      // 缺省口径：maxOutputTokens = DEFAULT_MAX_TOKENS（8192）；maxInputTokens =
+      // 供应商 preset（按当前 baseUrl 匹配；白名单发送仅 DashScope/Qwen）。
+      maxInputTokens: current.maxInputTokens ?? inputTokensPresetOf(current.baseUrl),
+      maxOutputTokens: current.maxOutputTokens ?? DEFAULT_MAX_TOKENS,
+      ...(current.maxInputTokens === undefined ? { maxInputTokensDefault: true } : {}),
+      ...(current.maxOutputTokens === undefined ? { maxOutputTokensDefault: true } : {}),
+      // A 档：存量模型名尾标在读取时被剥离（净化显示）→ 告知前端「已自动校正」一次
+      ...(modelSanitizedOnRead ? { modelSanitized: true } : {}),
     };
     if (current.apiKey !== undefined) {
       const masked = maskApiKey(current.apiKey);
       if (masked !== undefined) response.apiKey = masked;
     }
-    // A 档：输入/输出上限——只回显「已设置」的值（未设不带键；前端输入框留空）
-    if (current.maxInputTokens !== undefined) response.maxInputTokens = current.maxInputTokens;
-    if (current.maxOutputTokens !== undefined) response.maxOutputTokens = current.maxOutputTokens;
     // 窗口（取窗：用户覆盖 > 网关探测 > preset；无任何源 → 不带键，前端回退内置估算）
     const windowSource = effectiveWindow();
     if (windowSource.window !== undefined) response.window = windowSource.window;
@@ -3042,8 +3100,9 @@ export function createDevmateServer(deps: DevmateServerDeps): DevmateServer {
       }
       windowTokens = rawWindowTokens;
     }
-    // A 档：输入/输出上限（严格正整数；未提供 = 不触碰（保持现值）
-    // ——「未设不传」：GET 只在设置了才带键，前端空输入 = 不发送）。
+    // A/B 档：输入/输出上限——**必填**（用户强制）：POST 缺任一 → 400
+    // code=max-input-output-required；非严格正整数 → 400 code=invalid。
+    // 应用语义仍是「触碰」：携带即为当前值（前端恒带；缺省回填值随保存升格为存量）。
     const rawMaxInputTokens = record.maxInputTokens;
     let maxInputTokens: number | undefined;
     if (rawMaxInputTokens !== undefined) {
@@ -3052,7 +3111,7 @@ export function createDevmateServer(deps: DevmateServerDeps): DevmateServer {
         !Number.isInteger(rawMaxInputTokens) ||
         rawMaxInputTokens < 1
       ) {
-        throw new HttpError(400, 'maxInputTokens must be a positive integer');
+        throw new HttpError(400, 'maxInputTokens must be a positive integer', 'invalid');
       }
       maxInputTokens = rawMaxInputTokens;
     }
@@ -3064,9 +3123,16 @@ export function createDevmateServer(deps: DevmateServerDeps): DevmateServer {
         !Number.isInteger(rawMaxOutputTokens) ||
         rawMaxOutputTokens < 1
       ) {
-        throw new HttpError(400, 'maxOutputTokens must be a positive integer');
+        throw new HttpError(400, 'maxOutputTokens must be a positive integer', 'invalid');
       }
       maxOutputTokens = rawMaxOutputTokens;
+    }
+    if (rawMaxInputTokens === undefined || rawMaxOutputTokens === undefined) {
+      throw new HttpError(
+        400,
+        'maxInputTokens and maxOutputTokens are required (positive integers)',
+        'max-input-output-required',
+      );
     }
     const rawPermission = record.permission;
     let permission: PermissionPreset | undefined;
@@ -3126,7 +3192,13 @@ export function createDevmateServer(deps: DevmateServerDeps): DevmateServer {
       reviewMode?: boolean;
     } = {};
     if (baseUrl !== undefined) current.baseUrl = baseUrl;
-    if (model !== undefined) current.model = model;
+    // 模型名保存即净化（用户实测残留根除）：POST 的 `[N]m/k` 尾标剥离后才应用/持久化/
+    // 重探——config 持久化与 GET/下次 run 消费且恒净化名。本编辑器值已换新（用户重新
+    // 保存），存量净化位清除（提示语义只针对「历史残留」读取；新保存静默净化）。
+    if (model !== undefined) {
+      current.model = sanitizeProviderModel(model);
+      modelSanitizedOnRead = false;
+    }
     if (apiKey !== undefined) {
       if (apiKey === '') {
         // apiKey:''（明文空串）= 显式删除密钥：同时清运行时与持久化（见下）
@@ -3310,7 +3382,13 @@ export function createDevmateServer(deps: DevmateServerDeps): DevmateServer {
           return;
         }
         if (err instanceof HttpError) {
-          sendError(res, err.status, err.message);
+          // 错误码（code）只在声明时携带（如 max-input-output-required/invalid——
+          // POST /api/settings 的 INPUT/OUTPUT 必填校验）；无码 → 既有 {error} 形状不变
+          sendJson(
+            res,
+            err.status,
+            err.code !== undefined ? { error: err.message, code: err.code } : { error: err.message },
+          );
           return;
         }
         sendError(res, 500, err instanceof Error ? err.message : String(err));

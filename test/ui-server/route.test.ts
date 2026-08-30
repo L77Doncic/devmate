@@ -37,6 +37,8 @@ import { postJson, SseClient, startServer, waitForFrames } from './support.js';
 // ---------------------------------------------------------------------------
 // 路由纯函数（语义版：触发词 split / 任一命中→id；多命中先列优先；大小写与空格容错）
 // ---------------------------------------------------------------------------
+/** B 档：/api/settings POST 恒要求的必填上限对（2026-08-30 用户强制）。 */
+const TOKENS = { maxInputTokens: 4096, maxOutputTokens: 2048 };
 
 describe('ui/server/route：路由纯函数', () => {
   it('r1) 单中：任一触发词命中（子串）→ id；无中 → null', () => {
@@ -482,14 +484,25 @@ describe('ui/server/route：服务端全链（真实 server × methodologies.jso
     expect(initial.methodFirst).toBe(true);
 
     // 未触碰不带键（补丁语义）；触碰后携带
-    await postJson(base, '/api/settings', { model: 'm1' });
-    expect(persisted[0]).toEqual({ baseUrl: '', model: 'm1' });
-    const off = await postJson(base, '/api/settings', { methodFirst: false });
+    await postJson(base, '/api/settings', { model: 'm1', ...TOKENS });
+    expect(persisted[0]).toEqual({
+      baseUrl: '',
+      model: 'm1',
+      maxInputTokens: TOKENS.maxInputTokens,
+      maxOutputTokens: TOKENS.maxOutputTokens,
+    });
+    const off = await postJson(base, '/api/settings', { methodFirst: false, ...TOKENS });
     expect(off.status).toBe(200);
-    expect(persisted[1]).toEqual({ baseUrl: '', model: 'm1', methodFirst: false });
+    expect(persisted[1]).toEqual({
+      baseUrl: '',
+      model: 'm1',
+      methodFirst: false,
+      maxInputTokens: TOKENS.maxInputTokens,
+      maxOutputTokens: TOKENS.maxOutputTokens,
+    });
     expect(((await off.json()) as { methodFirst: boolean }).methodFirst).toBe(false);
 
-    const bad = await postJson(base, '/api/settings', { methodFirst: 'yes' });
+    const bad = await postJson(base, '/api/settings', { methodFirst: 'yes', ...TOKENS });
     expect(bad.status).toBe(400);
 
     // methodFirst:false → startRun 删除门 → 路由命中任务也直接执行
