@@ -213,7 +213,7 @@ describe('loop：错误回注与熔断（接缝 S5）', () => {
       expect(String(toolMsg?.content)).toContain('user-denied');
     });
 
-    it('approver deny 带 errorType=permission-denied：工具结果错误类型逐字 permission-denied、循环继续（权限预设直拒语义）', async () => {
+    it('approver deny 带 errorType=permission-denied：工具结果错误类型逐字 permission-denied、循环继续（兼容保留——服务端权限矩阵 deny 直拒路径已删除，注入式 approver 显式使用仍按普通回注）', async () => {
       const store = readyStore();
       const { registry, executions } = makeRegistry();
       const llm = new FakeLlm([

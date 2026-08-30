@@ -27,8 +27,10 @@ DevMate 是智能体（Agent）的「壳体」（harness）：给定一个任务
 - **工具面**（[`src/core/tools`](src/core/tools)）——9 个内置工具：`read_file`、`write_file`、`edit_file`（SEARCH/REPLACE）、`list_dir`、`glob`、`grep`、`run_command`（常驻 Shell，哨兵行界定输出）、`use_skill`（技能懒加载）、`spawn_subagent`（并行子代理池）；MCP 服务器工具以 `mcp_` 前缀追加进同一张表（`GET /api/tools` 可看实时工具面）。
 - **MCP 接入**（[`src/core/mcp`](src/core/mcp)）——stdio JSON-RPC 客户端：设置页登记服务器（`name` + `command` + `args`）、逐个开关、工具自动合并进循环。
 - **技能内化（18 个）**——构建时把 mattpocock-skills 工程技能集打包进 `dist/assets/skills`；系统提示只带一行清单，`use_skill` 按需懒加载 SKILL.md 全文（上限 4k 字符）；设置页可逐技能开关。
-- **子代理工作流**——`spawn_subagent` 独立处理子任务，并行上限可配（`maxParallel` 1–4，缺省 2），设置页「Subagent」区开关。
+- **子代理工作流**——`spawn_subagent` 独立处理子任务，并行上限可配（`maxParallel` 1–4，缺省 2），设置页「Subagent」区开关；带 `skill:"code-review"` 创建时，该技能文本（上限 6000 码点，头截 + 标记）会注入子代理上下文（借鉴 Claude Code subagent `skills` 语义——审查员与主代理按同一方法论审查）。
 - **OpenAI 兼容供应商**（[`src/core/llm`](src/core/llm)）——DeepSeek（默认：`https://api.deepseek.com` / `deepseek-v4-flash`）、OpenAI、阿里云百炼 DashScope/Qwen、智谱 GLM、Kimi；每家一个适配层归一化 `reasoning` 处置、采样参数白名单、strict 默认值、finish_reason 词汇与错误体形态。
+- **图像理解（DeepSeek vision，[ADR-0015](docs/adr/0015-deepseek-vision-and-token-limits.md)）**——输入框可附加图片（服务端内容寻址附件：≤20MiB/图、每条消息 ≤20 张、单会话累计 ≤200MiB——dsh 三数；图片字节存 `<sessionsDir>/attachments/`，事件与会话文件只存 sha256 ref），`deepseek-v4-flash-vision-exp` 模型直接识别（截图文字/图表分析），请求时展开为 DeepSeek 协议的 base64 dataURL；其它供应商/模型自动降级为文本 + 说明（绝不 400）；ref 缺失/超 40MiB 同理降级（诚实路径）。token 预算含图像（每图 ≤384 token，官方上限；估算公式见 ADR-0015）。
+- **请求侧 token 上限（设置页）**——可选「输入上限 / 输出上限」（正整数；留空 = 厂商默认）。输出上限映射 `max_tokens`（OpenAI/Kimi 用 `max_completion_tokens`）；输入上限只发送给白名单供应商（DashScope/Qwen 走 `max_input_tokens`——DeepSeek 官方无此参数，不发送）。
 - **提示词工程**（[`src/ui/server/deps.ts`](src/ui/server/deps.ts)）——预算感知的系统提示合成（锚定词：界内动 / 小步闭环 / 失败是普通消息）+ 技能清单节 + 子代理节，按供应商分离处理而不是堆进一段长文。
 - **原生 Web UI**（[`src/ui/web`](src/ui/web)）——零框架 HTML/CSS/ES Modules、无构建步骤；双主题（浅色 GitHub / 深色 GitHub token 体系）、按工作区分组侧栏、12 条 `/` 命令、思考强度 pill（关闭/低/中/高）、上下文占用环、运行状态条、压缩披露小记。
 - **上下文工程**（[`src/core/context`](src/core/context)）——只作用于投影的上下文管理：工具输出截断（保头尾 + 省略标记）、工具结果裁剪 + 占位符、对话摘要 + 防抖、token 预算估算 + 服务端 usage 校准。
@@ -129,7 +131,7 @@ flowchart LR
 npx devmate-cli web
 ```
 
-本地服务绑定 `127.0.0.1` 并自动打开浏览器。换个工作区：
+本地服务绑定 `127.0.0.1` 并自动打开浏览器。在任意项目目录用 `npx devmate-cli web` 启动即可将其设为默认工作区；更多工作区用 hero 或侧栏添加。启动首屏需先**选择或确认工作区**（默认 = 启动目录）：目录弹窗选定或点「使用默认工作区」即解锁输入。换个工作区：
 
 ```bash
 npx devmate-cli web --workspace /path/to/your/project --port 7911 --no-open
@@ -170,10 +172,10 @@ UI 的所有动作都走这些端点（`src/ui/server/index.ts`）：
 | 方法                  | 路径                                                 | 用途                                                                                                                                                             |
 | --------------------- | ---------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `GET`                 | `/api/stream?sessionId=…`                            | SSE 帧流：`session-user`、`assistant-delta`、`assistant-done`、`tool-start`、`tool-result`、`approval-request`、`usage`、`run-status`、`run-error`、`compaction` |
-| `POST`                | `/api/chat`                                          | 发消息 / 启动（或续跑）一轮 run；返回 `{sessionId}`                                                                                                              |
+| `POST`                | `/api/chat`                                          | 发消息 / 启动（或续跑）一轮 run；可选 `images: [{url,width?,height?}]`（dataURL，≤6 张）；返回 `{sessionId}`（回显 `session-user` 帧携带同形 `images`）                                                                                                              |
 | `POST`                | `/api/approval`                                      | 应答待处理审批（`approve` / `deny` + 可选理由）                                                                                                                  |
 | `POST`                | `/api/interrupt`                                     | 中断运行中的智能体（终态 `run-status` 仍经流到达）                                                                                                               |
-| `GET`/`POST`          | `/api/settings`                                      | 读取返回 `{baseUrl, model, reasoning, apiKey?（掩码）, window?}`；写入接受 `{baseUrl, model, apiKey?, reasoning?, windowTokens?}`——密钥只回显掩码                |
+| `GET`/`POST`          | `/api/settings`                                                        | 读返回 `{baseUrl, model, reasoning, apiKey?（掩码）, window?, maxInputTokens?, maxOutputTokens?}`；写接受 `{baseUrl, model, apiKey?, reasoning?, windowTokens?, maxInputTokens?, maxOutputTokens?}` —— 密钥只回掩码 |
 | `GET`/`POST`/`DELETE` | `/api/sessions`、`/api/sessions/:id`                 | 会话列表（每项含 `workspaceRoot`）、历史回放（≤ 500 帧）、新建、删除（活跃时 409）                                                                               |
 | `GET`                 | `/api/stats`                                         | 进程统计：`{rssMb, heapMb, sessions, activeShells, mcpServers, mcpTools, queuedSubagents, memoryGuard}`                                                          |
 | `GET`                 | `/api/tools`                                         | 模型可见的实时工具定义                                                                                                                                           |
@@ -183,18 +185,21 @@ UI 的所有动作都走这些端点（`src/ui/server/index.ts`）：
 
 ## 安全模型
 
-三层互补防线 + 常开护栏（依据 [ADR-0013](docs/adr/0013-safety-baseline.md)、[CONTEXT.md](CONTEXT.md)「安全与隔离」）：
+三层互补防线 + 常开护栏（依据 [ADR-0013](docs/adr/0013-safety-baseline.md)、[ADR-0014](docs/adr/0014-hardening-violent-test.md)、[CONTEXT.md](CONTEXT.md)「安全与隔离」）：
 
-1. **工作区监狱**——文件系统边界。启动目录为默认边界，额外目录须显式登记；符号链接两端同检（allow 须两端命中、deny 任一命中即拦）；`>`/`>>` 重定向目标按写入审查。
-2. **危险操作审批**——危险动作暂停循环征询用户：UI 弹出审批弹窗（`approval-request`）；带理由拒绝的拒因作为普通工具结果回注给模型继续调整，无理由拒绝才结束本轮。
+1. **工作区监狱**——文件系统边界。启动目录为默认边界，额外目录须显式登记；符号链接两端同检（allow 须两端命中、deny 任一命中即拦）；`>`/`>>` 重定向目标按写入审查。注意：门只作用于 fs 工具与 shell 的**写入目标**；shell 命令的**读侧**（`cat /etc/passwd`）不受边界限制——监狱是模型侧边界，不是 OS 沙箱（见第 3 条）。
+2. **危险操作审批**——唯一问询档 = read-only：fs 写/编辑与 ask/deny 级命令（含 `rm -rf`）暂停循环征询用户：UI 弹出审批弹窗（`approval-request`）；带理由拒绝的拒因作为普通工具结果回注给模型继续调整，无理由拒绝才结束本轮。workspace-write（默认）与 full-access 档**全部命令（含破坏性）零弹窗直接执行**——DevMate 无 OS 沙箱强制层，选档即接受风险，前端权限描述承担风险声明（deny 直拒路径已删除）。
 3. **沙箱 / 资源限制**——操作系统级隔离（容器/VM、禁用网络、ulimit）是无人值守场景的兜底防线。harness 绝不把字符串黑名单当安全边界；无人值守评测请放进容器并压住预算。
 
 常开护栏：
 
-- **机密脱敏**——工具结果回注前统一掩码（`securedRegistry`），错误信息同样打码。
+- **机密脱敏**——回注前统一掩码（`securedRegistry`）＋存储层落盘前掩码（`JsonlFileAdapter` 默认开，tool 结果 content——掩码即最终口径：磁盘/resume/回放一致）；错误信息同样打码。覆盖常见凭据形态（AKIA…、`ghp_…`、`sk-…`≥36、`Bearer`/`Basic`、PEM 块），短 mock 形态不在覆盖内。
+- **存储卫生**——`~/.devmate/config.json` 与会话文件以 `0600` 写入、目录 `0700`（会话目录启动时把历史 0644/0755 存量一次性纠正；两者皆 POSIX 语义——Windows 无 POSIX `chmod`，0600/0700 主张仅 POSIX 有效）；端点只回掩码；Web UI 全文禁止 `innerHTML`、强制 `safeHref` 白名单 + CSP。
 - **成本护栏**——唯一默认开启的保险丝：`$3`/任务，每次查询前预检、流式中超阈值即中止，带真实 usage 校准账本。
 - **内存警戒线**——超过 RSS 阈值释放空闲 Shell，`GET /api/stats` 上报 `memoryGuard` 状态。
-- **密钥卫生**——`~/.devmate/config.json` 以 `0600` 写入（目录 `0700`；两者皆 POSIX 语义——Windows 无 POSIX `chmod`，0600/0700 主张仅 POSIX 有效）；端点只回掩码；Web UI 全文禁止 `innerHTML`、强制 `safeHref` 白名单 + CSP。
+- **生命周期**——SIGINT 与 SIGTERM 走同一完整优雅关闭（server close → MCP launcher dispose → 常驻 Shell）；MCP 服务器以独立进程组启动，close() 按组终止（`npm → sh → node` 整树），2s 宽限后组 SIGKILL。
+
+**MCP 凭据限制（本机信任场景）**——`mcp-remote` 类服务器把 API 凭据放在命令行参数（`--header 'Authorization: Bearer …'`），同机任何进程可从 `ps`/`/proc/<pid>/cmdline` 读取。DevMate 无法改变该 CLI（只在 API 响应面与错误里掩码）；使用即本机信任决策：保持单用户机器，或改用环境变量注入凭据。
 
 ## 开发
 

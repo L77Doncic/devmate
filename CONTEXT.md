@@ -170,7 +170,7 @@ _Avoid_: Full Jitter、Decorrelated Jitter、裸指数退避
 ### 安全与隔离
 
 **工作区监狱（Workspace Jail）**:
-允许访问的文件系统边界：启动目录为默认边界、额外目录须显式登记；判定时对符号链接两端都按同一套边界检查（allow 须两端命中、deny 任一命中即拦）、重定向目标按写入检查——它管的是「模型放不放行」，与 OS 级隔离是互补的两层。
+允许访问的文件系统边界：启动目录为默认边界、额外目录须显式登记；判定时对符号链接两端都按同一套边界检查（allow 须两端命中、deny 任一命中即拦）、重定向目标按写入检查——它管的是「模型放不放行」，与 OS 级隔离是互补的两层。**边界事实**：门作用于 fs 工具，以及 shell 命令的**重定向目标**；shell 命令的**读侧**（`cat /etc/passwd` 等）越界无门——配合「workspace-write 档全命令零弹窗」可被用于读取 `~/.devmate/config.json` 等（本机信任场景；存储侧以 0700/0600 权限 + 落盘脱敏兜底，凭据形态限制见「机密脱敏」）。
 _Avoid_: 沙箱（sandbox）、目录白名单、越界检查
 
 **沙箱（Sandbox）**:
@@ -178,11 +178,11 @@ _Avoid_: 沙箱（sandbox）、目录白名单、越界检查
 _Avoid_: 工作区监狱、隔离实现、虚拟化
 
 **危险操作审批（Approval）**:
-仅触发于权限矩阵需问询（ask）项的交互：矩阵判定 ask（read-only 档的文件写/编辑与 ask、deny 级命令；workspace-write 档的 ask 级命令）才发审批请求与弹窗；deny 类（rm -rf 等不可逆命令）在 workspace-write 档不弹窗、直接拒绝并回注（permission-denied 普通工具失败，模型继续）；带备注拒绝时拒因回注给模型使其继续，无备注拒绝则结束本轮。
+唯一审批面：read-only 档产生的 approval-request（fs 写/编辑 与 ask/deny 级命令——问询兜底）。workspace-write（默认）与 full-access 档不产生任何审批——命令全部直接执行（含 rm -rf 等破坏性；DevMate 无 OS 沙箱强制层，选档即接受风险，前端权限描述承担风险声明）。带备注拒绝时拒因回注给模型使其继续，无备注拒绝则结束本轮。deny 直拒（permission-denied 回注）路径已删除：classify 三判级仍整体消费，但只参与「read-only 档一律 ask」的判定。
 _Avoid_: 授权（authorization）、确认弹窗、放行
 
 **许可模式（Permission Mode）**:
-dsh 式三档语义（settings 持久化，缺省 workspace-write）：read-only（只读）——fs 读类与只读命令放行，文件写/编辑与 ask、deny 级命令按 ask 兜底；workspace-write（工作区写入，默认）——文件写与只读操作直放行，危险命令按档判决（ask 级审批弹窗、deny 级直拒回注）；full-access（全访问）——一次性风险确认后零问询（含 deny 级）。它是交互档位，不是规则来源。
+dsh 式三档语义（settings 持久化，缺省 workspace-write）：read-only（只读）——唯一产生问询的档：fs 读类与只读命令放行，fs 写/编辑与 ask/deny 级命令按 ask 兜底（弹窗评审）；workspace-write（工作区写入，默认）——fs 全类放行，命令（含 classify ask/deny 级）全部零弹窗直接执行（含破坏性；jail 写边界仍生效）；full-access（全访问）——零问询（一次性风险确认门由前端负责，后端只记 permissionConfirmedAt）。它是交互档位，不是规则来源——jail 边界与 OS 沙箱是它的规则来源。
 _Avoid_: 权限级别、安全等级、权限配置文件
 
 **权限规则（Permission Rule）**:
@@ -194,7 +194,7 @@ _Avoid_: ACL（访问控制列表）、策略（policy）、黑名单规则
 _Avoid_: 危险命令黑名单、命令过滤、禁词表
 
 **机密脱敏（Secret Redaction）**:
-工具输出回注给模型之前，对凭据类敏感内容的掩码处理。
+凭据类敏感内容的掩码处理，两层同一实现（redactSecrets）：① 工具结果回注给模型前（securedRegistry——registry 层唯一咽喉）；② 存储层——kind==='tool' 的结果 content 落盘前（JsonlFileAdapter 默认开）：掩码即最终口径（append 返回值、磁盘、resume/回放一致，模型可见上下文不会出现两次明文）。只覆盖常见凭据形态（AKIA/ghp_/sk-≥36/Bearer/Basic/PEM 块），短 mock 形态不在覆盖内；只作用于 tool 事件（user 消息不脱敏）。
 _Avoid_: 日志脱敏、密钥替换
 
 ### 执行环境

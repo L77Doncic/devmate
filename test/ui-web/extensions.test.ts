@@ -3,6 +3,8 @@ import {
   SUBAGENT_DEFAULTS,
   SUBAGENT_PARALLEL_MAX,
   SUBAGENT_PARALLEL_MIN,
+  SUBAGENT_PARALLEL_UNLIMITED_LABEL,
+  SUBAGENT_PARALLEL_RISK_NOTE,
   SUBAGENT_LS_KEY,
   WORKFLOW_API_URL,
   SUBAGENT_LOCAL_NOTE,
@@ -18,6 +20,7 @@ import {
   loadWorkflowPref,
   saveSubagentPref,
   syncWorkflowPref,
+  parallelLabelText,
   splitMcpArgs,
   SKILL_INSTALL_API_URL,
   SKILL_INSTALL_BUSY,
@@ -40,7 +43,8 @@ import {
 /**
  * 设置页扩展区纯逻辑（extensions.js）：Subagent 工作流（/api/workflow 同步 + 降级）、
  * Skills/MCP 契约形状。契约形状 {skills:[...]} / {servers:[...]} / workflow
- * {subagentsEnabled,maxParallel}（任务书），宽容路径（裸数组 / 双形状）一并覆盖。
+ * {subagentsEnabled,maxParallel}（subagent 无上限：maxParallel 0 = 无上限、1-8 显式）。
+ * 宽容路径（裸数组 / 双形状）一并覆盖。
  */
 
 interface StorageLike {
@@ -72,27 +76,29 @@ function storageWith(initial = ''): StorageLike & { _value: () => string } {
   };
 }
 
-describe('normalizeParallel（1-4 步进，禁 0）', () => {
-  it('合法值原样通过', () => {
+describe('normalizeParallel（0-8 步进；0 = 无上限（按需派遣），1-8 显式）', () => {
+  it('合法值原样通过：0 = 无上限合法档位', () => {
+    expect(normalizeParallel(0)).toBe(0);
     expect(normalizeParallel(1)).toBe(1);
     expect(normalizeParallel(2)).toBe(2);
-    expect(normalizeParallel(4)).toBe(4);
+    expect(normalizeParallel(8)).toBe(8);
   });
 
-  it('小数四舍五入后 clamp', () => {
-    expect(normalizeParallel(2.6)).toBe(3);
+  it('小数 floor 后 clamp（与 clampMaxParallel 同口径）', () => {
+    expect(normalizeParallel(2.6)).toBe(2);
+    expect(normalizeParallel(3.7)).toBe(3);
     expect(normalizeParallel(1.49)).toBe(1);
-    expect(normalizeParallel(9)).toBe(SUBAGENT_PARALLEL_MAX);
   });
 
-  it('0/负值/非数一律回落 fallback（默认 2）', () => {
-    expect(normalizeParallel(0)).toBe(SUBAGENT_DEFAULTS.parallel);
-    expect(normalizeParallel(-3)).toBe(SUBAGENT_DEFAULTS.parallel);
+  it('负 → 0（无上限）；>8 → 8；非数一律回落 fallback（默认 2）', () => {
+    expect(normalizeParallel(-3)).toBe(0);
+    expect(normalizeParallel(-1)).toBe(0);
+    expect(normalizeParallel(9)).toBe(SUBAGENT_PARALLEL_MAX);
     expect(normalizeParallel(NaN)).toBe(SUBAGENT_DEFAULTS.parallel);
     expect(normalizeParallel(undefined)).toBe(SUBAGENT_DEFAULTS.parallel);
     expect(normalizeParallel('abc')).toBe(SUBAGENT_DEFAULTS.parallel);
     const fb: number = 4;
-    expect(normalizeParallel(0, fb)).toBe(4); // 自定义 fallback
+    expect(normalizeParallel('x', fb)).toBe(4); // 自定义 fallback（仅非有限值）
   });
 });
 
@@ -102,13 +108,14 @@ describe('normalizeSubagentPref / load / save（显式开 → 数值越界兜底
     expect(normalizeSubagentPref({})).toEqual({ enabled: true, parallel: 2 });
   });
 
-  it('关闭态与并行数各自保留；并行数越界归一', () => {
+  it('关闭态与并行数各自保留；并行数越界归一（0 = 无上限合法保留）', () => {
     expect(normalizeSubagentPref({ enabled: false, parallel: 3 })).toEqual({
       enabled: false,
       parallel: 3,
     });
-    expect(normalizeSubagentPref({ enabled: true, parallel: 9 }).parallel).toBe(4);
-    expect(normalizeSubagentPref({ enabled: true, parallel: 0 }).parallel).toBe(2);
+    expect(normalizeSubagentPref({ enabled: true, parallel: 9 }).parallel).toBe(8);
+    expect(normalizeSubagentPref({ enabled: true, parallel: 0 }).parallel).toBe(0); // 无上限
+    expect(normalizeSubagentPref({ enabled: true, parallel: -2 }).parallel).toBe(0); // 负 → 0
   });
 
   it('load：存储缺失/JSON 坏/读异常一律回落默认（不 throw）', () => {
@@ -120,7 +127,7 @@ describe('normalizeSubagentPref / load / save（显式开 → 数值越界兜底
   it('save：写入键 + 归一化值；写异常静默（不 throw），返回归一值', () => {
     const s = storageWith();
     const saved = saveSubagentPref(s, { enabled: false, parallel: '3.6' });
-    expect(saved).toEqual({ enabled: false, parallel: 4 });
+    expect(saved).toEqual({ enabled: false, parallel: 3 }); // floor 口径（与 clamp 一致）
     expect(s._value()).toBe(JSON.stringify(saved));
     expect(JSON.parse(s._value()).parallel).toBeLessThanOrEqual(SUBAGENT_PARALLEL_MAX);
     // 写失败：隐私模式
@@ -131,7 +138,7 @@ describe('normalizeSubagentPref / load / save（显式开 → 数值越界兜底
     } as unknown as StorageLike;
     expect(() => saveSubagentPref(throwing, { enabled: true, parallel: 2 })).not.toThrow();
     // 往返一致性（enabled=false 是持久化的关键）
-    expect(loadSubagentPref(s)).toEqual({ enabled: false, parallel: 4 });
+    expect(loadSubagentPref(s)).toEqual({ enabled: false, parallel: 3 });
   });
 
   it('存储键 = 任务书命名 devmate.ui.subagents', () => {
@@ -373,14 +380,15 @@ describe('normalizeMcpServers 无 status 形状（契约漂移修复：前端不
 });
 
 describe('normalizeWorkflowPref（服务端 {subagentsEnabled,maxParallel} / 本地 {enabled,parallel} 双形状）', () => {
-  it('服务端形状 → 内部 {enabled,parallel}：false 保真、越界/0 clamp 兜底', () => {
+  it('服务端形状 → 内部 {enabled,parallel}：0 = 无上限原样、越界 clamp 到 0-8', () => {
     expect(normalizeWorkflowPref({ subagentsEnabled: false, maxParallel: 3 })).toEqual({
       enabled: false,
       parallel: 3,
     });
-    expect(normalizeWorkflowPref({ subagentsEnabled: true, maxParallel: 9 }).parallel).toBe(4);
-    expect(normalizeWorkflowPref({ subagentsEnabled: true, maxParallel: 0 }).parallel).toBe(2);
-    expect(normalizeWorkflowPref({ subagentsEnabled: true, maxParallel: -1 }).parallel).toBe(2);
+    expect(normalizeWorkflowPref({ subagentsEnabled: true, maxParallel: 9 }).parallel).toBe(8);
+    expect(normalizeWorkflowPref({ subagentsEnabled: true, maxParallel: 0 }).parallel).toBe(0);
+    expect(normalizeWorkflowPref({ subagentsEnabled: true, maxParallel: -1 }).parallel).toBe(0);
+    expect(normalizeWorkflowPref({ subagentsEnabled: true, maxParallel: 8 }).parallel).toBe(8);
   });
 
   it('缺省/空/坏值 → 默认 {true,2}；本地形状 {enabled,parallel} 一并接受（宽容）', () => {
@@ -448,24 +456,26 @@ describe('syncWorkflowPref（POST /api/workflow 混合字段部分提交）', ()
     expect(JSON.parse(calls[0]!.body)).toEqual({ subagentsEnabled: false });
   });
 
-  it('parallel 变更：只提交 {maxParallel}；0/负 → 本地兜底 2 后才提交（禁 0 契约）', async () => {
+  it('parallel 变更：只提交 {maxParallel}；0 = 无上限原样上行；越界先归一再提交', async () => {
     const calls: Array<{ body: string }> = [];
     const fetchImpl = asFetch(async (_url: string, opts: unknown) => {
       calls.push(opts as { body: string });
       return okResponse({ subagentsEnabled: true, maxParallel: 2 });
     });
     const r0 = await syncWorkflowPref({ parallel: 0 }, { fetchImpl });
-    expect(JSON.parse(calls[0]!.body)).toEqual({ maxParallel: 2 });
-    await syncWorkflowPref({ parallel: 4 }, { fetchImpl });
-    expect(JSON.parse(calls[1]!.body)).toEqual({ maxParallel: 4 });
+    expect(JSON.parse(calls[0]!.body)).toEqual({ maxParallel: 0 }); // 无上限合法档
+    await syncWorkflowPref({ parallel: 9 }, { fetchImpl });
+    expect(JSON.parse(calls[1]!.body)).toEqual({ maxParallel: 8 }); // 提交前归一 >8 → 8
+    await syncWorkflowPref({ parallel: -1 }, { fetchImpl });
+    expect(JSON.parse(calls[2]!.body)).toEqual({ maxParallel: 0 }); // 负 → 0
     expect(r0.ok).toBe(true);
   });
 
-  it('服务端 400（校验拒绝）：ok=false 且 error.status=400 —— 调用方据此回滚重读', async () => {
+  it('服务端 400（旧服务端 1-4 档拒 8）：ok=false 且 error.status=400 —— 调用方据此回滚重读', async () => {
     const fetchImpl = asFetch(async () =>
-      errResponse(400, { error: 'maxParallel must be an integer in 1-4' }),
+      errResponse(400, { error: 'maxParallel must be an integer in 0-8' }),
     );
-    const r = await syncWorkflowPref({ parallel: 7 }, { fetchImpl });
+    const r = await syncWorkflowPref({ parallel: 8 }, { fetchImpl });
     expect(r.ok).toBe(false);
     expect((r.error as { status?: number }).status).toBe(400);
   });
@@ -481,6 +491,8 @@ describe('文案纪律：扩展区用户可见文案零端点路径（字段变�
     MCP_DEGRADED_NOTE,
     SUBAGENT_SYNC_FAILED_TOAST,
     SUBAGENT_LOCAL_NOTE,
+    SUBAGENT_PARALLEL_UNLIMITED_LABEL,
+    SUBAGENT_PARALLEL_RISK_NOTE,
   ];
 
   it('skills/mcp 降级文案（toggle 失败重读再失败同款）无 /api/ 字样', () => {
@@ -492,6 +504,31 @@ describe('文案纪律：扩展区用户可见文案零端点路径（字段变�
   it('workflow 回滚提示 = 「同步失败，已还原」；降级旁注含「未同步（仅本地）」前缀', () => {
     expect(SUBAGENT_SYNC_FAILED_TOAST).toBe('同步失败，已还原');
     expect(SUBAGENT_LOCAL_NOTE.startsWith('未同步（仅本地）')).toBe(true);
+  });
+});
+
+describe('无上限（0 档）显示：标签 + 风险说明小字 + 组合文案', () => {
+  it('常量：标签「无上限（按需派遣）」；风险说明含「任意并发」与预算建议', () => {
+    expect(SUBAGENT_PARALLEL_UNLIMITED_LABEL).toBe('无上限（按需派遣）');
+    expect(SUBAGENT_PARALLEL_RISK_NOTE).toContain('任意并发');
+    expect(SUBAGENT_PARALLEL_RISK_NOTE).toContain('预算');
+  });
+
+  it('parallelLabelText：0 → 标签；风险说明组合；1-8 → 空串', () => {
+    expect(parallelLabelText(0)).toBe(
+      `${SUBAGENT_PARALLEL_UNLIMITED_LABEL}；${SUBAGENT_PARALLEL_RISK_NOTE}`,
+    );
+    expect(parallelLabelText(2)).toBe('');
+    expect(parallelLabelText(8)).toBe('');
+    // 组合文案零端点路径、不泄漏协议字段名
+    expect(parallelLabelText(0)).not.toMatch(/\/api\//);
+    expect(parallelLabelText(0)).not.toMatch(/maxParallel/);
+  });
+
+  it('档位单源：MIN=0（0 = 无上限语义的展示侧镜像）、MAX=8；归一 0 = 0（绝不夹紧到 1）', () => {
+    expect(SUBAGENT_PARALLEL_MIN).toBe(0);
+    expect(SUBAGENT_PARALLEL_MAX).toBe(8);
+    expect(normalizeParallel(0)).toBe(0);
   });
 });
 
@@ -510,10 +547,11 @@ describe('splitMcpArgs（args 文本行 → 参数数组）', () => {
   });
 });
 
-describe('normalizeSubagentPref 的平行数下界（SUBAGENT_PARALLEL_MIN=1 与禁 0 契约）', () => {
-  it('0 永远被拒（用户裁定禁 0 输入）', () => {
+describe('normalizeSubagentPref 的下界（SUBAGENT_PARALLEL_MIN=0 = 无上限档位）', () => {
+  it('0 合法保留（无上限档位不再是非法输入）；负值收敛到 0', () => {
     const v = normalizeSubagentPref({ enabled: true, parallel: 0 });
-    expect(v.parallel).not.toBe(0);
+    expect(v.parallel).toBe(0);
     expect(v.parallel).toBeGreaterThanOrEqual(SUBAGENT_PARALLEL_MIN);
+    expect(normalizeSubagentPref({ enabled: true, parallel: -5 }).parallel).toBe(0);
   });
 });

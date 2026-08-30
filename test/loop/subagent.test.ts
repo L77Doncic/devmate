@@ -1,7 +1,10 @@
 import { describe, expect, it } from 'vitest';
 import {
+  capSkill,
   createSubagentPool,
   DEFAULT_SUBAGENT_QUEUE_LIMIT,
+  SKILL_INJECTION_LIMIT_CHARS,
+  SKILL_INJECTION_TRUNCATED_MARK,
   SUBAGENT_REPORT_LIMIT_CHARS,
   SUBAGENT_SYSTEM_PROMPT,
 } from '../../src/core/loop/subagent.js';
@@ -25,7 +28,10 @@ import { FakeLlm, deferred, sleep } from './support.js';
  * - 报告截断：n ≥ 4000 字符 → 复用 CONTEXT 截断面板（头 2000 + 尾 2000 + elide
  *   标记 + 收窄建议；禁止手写头截断）；n < 4000 原样返回；
  * - 池级成本护栏缺省 $1.00：单任务 0.6×2 → 第 2 个 spawn 预判拒绝（0.6+0.6 > 1.0）；
- * - 队列上限缺省 64（DEFAULT_SUBAGENT_QUEUE_LIMIT）。
+ * - 队列上限缺省 512（DEFAULT_SUBAGENT_QUEUE_LIMIT）。
+ * - maxParallel 0 = 无上限（无信号量：所有任务立即执行，FIFO 队列只保证提交序；
+ *   并发受系统资源自然限制），1-8 为显式并发数（归一 0..8 属 shared/workflow 的
+ *   clampMaxParallel——池直接消费 config）。
  */
 
 /** 最简池构造（测试注入点），缺省 config = {subagentsEnabled:true, maxParallel:2}。 */
@@ -309,18 +315,21 @@ describe('subagent：子代理池', () => {
     });
   });
 
-  describe('e) 队列满 64 → reject queue-full', () => {
-    it('缺省上限 64：第 67 个 spawn 拒绝，前 66 个完成后正常', async () => {
+  describe('e) 队列满 512 → reject queue-full', () => {
+    it('缺省上限 512：第 515 个 spawn 拒绝，前 514 个完成后正常', async () => {
       const gate1 = deferred();
       const gate2 = deferred();
+      // 2 个在跑 + 512 个排队 → 514 接受，第 515 个拒绝（queue-full）
       const llm = new FakeLlm([
         { content: 'a', gate: gate1.promise },
         { content: 'b', gate: gate2.promise },
-        ...Array.from({ length: 65 }, () => ({ content: 'ok' })),
+        ...Array.from({ length: DEFAULT_SUBAGENT_QUEUE_LIMIT }, () => ({ content: 'ok' })),
       ]);
-      const pool = makePool(llm); // 缺省 maxQueue = 64（DEFAULT_SUBAGENT_QUEUE_LIMIT）
+      const pool = makePool(llm); // 缺省 maxQueue = 512（DEFAULT_SUBAGENT_QUEUE_LIMIT）
 
-      const spawned = Array.from({ length: 67 }, (_, i) => pool.spawn({ prompt: `t-${i}` }));
+      const spawned = Array.from({ length: DEFAULT_SUBAGENT_QUEUE_LIMIT + 3 }, (_, i) =>
+        pool.spawn({ prompt: `t-${i}` }),
+      );
       await sleep(0);
 
       expect(llm.requests).toHaveLength(2);
@@ -329,15 +338,15 @@ describe('subagent：子代理池', () => {
         queued: DEFAULT_SUBAGENT_QUEUE_LIMIT,
         rejected: 1,
       });
-      const over = await spawned[66];
+      const over = await spawned[DEFAULT_SUBAGENT_QUEUE_LIMIT + 2];
       expect(over).toMatchObject({ ok: false, error: 'queue-full' });
 
       gate1.resolve();
       gate2.resolve();
-      const results = await Promise.all(spawned.slice(0, 66));
+      const results = await Promise.all(spawned.slice(0, DEFAULT_SUBAGENT_QUEUE_LIMIT + 2));
       expect(results.every((r) => r.ok)).toBe(true);
       expect(pool.stats()).toMatchObject({
-        completed: 66,
+        completed: DEFAULT_SUBAGENT_QUEUE_LIMIT + 2,
         rejected: 1,
         active: 0,
         queued: 0,
@@ -470,6 +479,144 @@ describe('subagent：子代理池', () => {
       const extra = await pool.spawn({ prompt: 'extra' });
       expect(extra.ok).toBe(true);
       expect(pool.stats().completed).toBe(121);
+    });
+  });
+
+  describe('i) maxParallel=0（无上限：无信号量，全部立即执行）', () => {
+    it('8 任务立即全并发（零排队）；逐门放行后全部完成；计数/统计齐整', async () => {
+      const gates = Array.from({ length: 8 }, () => deferred());
+      const llm = new FakeLlm(
+        gates.map((gate, i) => ({ content: `report-${i}`, gate: gate.promise })),
+      );
+      let clock = 1000;
+      const pool = makePool(llm, {
+        config: () => ({ subagentsEnabled: true, maxParallel: 0 }),
+        now: () => clock,
+      });
+
+      const results = gates.map((_g, i) => pool.spawn({ prompt: `task-${i}` }));
+      await sleep(0);
+
+      // 无信号量：全部任务在提交序上立即进入执行，队列恒空
+      expect(llm.requests).toHaveLength(8);
+      expect(llm.requests.map((r) => r.messages[1])).toEqual(
+        gates.map((_g, i) => ({ role: 'user', content: `task-${i}` })),
+      );
+      expect(pool.stats()).toEqual({
+        enabled: true,
+        maxParallel: 0,
+        active: 8,
+        queued: 0,
+        completed: 0,
+        rejected: 0,
+      });
+
+      // 逐个放行（各任务独立计时点：duration = 放行时刻 − 起动时刻，互不相同）
+      for (let i = 0; i < gates.length; i += 1) {
+        clock += 10;
+        gates[i]!.resolve();
+        const r = await results[i]!;
+        expect(r.ok).toBe(true);
+        expect(r.report).toBe(`report-${i}`);
+      }
+      expect(pool.stats()).toEqual({
+        enabled: true,
+        maxParallel: 0,
+        active: 0,
+        queued: 0,
+        completed: 8,
+        rejected: 0,
+      });
+    });
+
+    it('无上限不豁免成本护栏：累计 + 预判超限同样 cost-guard', async () => {
+      const llm = new FakeLlm([
+        {
+          content: 'heavy',
+          usage: { promptTokens: 600_000, completionTokens: 0, totalTokens: 600_000 },
+        },
+        { content: 'should not run' },
+      ]);
+      const pool = makePool(llm, {
+        config: () => ({ subagentsEnabled: true, maxParallel: 0 }),
+      });
+
+      expect((await pool.spawn({ prompt: 'a' })).ok).toBe(true);
+      const r = await pool.spawn({ prompt: 'b' });
+      expect(r).toMatchObject({ ok: false, error: 'cost-guard' });
+      expect(llm.requests).toHaveLength(1);
+      expect(pool.stats()).toMatchObject({ maxParallel: 0, completed: 1, rejected: 1 });
+    });
+  });
+
+  describe('j) skillContent 注入（方法论全文机械进 system；无则不变）', () => {
+    it('skillContent 给定：system = 固定角色 + 「# 方法论（注入）」节（内容全文透传）', async () => {
+      const methodology = '## 审查双轴\n- 标准轴：与仓库规范对照；\n- 规格轴：与需求条目对照。';
+      const llm = new FakeLlm([{ content: 'ok' }]);
+      const pool = makePool(llm);
+
+      const r = await pool.spawn({
+        prompt: '审查 diff',
+        skillId: 'code-review',
+        skillContent: methodology,
+      });
+
+      expect(r.ok).toBe(true);
+      expect(llm.requests).toHaveLength(1);
+      expect(llm.requests[0]?.messages[0]).toEqual({
+        role: 'system',
+        content: SUBAGENT_SYSTEM_PROMPT + '\n\n## 方法论（注入）\n' + methodology,
+      });
+      expect(llm.requests[0]?.messages[1]).toEqual({ role: 'user', content: '审查 diff' });
+    });
+
+    it('无 skillContent / 空串 / 纯空白 → system 与既有完全一致（零注入）', async () => {
+      const msgShape = [
+        { role: 'system', content: SUBAGENT_SYSTEM_PROMPT },
+        { role: 'user', content: 'p ' },
+      ];
+      for (const task of [
+        { prompt: 'p ' },
+        { prompt: 'p ', skillContent: '' },
+        { prompt: 'p ', skillContent: '   \n' },
+      ]) {
+        const llm = new FakeLlm([{ content: 'ok' }]);
+        const pool = makePool(llm);
+        await pool.spawn(task);
+        expect(llm.requests[0]?.messages).toEqual(msgShape);
+      }
+    });
+
+    it('超 SKILL_INJECTION_LIMIT_CHARS → capSkill 头截断 + 「…（截断）」标记；恰在界内原样', async () => {
+      const long = 'A'.repeat(SKILL_INJECTION_LIMIT_CHARS + 700); // >6000
+      const llm = new FakeLlm([{ content: 'ok' }]);
+      const pool = makePool(llm);
+
+      await pool.spawn({ prompt: 'p', skillContent: long });
+
+      const system = llm.requests[0]?.messages[0]?.content as string;
+      const prefix = SUBAGENT_SYSTEM_PROMPT + '\n\n## 方法论（注入）\n';
+      expect(system.startsWith(prefix)).toBe(true);
+      expect(system.slice(prefix.length)).toBe(
+        'A'.repeat(SKILL_INJECTION_LIMIT_CHARS) + SKILL_INJECTION_TRUNCATED_MARK,
+      );
+      expect(system).not.toContain('A'.repeat(SKILL_INJECTION_LIMIT_CHARS + 1));
+
+      // 边界：恰 6000 → 原样（不截断、无标记）；capSkill 纯函数直测
+      const exactly = 'B'.repeat(SKILL_INJECTION_LIMIT_CHARS);
+      expect(capSkill(exactly)).toBe(exactly);
+      expect(
+        capSkill('C'.repeat(SKILL_INJECTION_LIMIT_CHARS + 1)).endsWith(
+          SKILL_INJECTION_TRUNCATED_MARK,
+        ),
+      ).toBe(true);
+
+      // astral（代理对）码点边界：6000 个 emoji = 12000 UTF-16 单元 → 按码点不截断；
+      // 超出一个码点 → 头截（无孤立高位代理——不产生 U+FFFD 破烂）
+      const emoji = '😀'.repeat(SKILL_INJECTION_LIMIT_CHARS);
+      expect(capSkill(emoji)).toBe(emoji);
+      expect(capSkill(emoji + 'x')).toBe(emoji + SKILL_INJECTION_TRUNCATED_MARK);
+      expect(capSkill(emoji + 'x')).not.toContain('�');
     });
   });
 });

@@ -258,4 +258,15 @@ describe('redactSecrets：性能粗测（切片 e，不设严格基准）', () =
     expect((out.match(/\[REDACTED:github-token\]/g) ?? []).length).toBeGreaterThan(5);
     expect(elapsed).toBeLessThan(2_000); // 宽松上限：只断言「不灾难」
   });
+
+  it('超长单字符运行（base64/填充文本——100KB+ 同字符）不灾难：url 模式回溯有界（VT-3/VT-1 落盘点）', () => {
+    // 存储层脱敏（jsonl-file.ts）对每次 tool 落盘都跑 redactSecrets——工具结果常含
+    // 大段单一字符运行；旧 regex `[a-zA-Z0-9+.-]*://` 贪婪无界 → O(n²)（100KB 5.7s）。
+    const run = 'x'.repeat(150 * 1024);
+    const start = performance.now();
+    const out = redactSecrets(run);
+    const elapsed = performance.now() - start;
+    expect(out).toBe(run); // 无凭据：内容原样（幂等/无损伤）
+    expect(elapsed).toBeLessThan(1_000);
+  });
 });

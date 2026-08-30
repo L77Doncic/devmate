@@ -106,3 +106,27 @@ describe('ui/server/emit：SSE 序列化（纯函数）', () => {
     expect(text).toContain('"contentPreview":"a\\nb"');
   });
 });
+
+describe('ui/server/emit：session-user 图像帧（ADR-0015）', () => {
+  it('带 images 帧逐字序列化（dataURL 含 base64 转义后仍是单行 JSON）', () => {
+    const frame: SseEventData = {
+      event: 'session-user',
+      data: {
+        text: '看图',
+        images: [{ url: 'data:image/png;base64,AA==', width: 800, height: 600 }],
+      },
+    };
+    const text = serializeEvent(frame);
+    expect(text).toBe(
+      'event: session-user\n' +
+        'data: {"text":"看图","images":[{"url":"data:image/png;base64,AA==",' +
+        '"width":800,"height":600}]}\n\n',
+    );
+    expect(text.match(/\n\n/g)).toHaveLength(1); // frames 边界不被 base64 内的字符撕开
+  });
+
+  it('无 images 恒不带键（旧协议 zero 扰动——逐字形状钉点）', () => {
+    const frame: SseEventData = { event: 'session-user', data: { text: 'hi' } };
+    expect(serializeEvent(frame)).toBe('event: session-user\ndata: {"text":"hi"}\n\n');
+  });
+});

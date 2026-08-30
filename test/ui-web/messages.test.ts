@@ -1096,3 +1096,162 @@ describe('恢复历史回放去重（createReplayGuard）', () => {
     expect(snap.items.filter((i) => i.kind === 'assistant')).toHaveLength(2);
   });
 });
+
+// ---------------------------------------------------------------------------
+// 审查块标记（B：spawn_subagent 且 arguments.prompt 含 审查|review → 工具卡
+// review 标志；渲染层据此走独立审查块 —— 协议零改动，client 判定。）
+// ---------------------------------------------------------------------------
+
+const subagentArgs = (prompt: string, extra?: Record<string, unknown>) =>
+  JSON.stringify({ prompt, ...extra });
+
+/** 全量工具卡（按 id 找：tool-start 在 assistant-done 之后到 → 卡挂在新的助手气泡上）。 */
+function allTools(snap: {
+  items: Array<{ kind: string; tools?: Array<Record<string, unknown>> }>;
+}) {
+  return snap.items.flatMap((i) => (i.kind === 'assistant' ? (i.tools ?? []) : []));
+}
+
+describe('审查块状态机（review 标志）', () => {
+  it('tool-start spawn_subagent + prompt 含「审查」→ 工具卡 review:true', () => {
+    const snap = run([
+      ['assistant-done', { content: '开始跑审查', toolCalls: [] }],
+      [
+        'tool-start',
+        {
+          id: 'rev1',
+          name: 'spawn_subagent',
+          arguments: subagentArgs('请独立审查 src/ui/web 的实现'),
+        },
+      ],
+    ]);
+    const tools = allTools(snap);
+    expect(tools).toHaveLength(1);
+    expect(tools[0]).toMatchObject({ id: 'rev1', name: 'spawn_subagent', review: true });
+  });
+
+  it('prompt 含英文 review（大小写不敏感）→ review:true', () => {
+    const snap = run([
+      ['assistant-done', { content: 'x', toolCalls: [] }],
+      [
+        'tool-start',
+        { id: 'r2', name: 'spawn_subagent', arguments: subagentArgs('REVIEW results') },
+      ],
+    ]);
+    expect(allTools(snap)[0]!.review).toBe(true);
+  });
+
+  it('用户文本提「审查」但 prompt 不含 / 非 spawn_subagent → review:false（不误判）', () => {
+    const snap = run([
+      ['assistant-done', { content: 'x', toolCalls: [] }],
+      ['tool-start', { id: 'r3', name: 'spawn_subagent', arguments: subagentArgs('重构这段代码') }],
+      ['tool-start', { id: 'r4', name: 'read_file', arguments: subagentArgs('审查某文件') }],
+    ]);
+    expect(allTools(snap).map((t) => t.review)).toEqual([false, false]);
+  });
+
+  it('tool-result 晚到的审查判定：参数随 result 首次出现 → 亦打标（路径无关）', () => {
+    const snap = run([
+      ['assistant-done', { content: 'x', toolCalls: [] }],
+      [
+        'tool-result',
+        {
+          id: 'r5',
+          name: 'spawn_subagent',
+          arguments: subagentArgs('review'),
+          ok: true,
+          contentPreview: '总结',
+          content: '总结全文',
+        },
+      ],
+    ]);
+    expect(allTools(snap)[0]!.review).toBe(true);
+  });
+
+  it('assistant-done(toolCalls) 路径：先知名称参数 → 就此打标；result 回执后标志不丢失', () => {
+    const snap = run([
+      [
+        'assistant-done',
+        {
+          content: '派审查',
+          toolCalls: [
+            { id: 'r6', name: 'spawn_subagent', arguments: subagentArgs('独立审查漏洞清单') },
+          ],
+        },
+      ],
+      ['tool-result', { id: 'r6', ok: true, contentPreview: '结论行', content: '结论行全文' }],
+    ]);
+    const tools = allTools(snap);
+    expect(tools[0]).toMatchObject({
+      id: 'r6',
+      review: true,
+      state: 'success',
+      result: { ok: true, preview: '结论行', content: '结论行全文' },
+    });
+  });
+
+  it('review 标志进快照（渲染层分发依据）；非审查工具卡恒 review:false', () => {
+    const snap = run([
+      ['assistant-done', { content: 'x', toolCalls: [] }],
+      ['tool-start', { id: 'r7', name: 'run_command', arguments: '{}' }],
+    ]);
+    expect(allTools(snap)[0]).toMatchObject({ id: 'r7', review: false });
+    expect(
+      JSON.parse(JSON.stringify(snap)).items.flatMap((i: { kind: string; tools?: unknown[] }) =>
+        i.kind === 'assistant' ? (i.tools ?? []) : [],
+      )[0],
+    ).toMatchObject({ review: false });
+  });
+});
+
+// ---------------------------------------------------------------------------
+// 多模态（ADR-0015）：session-user/addUser 携带 images → 用户气泡图像卡数据流
+// ---------------------------------------------------------------------------
+
+const IMG = { url: 'data:image/png;base64,iVBORw0KGgo=', width: 800, height: 600 };
+
+describe('消息状态机：图像（ADR-0015 协议帧 images）', () => {
+  it('session-user 带 images → 快照用户项同步携带（回放/在线同形状）', () => {
+    const store = createMessageStore();
+    store.dispatch(ev('session-user', { text: 'describe', images: [IMG] }));
+    const items = store.snapshot().items;
+    expect(items).toHaveLength(1);
+    expect(items[0]).toMatchObject({ kind: 'user', text: 'describe', images: [IMG] });
+  });
+
+  it('无 images 的 session-user → 快照用户项无 images 键（旧协议零扰动）', () => {
+    const store = createMessageStore();
+    store.dispatch(ev('session-user', { text: 'hi' }));
+    const items = store.snapshot().items;
+    expect((items[0] as { images?: unknown[] }).images).toBeUndefined();
+  });
+
+  it('addUser(text, images) 乐观渲染：回声帧（同文本+同图）命中 → 原地合并不重复', () => {
+    const store = createMessageStore();
+    store.addUser('describe', [IMG]);
+    store.dispatch(ev('session-user', { text: 'describe', images: [IMG] }));
+    const users = store.snapshot().items.filter((it) => it.kind === 'user');
+    expect(users).toHaveLength(1);
+    expect((users[0] as { images?: unknown[] }).images).toEqual([IMG]);
+  });
+
+  it('回声帧先行（长活流直投快于 POST 响应）：addUser(带图) 消费 awaitedEcho → 单条气泡且带图', () => {
+    const store = createMessageStore();
+    store.dispatch(ev('session-user', { text: 'describe', images: [IMG] }));
+    store.addUser('describe', [IMG]);
+    const users = store.snapshot().items.filter((it) => it.kind === 'user');
+    expect(users).toHaveLength(1);
+    expect((users[0] as { images?: unknown[] }).images).toEqual([IMG]);
+  });
+
+  it('图像消息重置轮次边界（同普通用户帧）：新一轮 delta 进新气泡', () => {
+    const store = createMessageStore();
+    store.dispatch(ev('session-user', { text: 'describe', images: [IMG] }));
+    store.dispatch(ev('assistant-delta', { text: '第一轮' }));
+    store.dispatch(ev('session-user', { text: 'second', images: [IMG] }));
+    store.dispatch(ev('assistant-delta', { text: '第二轮' }));
+    const assistants = store.snapshot().items.filter((it) => it.kind === 'assistant');
+    expect(assistants).toHaveLength(2);
+    expect(assistants[1]?.text).toBe('第二轮');
+  });
+});

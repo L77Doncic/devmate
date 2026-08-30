@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { LlmClient, LlmError } from '../../src/core/llm/index.js';
+import { LlmClient, LlmError, PROVIDER_PRESETS, buildRequest } from '../../src/core/llm/index.js';
 import type { StreamEvent, WireRequest } from '../../src/core/llm/index.js';
 
 /**
@@ -199,6 +199,72 @@ describe('LlmClient · a) 简单文本流', () => {
     expect(
       (capturedInit?.headers as Record<string, string> | undefined)?.authorization,
     ).toBeUndefined();
+  });
+
+  it('模型尾标注：直发 `deepseek-v4-flash[1m]` → 400（错误回注）；净化后 → 200 且 body.model 无尾标（B 档）', async () => {
+    // 注入 fetch：按上行 body.model 判断 —— 尾标模型（净化前直发）= 网关 400；
+    // 净化后的模型名 = 200 流（模拟 DeepSeek：带标注模型名不存在 → 400；剥后 200）。
+    const seenBodies: Array<{ model: string }> = [];
+    let servedRaw400 = false;
+    const fetchImpl = async (
+      _url: Parameters<typeof fetch>[0],
+      init?: RequestInit,
+    ): Promise<Response> => {
+      const payload = JSON.parse(String(init?.body)) as { model: string };
+      seenBodies.push(payload);
+      if (payload.model.endsWith(']')) {
+        servedRaw400 = true;
+        return new Response(
+          JSON.stringify({ error: { message: 'The model `deepseek-v4-flash[1m]` does not exist' } }),
+          {
+            status: 400,
+            headers: { 'content-type': 'application/json' },
+          },
+        );
+      }
+      return fakeResponse([`${CH.hello}\n${CH.finishStop}\n${CH.done}\n`]);
+    };
+    const client = makeClient(fetchImpl, { apiKey: 'sk-b' });
+
+    // 阶段 1：未经净化的 WireRequest（模拟「直发」）→ 400 → LlmError 回注（已有错误注入路径）
+    const rawWire: WireRequest = {
+      baseUrl: 'https://api.deepseek.com',
+      body: {
+        model: 'deepseek-v4-flash[1m]',
+        messages: [{ role: 'user', content: '你好' }],
+        stream: true,
+      },
+    };
+    const raw = await collectEvents(client, rawWire);
+    const rawError = raw.find((e) => e.type === 'error') as Extract<
+      StreamEvent,
+      { type: 'error' }
+    >;
+    expect(rawError).toBeDefined();
+    expect(rawError.error).toBeInstanceOf(LlmError);
+    expect(rawError.error).toMatchObject({ kind: 'http', status: 400, retryable: false });
+    expect(servedRaw400).toBe(true);
+
+    // 阶段 2：buildRequest 净化后的 wire（同输入，经 adapter）→ 200 流 + 上行 body.model 无尾标
+    const wire = buildRequest(
+      {
+        model: 'deepseek-v4-flash[1m]',
+        messages: [{ role: 'user', content: '你好' }],
+      },
+      PROVIDER_PRESETS.deepseek,
+    );
+    const events = await collectEvents(client, wire);
+    expect(events.map((e) => e.type)).toEqual(['text', 'end']);
+    expect((events[0] as Extract<StreamEvent, { type: 'text' }>).text).toBe('Hello');
+    expect((events.at(-1)! as Extract<StreamEvent, { type: 'end' }>).snapshot.finishReason).toBe(
+      'stop',
+    );
+    expect(seenBodies.map((b) => b.model)).toEqual([
+      'deepseek-v4-flash[1m]', // 阶段 1 直发（照单发：客户端不做字段映射）
+      'deepseek-v4-flash', // 阶段 2 净化后发送值
+    ]);
+    // URL 形态不因净化变化（仍 baseUrl + /chat/completions）
+    expect(seenBodies).toHaveLength(2);
   });
 
   it('SSE 解析：CRLF、注释行与空行分组不产生垃圾事件（§8.A.3）', async () => {

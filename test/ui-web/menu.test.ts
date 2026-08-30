@@ -3,6 +3,7 @@ import {
   MENU_GAP,
   MENU_VIEWPORT_PAD,
   SESSION_MENU_ITEMS,
+  ROW_MENU_KEBAB_TITLE,
   menuItemById,
   menuPosition,
 } from '../../src/ui/web/menu.js';
@@ -21,6 +22,19 @@ describe('SESSION_MENU_ITEMS（会话行菜单条目模型）', () => {
 
   it('文案单一来源（防漂移：与 DOM 断言的字符串同源）', () => {
     expect(SESSION_MENU_ITEMS[0]!.label).toBe('删除会话');
+  });
+});
+
+describe('ROW_MENU_KEBAB_TITLE（kebab 可访问名/悬停提示单一来源）', () => {
+  it('值 = 「更多（删除/恢复等）」且非空（会话行 kebab title/aria-label 由此常量装配）', () => {
+    expect(ROW_MENU_KEBAB_TITLE).toBe('更多（删除/恢复等）');
+    expect(ROW_MENU_KEBAB_TITLE.length).toBeGreaterThan(0);
+  });
+
+  it('文案覆盖菜单动作语义（删除/恢复等）：包含菜单内「删除」词根', () => {
+    const itemsText = SESSION_MENU_ITEMS.map((i) => i.label).join('');
+    expect(itemsText).toContain('删除');
+    expect(ROW_MENU_KEBAB_TITLE).toContain('删除');
   });
 });
 

@@ -1,13 +1,14 @@
 /**
  * # test/ui-server/approval：危险操作审批往返（接缝 S12 c 档；权限预设定案后语义迁移）
  *
- * 协议：approval-request 只由权限预设矩阵的 ask 项触发；默认档（workspace-write）下
- * fs 全类与只读命令放行（不弹窗）、ask 级命令（未知命令等）弹窗、deny 级命令
- * （rm -rf 等）不弹窗直拒（permission-denied 回注，纯工具节点，模型继续）。
+ * 协议：approval-request 只由权限预设矩阵的 ask 项触发——审批面只在 **read-only 档**
+ * 保留（fs 写/编辑与 ask/deny 级命令 → ask）；默认档（workspace-write）与 full-access
+ * 档零弹窗（命令全放行，含 ask/deny 级——dsh 实测语义；deny 直拒路径已删除：
+ * permission-denied 不再产生）。
  * POST /api/approval 协议不变：approve → 工具执行 → tool-result；deny（带备注）→
  * user-denied 结果+拒因回注，run 继续；deny（无备注）→ user-interrupted。未答不推进。
- * 用例全部经假 run_command/write_file 触发真实矩阵决策（矩阵逐格 + 真装配级见
- * permission.test.ts）。
+ * 用例全部经假 run_command/write_file 触发真实矩阵决策——审批往返类用例在 read-only 档
+ * 下执行（默认档无弹窗，无审批可答；矩阵逐格 + 真装配级见 permission.test.ts）。
  */
 import { afterEach, describe, expect, it } from 'vitest';
 import { defineRegistry } from '../../src/core/loop/index.js';
@@ -29,6 +30,17 @@ function toolDeps(scripts: FakeScript[], tools: Tool[]): DevmateServerDeps {
     model: 'test-model',
     // 本组聚焦审批矩阵：关掉评审哨兵（run_command 属实质变更——防止注入打断脚本序）
     settings: { reviewMode: false },
+  };
+}
+
+/**
+ * 审批往返档（read-only 种子）：审批面只在 read-only 档保留（ask/deny 级命令 → ask）；
+ * 默认档零弹窗无审批可答——往返类用例全部在 read-only 档跑。
+ */
+function readOnlyDeps(scripts: FakeScript[], tools: Tool[]): DevmateServerDeps {
+  return {
+    ...toolDeps(scripts, tools),
+    settings: { reviewMode: false, permission: 'read-only' },
   };
 }
 
@@ -63,9 +75,9 @@ describe('ui/server：审批往返（权限预设矩阵驱动）', () => {
     for (const server of servers.splice(0)) await server.close();
   });
 
-  it('c1) 默认档 ask 级命令（echo=未知→ask）：审批前不推进；approve → 工具执行 → tool-result → 下一轮 → completed', async () => {
+  it('c1) read-only 档 ask 级命令（echo=未知→ask）：审批前不推进；approve → 工具执行 → tool-result → 下一轮 → completed', async () => {
     const { base, server } = await startServer(
-      toolDeps(
+      readOnlyDeps(
         [
           { content: 'echoing', toolCalls: [ASK_CALL] },
           { content: 'patched', usage: { promptTokens: 1, completionTokens: 1, totalTokens: 2 } },
@@ -114,9 +126,9 @@ describe('ui/server：审批往返（权限预设矩阵驱动）', () => {
     expect(client.frames[client.frames.length - 1]!.data).toMatchObject({ status: 'completed' });
   });
 
-  it('c2) deny（带备注）→ user-denied 结果 + 拒因；run 继续（弹窗拒绝语义不变）', async () => {
+  it('c2) read-only 档：deny（带备注）→ user-denied 结果 + 拒因；run 继续（弹窗拒绝语义不变）', async () => {
     const { base, server } = await startServer(
-      toolDeps(
+      readOnlyDeps(
         [{ content: 'need tool', toolCalls: [ASK_CALL] }, { content: 'fine without it' }],
         [runCommandTool()],
       ),
@@ -152,9 +164,9 @@ describe('ui/server：审批往返（权限预设矩阵驱动）', () => {
     expect(client.frames[client.frames.length - 1]!.data).toMatchObject({ status: 'completed' });
   });
 
-  it('c3) deny（无备注）→ run-status user-interrupted（无工具结果、无第二次查询）', async () => {
+  it('c3) read-only 档：deny（无备注）→ run-status user-interrupted（无工具结果、无第二次查询）', async () => {
     const { base, server } = await startServer(
-      toolDeps([{ content: 'need tool', toolCalls: [ASK_CALL] }], [runCommandTool()]),
+      readOnlyDeps([{ content: 'need tool', toolCalls: [ASK_CALL] }], [runCommandTool()]),
     );
     servers.push(server);
     const sessionId = await chat(base, 'task');
@@ -186,7 +198,7 @@ describe('ui/server：审批往返（权限预设矩阵驱动）', () => {
 
   it('c4) 未知 toolCallId / 未知 session → 404 {error}', async () => {
     const { base, server } = await startServer(
-      toolDeps(
+      readOnlyDeps(
         [{ content: 'need tool', toolCalls: [ASK_CALL] }, { content: 'ok2' }],
         [runCommandTool()],
       ),
@@ -274,10 +286,10 @@ describe('ui/server：审批往返（权限预设矩阵驱动）', () => {
     expect(client.frames[client.frames.length - 1]!.data).toMatchObject({ status: 'completed' });
   });
 
-  it('c7) 默认档 deny 级命令（rm -rf）：不弹窗直接拒绝——permission-denied 回注，模型继续', async () => {
+  it('c7) read-only 档：deny 级命令（rm -rf）走 ask（问询兜底，不再直拒）——approve 后工具执行', async () => {
     const { base, server } = await startServer(
-      toolDeps(
-        [{ content: 'do it', toolCalls: [DENY_CALL] }, { content: '收尾，不动它了' }],
+      readOnlyDeps(
+        [{ content: 'do it', toolCalls: [DENY_CALL] }, { content: '收尾' }],
         [runCommandTool()],
       ),
     );
@@ -286,25 +298,24 @@ describe('ui/server：审批往返（权限预设矩阵驱动）', () => {
 
     const client = await SseClient.connect(base, sessionId);
     clients.push(client);
-    await waitForFrames(client, 9, 10_000);
-    const events = client.frames.map((f) => f.event);
-    // deny 不产生 approval-request（纯工具节点）；工具未执行而是直接回注失败
-    expect(events).not.toContain('approval-request');
-    expect(events).toContain('tool-start');
-    const result = client.frames.find((f) => f.event === 'tool-result')!;
-    expect(result.data).toMatchObject({
-      id: 'call-2',
-      name: 'run_command',
-      ok: false,
-      error:
-        '[permission: 命令被安全策略拒绝 under workspace-write mode]：rm 是危险命令（不可恢复的破坏性操作）',
+    await waitForFrames(client, 5, 10_000);
+    // deny 级命令在 read-only 档 = ask（问询兜底；原「deny 直拒回注」路径已删除——
+    // 权限拒绝不再产生，模型不再收到 permission-denied 失败回注）
+    expect(client.frames[4]).toMatchObject({
+      event: 'approval-request',
+      data: { toolCallId: 'call-2', name: 'run_command' },
     });
-    expect(result.data).toMatchObject({
-      contentPreview: expect.stringContaining('permission-denied'),
+
+    const approved = await postJson(base, '/api/approval', {
+      sessionId,
+      toolCallId: 'call-2',
+      approve: true,
     });
-    expect(result.data).toMatchObject({ content: expect.stringContaining('permission-denied') });
-    // 普通回注 → 模型继续 → completed
-    expect(client.frames.filter((f) => f.event === 'assistant-delta')).toHaveLength(2);
+    expect(approved.status).toBe(200);
+    await waitForFrames(client, 10, 10_000);
+    const result = client.frames[5]!;
+    expect(result.event).toBe('tool-result');
+    expect(result.data).toMatchObject({ id: 'call-2', name: 'run_command', ok: true });
     expect(client.frames[client.frames.length - 1]!.data).toMatchObject({ status: 'completed' });
   });
 });

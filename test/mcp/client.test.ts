@@ -14,7 +14,15 @@ import { afterEach, describe, expect, it } from 'vitest';
 
 import { connectMcpServer, type McpCallResult } from '../../src/core/mcp/client.js';
 import { McpError, spawnMcpTransport } from '../../src/core/mcp/transport.js';
-import { fixtureSpec, mkLogPath, readLog, waitForPidGone, waitForStart } from './support.js';
+import {
+  fixturePath,
+  fixtureSpec,
+  mkLogPath,
+  readLog,
+  waitForLog,
+  waitForPidGone,
+  waitForStart,
+} from './support.js';
 
 describe('core/mcp：client（假 stdio 服务器真进程往返）', () => {
   /** 收尾兜底：客户端/传输层 close（幂等；进程无残留由各用例自证）。 */
@@ -161,6 +169,47 @@ describe('core/mcp：client（假 stdio 服务器真进程往返）', () => {
     await client.close(); // 幂等：二次 close 不抛
     opened.pop();
   });
+
+  it.skipIf(process.platform === 'win32')(
+    'v2b) 进程组终止：close() 杀死中介+服务器整组（npm→node 形态；stdin 断管仍常驻的服务器不复存在）',
+    async () => {
+      const log = mkLogPath();
+      // 中介 node（launcher，stdio 全继承 → 服务器 node 拿到同一根 stdin 管道）→ 真实服务器
+      // node（fixture --stayOnEof：stdin EOF 后仍常驻——模拟 mcp-remote 类「父死仍不退出」；
+      // 只杀直接子进程（launcher 对应 npm）会留下服务器孤儿）。
+      // （sh 后台形态不适用：dash 对后台列表 stdin 重定向 /dev/null——服务器会提前 EOF。）
+      const launcherJs =
+        "const{spawn}=require('node:child_process');" +
+        "const c=spawn(process.execPath,[process.argv[1],...process.argv.slice(2)],{stdio:'inherit'});" +
+        "c.on('exit',code=>{process.exitCode=code??0});";
+      const transport = spawnMcpTransport({
+        command: process.execPath,
+        args: ['-e', launcherJs, '--', fixturePath(), `--log=${log}`, '--stayOnEof'],
+      });
+      opened.push(transport);
+      const nodePid = await waitForStart(log); // 服务器 node（组内孙进程）
+      // stdin 仍开着（launcher 完整继承）——服务器不会提前 EOF
+      expect((await readLog(log)).some((e) => e.ev === 'stay-eof')).toBe(false);
+
+      const t0 = Date.now();
+      await transport.close();
+      // close() 先 stdin.end：服务器收到 EOF 但 stayOnEof 常驻（直到被信号终止）。
+      // sigterm 事件证明：EOF 后进程仍存活（只杀直接子进程会留下这个孤儿）——
+      // 组杀之后整组回收、close 无需等满 2s 宽限。短窗口轮询（fixture 的日志刷写与
+      // close 返回之间存在调度间隙）。
+      const sigtermSeen = await waitForLog(
+        log,
+        (list) => list.some((e) => e.ev === 'sigterm'),
+        2000,
+      )
+        .then(() => true)
+        .catch(() => false);
+      expect(sigtermSeen).toBe(true);
+      expect(await waitForPidGone(nodePid, 5000)).toBe(true);
+      expect(Date.now() - t0).toBeLessThan(2000);
+      opened.pop();
+    },
+  );
 
   it('e1) 串行化：并发 2 call → 服务器观察 请求1→应答1→请求2→应答2', async () => {
     const log = mkLogPath();

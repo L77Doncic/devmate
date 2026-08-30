@@ -5,6 +5,7 @@
 import { describe, expect, it } from 'vitest';
 import {
   COMMANDS,
+  CONTINUE_PROMPT,
   THEME_ARG_VALUES,
   commandById,
   commandFor,
@@ -14,9 +15,9 @@ import {
   themeArgLabel,
 } from '../../src/ui/web/commands.js';
 
-describe('命令表（12 条单一来源）', () => {
-  it('12 条；name 唯一且都以 / 开头；help 首条', () => {
-    expect(COMMANDS).toHaveLength(12);
+describe('命令表（13 条单一来源）', () => {
+  it('13 条；name 唯一且都以 / 开头；help 首条', () => {
+    expect(COMMANDS).toHaveLength(13);
     const names = COMMANDS.map((c) => c.name);
     expect(new Set(names).size).toBe(names.length);
     for (const c of COMMANDS) {
@@ -30,6 +31,7 @@ describe('命令表（12 条单一来源）', () => {
       'new',
       'clear',
       'stop',
+      'continue',
       'sessions',
       'cost',
       'stats',
@@ -43,7 +45,20 @@ describe('命令表（12 条单一来源）', () => {
 
   it('id → 命令白名单匹配；未知 id → null', () => {
     expect(commandById('theme')).toMatchObject({ id: 'theme', name: '/theme' });
+    expect(commandById('continue')).toMatchObject({ id: 'continue', name: '/continue' });
     expect(commandById('nope')).toBeNull();
+  });
+
+  it('/continue：无参数；CONTINUE_PROMPT = 续跑指令文本（单一来源）', () => {
+    expect(commandFor('/continue')).toMatchObject({ id: 'continue', name: '/continue' });
+    expect(parseCommandLine('/continue')).toEqual({
+      name: '/continue',
+      args: '',
+      argList: [],
+    });
+    expect(commandArgValid(commandFor('/continue'), [])).toBe(true);
+    expect(commandArgValid(commandFor('/continue'), ['1'])).toBe(false);
+    expect(CONTINUE_PROMPT).toBe('请继续刚才未完成的任务。');
   });
 
   it('THEME_ARG_VALUES = theme.js 三态（dark/light/system；防两表漂移）', () => {
@@ -98,6 +113,12 @@ describe('matchCommands（下拉前缀过滤，防抖 150ms 后展示）', () =>
       '/skill',
     ]);
     expect(matchCommands('/n', 8).map((c) => c.name)).toEqual(['/new']);
+    expect(matchCommands('/c', 8).map((c) => c.name)).toEqual([
+      '/clear',
+      '/continue',
+      '/cost',
+      '/compact',
+    ]);
   });
   it('无命中 → []（菜单收起）；cap ≤ 0 防御', () => {
     expect(matchCommands('/zzz', 8)).toEqual([]);

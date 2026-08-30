@@ -284,3 +284,91 @@ describe('ui/server：reviewMode（R2-S2 评审哨兵开关）', () => {
     expect(llm.requests).toHaveLength(2);
   });
 });
+
+// ---------------------------------------------------------------------------
+// A 档：maxInputTokens / maxOutputTokens（严格正整数；未设不传；即时作用于后续 run）
+// ---------------------------------------------------------------------------
+
+describe('ui/server：settings 输入/输出上限（A 档）', () => {
+  const servers: DevmateServer[] = [];
+  const clients: SseClient[] = [];
+
+  afterEach(async () => {
+    for (const client of clients.splice(0)) client.close();
+    for (const server of servers.splice(0)) await server.close();
+  });
+
+  it('l1) POST 上限 → GET 回显（只回已设值）；未设恒不带键', async () => {
+    const { base, server } = await startServer(baseDeps(new FakeLlm([{ content: 'x' }])));
+    servers.push(server);
+
+    const initial = (await (await fetch(new URL('/api/settings', base))).json()) as Record<
+      string,
+      unknown
+    >;
+    expect(initial.maxInputTokens).toBeUndefined();
+    expect(initial.maxOutputTokens).toBeUndefined();
+
+    await postJson(base, '/api/settings', { maxInputTokens: 4096, maxOutputTokens: 2048 });
+    const after = (await (await fetch(new URL('/api/settings', base))).json()) as Record<
+      string,
+      unknown
+    >;
+    expect(after.maxInputTokens).toBe(4096);
+    expect(after.maxOutputTokens).toBe(2048);
+
+    // 未触碰字段不被回写（只 POST 一个）
+    await postJson(base, '/api/settings', { maxInputTokens: 8192 });
+    const partial = (await (await fetch(new URL('/api/settings', base))).json()) as Record<
+      string,
+      unknown
+    >;
+    expect(partial.maxInputTokens).toBe(8192);
+    expect(partial.maxOutputTokens).toBe(2048);
+  });
+
+  it('l2) 违反严格正整数的值 → 400', async () => {
+    const { base, server } = await startServer(baseDeps(new FakeLlm([{ content: 'x' }])));
+    servers.push(server);
+    for (const bad of [0, -1, 1.5, '4096', true]) {
+      const res = await postJson(base, '/api/settings', { maxInputTokens: bad });
+      expect(res.status, `maxInputTokens=${String(bad)}`).toBe(400);
+      const res2 = await postJson(base, '/api/settings', { maxOutputTokens: bad });
+      expect(res2.status, `maxOutputTokens=${String(bad)}`).toBe(400);
+    }
+  });
+
+  it('l3) 生效：POST maxOutputTokens 后下一条 run 的请求带 maxTokens；未设置时不带', async () => {
+    const fake = new FakeLlm([
+      { content: 'a', usage: { promptTokens: 1, completionTokens: 1, totalTokens: 2 } },
+      { content: 'b', usage: { promptTokens: 1, completionTokens: 1, totalTokens: 2 } },
+    ]);
+    const { base, server } = await startServer(baseDeps(fake));
+    servers.push(server);
+
+    // 未设置：请求不带 maxTokens / maxInputTokens（缺省=厂商默认）
+    const r1 = await postJson(base, '/api/chat', { text: 'x' });
+    expect(r1.status).toBe(200);
+    const s1 = (await r1.json()) as { sessionId: string };
+    await waitRun(fake, 1);
+    expect(fake.requests[0]!.maxTokens).toBeUndefined();
+    expect(fake.requests[0]!.maxInputTokens).toBeUndefined();
+
+    // 设置后：message 请求带新值（每次 run 现读）
+    await postJson(base, '/api/settings', { maxInputTokens: 1111, maxOutputTokens: 2222 });
+    const r2 = await postJson(base, '/api/chat', { sessionId: s1.sessionId, text: 'y' });
+    expect(r2.status).toBe(200);
+    await waitRun(fake, 2);
+    expect(fake.requests[1]!.maxTokens).toBe(2222);
+    expect(fake.requests[1]!.maxInputTokens).toBe(1111);
+  });
+});
+
+/** 等待 fake 收到第 n 次请求（onEnter 计数；超时 5s 抛错）。 */
+async function waitRun(fake: FakeLlm, count: number): Promise<void> {
+  const deadline = Date.now() + 5000;
+  while (fake.callCount < count && Date.now() < deadline) {
+    await new Promise((resolve) => setTimeout(resolve, 20));
+  }
+  if (fake.callCount < count) throw new Error(`fake llm callCount ${fake.callCount} < ${count}`);
+}

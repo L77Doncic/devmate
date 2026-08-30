@@ -380,3 +380,24 @@ describe('tools', () => {
     expect(toolsListSource(true, [{ name: 'bash' }])).toBe('runtime');
   });
 });
+
+describe('toProtocolEvent：images 同形透传（ADR-0015）', () => {
+  it('user 事件带 images → session-user 帧 data.images 相同（存储→协议回放形状）', () => {
+    const images = [{ url: 'data:image/png;base64,AA==', width: 640, height: 480 }];
+    expect(toProtocolEvent({ kind: 'user', payload: { content: '看图', images } })).toEqual({
+      event: 'session-user',
+      data: { text: '看图', images },
+    });
+  });
+
+  it('无 images / 空数组 → 不带键（旧协议形状零扰动）', () => {
+    expect(toProtocolEvent({ kind: 'user', payload: { content: 'hi' } })).toEqual({
+      event: 'session-user',
+      data: { text: 'hi' },
+    });
+    expect(toProtocolEvent({ kind: 'user', payload: { content: 'hi', images: [] } })).toEqual({
+      event: 'session-user',
+      data: { text: 'hi' },
+    });
+  });
+});

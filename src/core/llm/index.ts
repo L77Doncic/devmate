@@ -15,11 +15,13 @@ export { LlmClient } from './client.js';
 export type { LlmClientOptions } from './client.js';
 export { LlmError } from '../../shared/llm-types.js';
 export {
+  MODEL_WINDOW_HINT_RE,
   PROVIDER_IDS,
   ProviderAdapterError,
   buildRequest,
   normalizeError,
   normalizeFinishReason,
+  sanitizeProviderModel,
 } from './provider-adapter.js';
 export type {
   NormalizedFinishReason,
@@ -36,6 +38,16 @@ export {
   defaultProviderPreset,
   getProviderPreset,
 } from './presets.js';
+// 网关窗口探测（三源取窗 · 网关层；零依赖纯模块）
+export {
+  DEFAULT_WINDOW_TIMEOUT_MS,
+  WINDOW_FIELD_KEYS,
+  WINDOW_MAX,
+  discoverWindow,
+  modelsEndpointOf,
+  normalizeWindow,
+} from './models.js';
+export type { DiscoverWindowParams, DiscoverWindowResult, DiscoverWindowSource } from './models.js';
 export type {
   AssembledToolCall,
   ChatMessage,

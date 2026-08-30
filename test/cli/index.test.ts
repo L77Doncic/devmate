@@ -1,6 +1,6 @@
 import { describe, expect, it, vi } from 'vitest';
-import { main } from '../../src/cli/index.js';
-import type { CliIo } from '../../src/cli/index.js';
+import { installGracefulSignals, main } from '../../src/cli/index.js';
+import type { CliIo, SignalIo } from '../../src/cli/index.js';
 
 /**
  * S14 入口分发规格：
@@ -68,5 +68,66 @@ describe('main：命令分发', () => {
     expect(code).toBe(1);
     expect(err.join('\n')).toContain('frobnicate');
     expect(out.join('\n')).toContain('用法');
+  });
+});
+
+describe('installGracefulSignals（VT-2 修复 a：SIGTERM 优雅关闭）', () => {
+  /** 假 SignalIo：捕获注册处理器；exit 记录码并正常返回（不会引入 unhandled rejection）。 */
+  function fakeIo(): {
+    io: SignalIo;
+    registered: Array<[string, () => void]>;
+    exitCodes: number[];
+  } {
+    const registered: Array<[string, () => void]> = [];
+    const exitCodes: number[] = [];
+    return {
+      registered,
+      exitCodes,
+      io: {
+        once: (signal, handler) => {
+          registered.push([signal, handler]);
+        },
+        exit: ((code: number) => {
+          exitCodes.push(code);
+        }) as unknown as (code: number) => never,
+      },
+    };
+  }
+
+  it('SIGINT 与 SIGTERM 都注册；SIGTERM 触发 → 同一完整关闭回调 → 退出 0', async () => {
+    const { io, registered, exitCodes } = fakeIo();
+    const shutdown = vi.fn(async () => undefined);
+    installGracefulSignals(['SIGINT', 'SIGTERM'], io, shutdown);
+    expect(registered.map(([s]) => s)).toEqual(['SIGINT', 'SIGTERM']);
+
+    // SIGTERM（kill / 端口终止 / systemd stop 等典型运维信号）走与 Ctrl-C 相同的收尾
+    const term = registered.find(([s]) => s === 'SIGTERM')![1]!;
+    term();
+    await new Promise((resolve) => setTimeout(resolve, 0)); // Promise 链落定
+    expect(shutdown).toHaveBeenCalledTimes(1);
+    expect(exitCodes).toEqual([0]);
+  });
+
+  it('关闭回调抛错也退出 0（清理只可能错过、不虚报失败；SIGINT 同一语义）', async () => {
+    const { io, registered, exitCodes } = fakeIo();
+    const shutdown = vi.fn(async () => {
+      throw new Error('close failed');
+    });
+    installGracefulSignals(['SIGINT', 'SIGTERM'], io, shutdown);
+    const ctrl = registered.find(([s]) => s === 'SIGINT')![1]!;
+    ctrl();
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    expect(shutdown).toHaveBeenCalledTimes(1);
+    expect(exitCodes).toEqual([0]);
+  });
+
+  it('一次信号只收尾一次（shutdown 幂等且 callback 只触发一次）', async () => {
+    const { io, registered, exitCodes } = fakeIo();
+    const shutdown = vi.fn(async () => undefined);
+    installGracefulSignals(['SIGTERM'], io, shutdown);
+    registered[0]![1]();
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    expect(shutdown).toHaveBeenCalledTimes(1);
+    expect(exitCodes).toEqual([0]);
   });
 });

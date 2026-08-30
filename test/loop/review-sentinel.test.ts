@@ -93,6 +93,10 @@ describe('loop：收尾评审哨兵（RunOptions.review）', () => {
     expect(sentinel).toBeDefined();
     expect(sentinel!.payload.content).toBe(REVIEW_SENTINEL_USER_CONTENT);
     expect(sentinel!.meta).toEqual({ system: true });
+    // 哨兵文案契约：含 skill:"code-review" 注入指引（B-1 skill 注入）；「审查」要求保留
+    expect(sentinel!.payload.content).toContain('skill:"code-review"');
+    expect(sentinel!.payload.content).toContain('spawn_subagent');
+    expect(sentinel!.payload.content).toContain('审查');
     // 续跑的一轮请求：哨兵消息已是最后一条 user 消息（模型对其 respond）
     const second = llm.requests[1]!;
     const last = second.messages[second.messages.length - 1]!;

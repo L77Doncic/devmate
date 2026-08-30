@@ -42,7 +42,7 @@ describe('ui/server：settings reasoning / window', () => {
     for (const dir of tempDirs.splice(0)) await rm(dir, { recursive: true, force: true });
   });
 
-  it('r1) GET 缺省：reasoning=medium、window 来自 preset（assembleDeps：deepseek 估算 64000）；POST 更新后 GET 一致', async () => {
+  it('r1) GET 缺省：reasoning=medium、window 来自 preset（assembleDeps：deepseek 估算 128000）；POST 更新后 GET 一致', async () => {
     const dir = await mkdtemp(join(tmpdir(), 'devmate-reasoning-'));
     tempDirs.push(dir);
     const deps = await assembleDeps({
@@ -59,14 +59,14 @@ describe('ui/server：settings reasoning / window', () => {
       baseUrl: string;
     };
     expect(before.reasoning).toBe('medium');
-    expect(before.window).toBe(64000); // deepseek preset contextWindowTokens（估算，可在设置覆盖）
+    expect(before.window).toBe(128000); // deepseek preset contextWindowTokens（估算，可在设置覆盖）
     expect(typeof before.baseUrl).toBe('string');
 
     const res = await postJson(base, '/api/settings', { reasoning: 'high' });
     expect(res.status).toBe(200);
     const saved = (await res.json()) as { reasoning: string; window?: number };
     expect(saved.reasoning).toBe('high');
-    expect(saved.window).toBe(64000);
+    expect(saved.window).toBe(128000);
 
     const after = (await (await fetch(new URL('/api/settings', base))).json()) as {
       reasoning: string;

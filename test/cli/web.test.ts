@@ -204,6 +204,31 @@ describe('runWeb：启动冒烟（注入假 ServerModule，不真监听）', () 
     expect(events).toEqual(['close']);
   });
 
+  it('SIGTERM 路径（VT-2 修复 a）：信号回调走完整关闭链——server.close → deps.dispose 恰一次（mcpLauncher/shell 释放）', async () => {
+    const events: string[] = [];
+    const dispose = vi.fn(async () => {
+      events.push('dispose');
+    });
+    const server = {
+      listen: vi.fn(async () => ({ host: '127.0.0.1', port: 4321 })),
+      close: vi.fn(async () => {
+        // 生产：server.close → deps.dispose（mcpLauncher.dispose + 常驻 shell 全清）
+        events.push('close');
+        await dispose();
+      }),
+    };
+    const module: ServerModule = {
+      assembleDeps: async () => ({ assembled: true }),
+      createDevmateServer: vi.fn(() => server),
+    };
+    const { rt, fireSignal } = makeRuntime([], { loadServerModule: async () => module });
+    await runWeb(['--no-open'], rt);
+    events.length = 0;
+    fireSignal(); // 生产接线把 SIGINT 与 SIGTERM 绑到同一回调（见 cli/index installGracefulSignals）
+    expect(events).toEqual(['close', 'dispose']);
+    expect(dispose).toHaveBeenCalledTimes(1);
+  });
+
   it('设置读回种子：持久三键写盘 → 重启（同文件重读）→ assembleDeps 收到持久值；清键 → 键缺省不传', async () => {
     const configPath = join(tmpHome, '.devmate', 'config.json');
     // 模拟上一进程 POST /api/settings 的持久化路径（mergeConfig 单点合并写）

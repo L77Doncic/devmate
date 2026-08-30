@@ -197,4 +197,20 @@ describe('ui/server/deps-prompt：预算估算（base 锚 + 裁剪链覆盖）',
     // 裁剪链只裁清单尾部：子代理节是固定小节（防回归：若日后该节做大，此处提醒它在裁剪链之外）
     expect(out).toContain('## 子代理');
   });
+
+  it('P10) maxParallel=0 → 子代理节显示「并行上限 无上限」（不显示误导性的 0）', async () => {
+    const out = await composeSystemPrompt({
+      skills: () => normalSkills(),
+      workflow: () => ({ subagentsEnabled: true, maxParallel: 0 }),
+    });
+    expect(out).toContain('## 子代理');
+    expect(out).toContain('并行上限 无上限');
+    expect(out).not.toContain('并行上限 0');
+    // 显式档照常显示数字（≥1 路径）
+    const explicit = await composeSystemPrompt({
+      skills: () => normalSkills(),
+      workflow: () => ({ subagentsEnabled: true, maxParallel: 8 }),
+    });
+    expect(explicit).toContain('并行上限 8');
+  });
 });

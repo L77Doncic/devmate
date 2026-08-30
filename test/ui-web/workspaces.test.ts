@@ -8,6 +8,8 @@ import { describe, expect, it } from 'vitest';
 import {
   WS_DEGRADED_NOTE,
   WS_EMPTY_NOTE,
+  WS_SEARCH_NO_MATCH,
+  WS_SORT_MODES,
   WS_COLLAPSE_LS_KEY,
   WS_MENU_ITEMS,
   WS_UNGROUPED_LABEL,
@@ -18,6 +20,9 @@ import {
   workspacePathMeta,
   workspaceMenuOrder,
   pickDefaultRoot,
+  filterSessionList,
+  nextWsSortMode,
+  sortWorkspaceSessions,
   groupSessionsByRegisteredWorkspaces,
   workspaceOfSession,
   createBrowseState,
@@ -394,5 +399,114 @@ describe('workspaceErrorInfo（HTTP/网络错误 → kind + 中文文案）', ()
     expect(workspaceErrorInfo(http(500, 'boom')).kind).toBe('http');
     expect(workspaceErrorInfo({ status: 500, message: 'x' })).toMatchObject({ kind: 'http' });
     expect(workspaceErrorInfo(null).kind).toBe('network');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// 区头搜索过滤 / 排序轮换（dsh WorkspaceBrowser 区头三图标）
+// ---------------------------------------------------------------------------
+
+describe('filterSessionList（搜索过滤，纯客户端）', () => {
+  const list = [
+    { sessionId: 'a1', title: '配置 API Key', updatedAt: 30 },
+    { sessionId: 'b2', title: '审查 websocket 协议', updatedAt: 20 },
+    { sessionId: 'c3', title: '', updatedAt: 10 },
+  ];
+
+  it('空/空白查询 → 原列表副本（不过滤）', () => {
+    expect(filterSessionList(list, '')).toEqual(list);
+    expect(filterSessionList(list, '   ')).toEqual(list);
+    expect(filterSessionList(list, undefined)).toEqual(list);
+  });
+
+  it('按标题包含过滤（大小写不敏感：中文原样 / 英文忽略大小写）', () => {
+    expect(filterSessionList(list, '审查')).toHaveLength(1);
+    expect(filterSessionList(list, 'api key')).toHaveLength(1);
+    expect(filterSessionList(list, 'API')).toHaveLength(1);
+  });
+
+  it('sessionId 亦参与匹配；无命中 → 空数组；输入不修改', () => {
+    expect(filterSessionList(list, 'b2')).toHaveLength(1);
+    expect(filterSessionList(list, '不存在')).toEqual([]);
+    const before = JSON.stringify(list);
+    filterSessionList(list, '审查');
+    expect(JSON.stringify(list)).toBe(before);
+  });
+
+  it('非法输入防御：非数组 → 空数组；坏项按空标题参与', () => {
+    expect(filterSessionList(null, 'x')).toEqual([]);
+    expect(filterSessionList([{ title: null }, { title: 'ok' }], '')).toHaveLength(2);
+    expect(filterSessionList([{ title: null }], 'x')).toHaveLength(0);
+  });
+});
+
+describe('sortWorkspaceSessions（排序轮换）', () => {
+  const list = [
+    { sessionId: 'a', title: '配置 API Key', updatedAt: 30 },
+    { sessionId: 'b', title: '审查 websocket 协议', updatedAt: 20 },
+    { sessionId: 'c', title: '', updatedAt: 10 },
+  ];
+
+  it('recent（缺省）：updatedAt 新→旧；无时间戳排后（原相对序）', () => {
+    const sorted = sortWorkspaceSessions(list, 'recent');
+    expect(sorted.map((s) => s.sessionId)).toEqual(['a', 'b', 'c']);
+    const withNull = sortWorkspaceSessions(
+      [
+        { sessionId: 'x', updatedAt: null },
+        { sessionId: 'y', updatedAt: 5 },
+      ],
+      'recent',
+    );
+    expect(withNull.map((s) => s.sessionId)).toEqual(['y', 'x']); // 无时间戳：排尾
+  });
+
+  it('name：标题升序，同标题比更新时间；输入不修改', () => {
+    const withDup = [
+      { sessionId: 'p', title: 'aa', updatedAt: 2 },
+      { sessionId: 'q', title: 'aa', updatedAt: 9 },
+      { sessionId: 'r', title: 'bb', updatedAt: 1 },
+    ];
+    expect(sortWorkspaceSessions(withDup, 'name').map((s) => s.sessionId)).toEqual(['q', 'p', 'r']);
+    const before = JSON.stringify(list);
+    sortWorkspaceSessions(list, 'name');
+    expect(JSON.stringify(list)).toBe(before);
+  });
+
+  it('未知模式 → recent 兜底；非数组 → []', () => {
+    expect(sortWorkspaceSessions(list, 'bogus').map((s) => s.sessionId)).toEqual(['a', 'b', 'c']);
+    expect(sortWorkspaceSessions(null, 'name')).toEqual([]);
+  });
+});
+
+describe('nextWsSortMode（点击轮换）', () => {
+  it('recent → name → recent 循环；未知值按 recent 起轮', () => {
+    expect(nextWsSortMode('recent')).toBe('name');
+    expect(nextWsSortMode('name')).toBe('recent');
+    expect(nextWsSortMode(undefined)).toBe('name');
+    expect(WS_SORT_MODES).toEqual(['recent', 'name']);
+    expect(WS_SEARCH_NO_MATCH).toBe('无匹配会话');
+  });
+});
+
+describe('filter + sort + group 流水线（renderSessionList 的入参组合）', () => {
+  it('过滤后按名称组内排序｜空结果组=空（组头仍按注册序保留）', () => {
+    const list = [
+      { sessionId: 'a', title: 'zzz review', workspaceRoot: '/w', updatedAt: 1 },
+      { sessionId: 'b', title: 'aaa review', workspaceRoot: '/w', updatedAt: 2 },
+      { sessionId: 'c', title: 'other', workspaceRoot: null, updatedAt: 3 },
+    ];
+    const groups = groupSessionsByRegisteredWorkspaces(
+      sortWorkspaceSessions(filterSessionList(list, 'review'), 'name'),
+      ['/w'],
+    );
+    expect(groups).toHaveLength(1); // 未知组被过滤后省略（未知项目组无会话不出现）
+    expect(groups[0]!.workspaceRoot).toBe('/w');
+    expect(groups[0]!.sessions.map((s: { sessionId: string }) => s.sessionId)).toEqual(['b', 'a']); // aaa → zzz
+    const none = groupSessionsByRegisteredWorkspaces(
+      sortWorkspaceSessions(filterSessionList(list, 'zzz-no'), 'recent'),
+      ['/w'],
+    );
+    expect(none).toHaveLength(1);
+    expect(none[0].sessions).toEqual([]);
   });
 });

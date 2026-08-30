@@ -11,6 +11,7 @@
  * - DELETE /api/sessions/:id → 删文件 + 清 broker/审批挂起/shell（deps.disposeSession 回调）
  *   → {ok:true}；活跃 run → 409；404 统一 {error}。
  */
+import { writeFileSync } from 'node:fs';
 import { mkdtemp, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -732,5 +733,80 @@ describe('ui/server：会话删除 DELETE /api/sessions/:id', () => {
     for await (const ev of store.events('s-race')) kinds.push(ev.kind);
     expect(kinds.filter((k) => k === 'user')).toHaveLength(1); // m1 落盘（删除后重建）
     expect(kinds.filter((k) => k === 'assistant')).toHaveLength(2); // 两回合
+  });
+});
+
+// ---------------------------------------------------------------------------
+// VT-8：全损坏会话（不可解析行 > 80%）显示语义
+// ---------------------------------------------------------------------------
+
+describe('ui/server：全损坏会话标记（VT-8：不冒充（空会话））', () => {
+  const tempDirs: string[] = [];
+
+  afterEach(async () => {
+    for (const dir of tempDirs.splice(0)) await rm(dir, { recursive: true, force: true });
+  });
+
+  it('l5) 100% 损坏文件 → 列表「（会话损坏）」+ corrupted 标记；详情同样标记；events 为空不冒充（空会话）', async () => {
+    const dir = await mkdtemp(join(tmpdir(), 'devmate-sessions-corrupt-'));
+    tempDirs.push(dir);
+    const deps = await assembleDeps({ workspaceRoot: dir, sessionsDir: dir, model: 'm-x' });
+    writeFileSync(join(dir, 's-vt-garbage.jsonl'), 'not json at all {{{');
+    // 正常会话对照
+    await deps.store.create('s-ok');
+    await deps.store.append('s-ok', { kind: 'user', payload: { content: '正常' } });
+
+    const listed = await deps.sessionLister!();
+    const garbage = listed.find((s) => s.sessionId === 's-vt-garbage');
+    const ok = listed.find((s) => s.sessionId === 's-ok');
+    expect(garbage).toBeDefined();
+    expect(garbage!.title).toBe('（会话损坏）');
+    expect(garbage!.corrupted).toBe(true);
+    expect(garbage!.stepCount).toBe(0);
+    expect(ok!.title).toBe('正常');
+    expect(ok!.corrupted).toBeUndefined();
+
+    // HTTP 列表 + 详情：用同一套装配 deps（真 JsonlFileAdapter 在 dir 上——store 与 lister 同源）
+    const { base, server } = await startServer(deps);
+    const res = await fetch(new URL('/api/sessions', base));
+    const body = (await res.json()) as { sessions: SessionSummary[] };
+    const httpGarbage = body.sessions.find((s) => s.sessionId === 's-vt-garbage');
+    expect(httpGarbage).toBeDefined();
+    expect(httpGarbage!.title).toBe('（会话损坏）');
+    expect(httpGarbage!.corrupted).toBe(true);
+
+    const detail = await fetch(
+      new URL(`/api/sessions/${encodeURIComponent('s-vt-garbage')}`, base),
+    );
+    expect(detail.status).toBe(200);
+    const detailBody = (await detail.json()) as {
+      title: string;
+      corrupted?: boolean;
+      events: unknown[];
+    };
+    expect(detailBody.title).toBe('（会话损坏）');
+    expect(detailBody.corrupted).toBe(true);
+    expect(detailBody.events).toEqual([]);
+    await server.close();
+  });
+
+  it('l6) 阈值语义：部分损坏（1/3 坏行）不误标；空文件仍「（空会话）」', async () => {
+    const dir = await mkdtemp(join(tmpdir(), 'devmate-sessions-partial-'));
+    tempDirs.push(dir);
+    const deps = await assembleDeps({ workspaceRoot: dir, sessionsDir: dir, model: 'm-x' });
+    // 完整行 ×2 + 脏行 ×1（33% < 80%）——正常崩溃的「完整行+截断尾行」形态在阈值下
+    const line = (seq: number, content: string): string =>
+      `${JSON.stringify({ v: 1, seq, ts: 1, kind: 'user', payload: { content } })}\n`;
+    writeFileSync(join(dir, 's-partial.jsonl'), `${line(1, 'a')}${line(2, 'b')}not json {{{`);
+    // 空文件（真空会话）
+    writeFileSync(join(dir, 's-empty.jsonl'), '');
+
+    const listed = await deps.sessionLister!();
+    const partial = listed.find((s) => s.sessionId === 's-partial');
+    const empty = listed.find((s) => s.sessionId === 's-empty');
+    expect(partial!.title).toBe('a');
+    expect(partial!.corrupted).toBeUndefined();
+    expect(empty!.title).toBe('（空会话）');
+    expect(empty!.corrupted).toBeUndefined();
   });
 });

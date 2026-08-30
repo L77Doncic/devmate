@@ -100,3 +100,14 @@ describe('icons.js 纪律：无 innerHTML（字符串版仅测试用）', () => 
     expect(ICON_NS).toBe('http://www.w3.org/2000/svg');
   });
 });
+
+describe('imagePlus（ADR-0015：composer 附件钮图标）', () => {
+  it('图标在表内：3 段 d 串（外框/山形/加号），绝对起笔，round cap 语言同族', () => {
+    const paths = iconPaths('imagePlus');
+    expect(paths).not.toBeNull();
+    expect(paths!.length).toBe(3);
+    for (const d of paths!) {
+      expect(d.startsWith('M')).toBe(true);
+    }
+  });
+});

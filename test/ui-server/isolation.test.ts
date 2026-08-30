@@ -25,7 +25,12 @@ class RoutingLlm implements LlmAdapter {
 
   async *chat(request: ChatRequest, signal?: AbortSignal): AsyncIterable<StreamEvent> {
     const first = request.messages.find((m) => m.role === 'user');
-    const key = first !== undefined && first.role === 'user' ? first.content : '';
+    const key =
+      first !== undefined && first.role === 'user'
+        ? typeof first.content === 'string'
+          ? first.content
+          : JSON.stringify(first.content)
+        : '';
     const fake = this.routes.get(key);
     if (fake === undefined) {
       throw new Error(`RoutingLlm: no route for ${JSON.stringify(key)}`);
@@ -34,8 +39,8 @@ class RoutingLlm implements LlmAdapter {
   }
 }
 
-// ask 级命令（echo=未知→ask）：默认档（workspace-write）下触发 approval-request——
-// 隔离用例的目标正是「各自挂着各自的审批请求」
+// ask 级命令（echo=未知→ask）：read-only 档下触发 approval-request（默认档零弹窗——
+// 隔离用例需要「各自挂着各自的审批请求」的挂点，故 d1 播种 read-only）
 const CALL_A = { id: 'call-a', name: 'run_command', arguments: '{"command":"echo a"}' };
 const CALL_B = { id: 'call-b', name: 'run_command', arguments: '{"command":"echo b"}' };
 
@@ -64,8 +69,9 @@ describe('ui/server：会话隔离', () => {
       tools: defineRegistry([runCommandTool()], { sessionId: 's1' }),
       llm: new RoutingLlm(routes),
       model: 'test-model',
-      // 本组聚焦隔离语义：关掉评审哨兵（run_command 属实质变更——防止注入改变 script 序）
-      settings: { reviewMode: false },
+      // 本组聚焦隔离语义：关掉评审哨兵（run_command 属实质变更——防止注入改变 script 序）；
+      // 播种 read-only：审批面只在 read-only 档保留（默认档零弹窗），d1 需要审批挂点
+      settings: { reviewMode: false, permission: 'read-only' },
     });
     servers.push(server);
 

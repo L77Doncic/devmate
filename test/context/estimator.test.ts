@@ -188,3 +188,78 @@ describe('估算器：L0 事后校准系数（估算 × EMA 系数；ADR-0012「
     expect(c.coefficient).toBeCloseTo(1.5, 12);
   });
 });
+
+// ---------------------------------------------------------------------------
+// 图像 token（ADR-0015）：DeepSeek 近似公式（official cap 384；<384×384 放大 / >800×800
+// 缩小；512px 瓦片 × 96 token；deepseek-vision.md §2——所有预期值为公式手算）
+// ---------------------------------------------------------------------------
+
+import { estimateImageTokens, IMAGE_TOKENS_CAP } from '../../src/core/context/estimator.js';
+
+describe('估算器：图像 token（ADR-0015 近似公式）', () => {
+  it('240×240（<384×384 面积）→ 放大至 384×384 → 1 瓦片 × 96 = 96', () => {
+    expect(estimateImageTokens(240, 240)).toBe(96);
+  });
+
+  it('384×384（恰在放大阈值内——面积不小于阈值则原样）→ 1 瓦片 = 96', () => {
+    expect(estimateImageTokens(384, 384)).toBe(96);
+  });
+
+  it('800×800（官方缩放宽/瓦片 2×2）→ 4 瓦片 × 96 = 384 = 上限', () => {
+    expect(estimateImageTokens(800, 800)).toBe(IMAGE_TOKENS_CAP);
+  });
+
+  it('2000×2000 与 5000×5000（官方同 token 示例）→ 同为 384（封顶）', () => {
+    expect(estimateImageTokens(2000, 2000)).toBe(IMAGE_TOKENS_CAP);
+    expect(estimateImageTokens(5000, 5000)).toBe(IMAGE_TOKENS_CAP);
+  });
+
+  it('1×1（极端小图）→ 放大计算 → ≥1 瓦片 = 96（每图下限，不因尺寸归零）', () => {
+    expect(estimateImageTokens(1, 1)).toBe(96);
+  });
+
+  it('宽高缺省（未知尺寸）→ 按上限档 800×800 估 = 384（保守）', () => {
+    expect(estimateImageTokens()).toBe(IMAGE_TOKENS_CAP);
+    expect(estimateImageTokens(undefined, undefined)).toBe(IMAGE_TOKENS_CAP);
+  });
+
+  it('非法尺寸输入（0/负数/NAN/字符串）→ 该边回落缺省 800；全非法 → 800×800 = 384（不抛错）', () => {
+    // 宽非法（回落 800）× 高 100：800×100 面积 < 384² → 放大至 384² → 1086×136 → 3 瓦片
+    expect(estimateImageTokens('0' as unknown as number, 100 as unknown as number)).toBe(288);
+    expect(estimateImageTokens(Number.NaN, 800)).toBe(IMAGE_TOKENS_CAP);
+    expect(estimateImageTokens(0, -5)).toBe(IMAGE_TOKENS_CAP);
+  });
+
+  it('多模态消息：parts.imageTokens 独立计量；tokens = 正文 + 图像 + 结构开销', () => {
+    const est = estimateTokens([
+      {
+        role: 'user',
+        content: [
+          { type: 'text', text: 'hi' },
+          {
+            type: 'image_url',
+            image_url: { url: 'data:image/png;base64,x' },
+            width: 800,
+            height: 800,
+          },
+          {
+            type: 'image_url',
+            image_url: { url: 'data:image/png;base64,y' },
+            width: 240,
+            height: 240,
+          },
+        ],
+      },
+    ]);
+    expect(est.parts.imageTokens).toBe(384 + 96);
+    expect(est.parts.contentTokens).toBe(1); // 'hi' → 1（图片不进 contentTokens）
+    expect(est.parts.messageOverhead).toBe(6);
+    expect(est.tokens).toBe(384 + 96 + 1 + 6);
+  });
+
+  it('纯文本消息：imageTokens 恒 0（旧路径零扰动）', () => {
+    const est = estimateTokens([{ role: 'user', content: 'hi' }]);
+    expect(est.parts.imageTokens).toBe(0);
+    expect(est.tokens).toBe(7);
+  });
+});

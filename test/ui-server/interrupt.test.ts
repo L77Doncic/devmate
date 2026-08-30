@@ -15,7 +15,8 @@ import type { DevmateServerDeps } from '../../src/ui/server/index.js';
 import { FakeLlm, runCommandTool } from '../loop/support.js';
 import { postJson, SseClient, startServer, waitForFrames } from './support.js';
 
-// ask 级命令（echo=未知→ask）：默认档下触发 approval-request（矩阵判定见 server）
+// ask 级命令（echo=未知→ask）：只读档下触发 approval-request（矩阵判定见 server）——
+// 审批面只在 read-only 档保留（默认档零弹窗），e1 的「审批挂起时中断」挂点播种 read-only
 const ASK_CALL = { id: 'call-1', name: 'run_command', arguments: '{"command":"echo hi"}' };
 
 function askAllDeps(): DevmateServerDeps {
@@ -24,6 +25,7 @@ function askAllDeps(): DevmateServerDeps {
     tools: defineRegistry([runCommandTool()], { sessionId: 's1' }),
     llm: new FakeLlm([{ content: 'need tool', toolCalls: [ASK_CALL] }]),
     model: 'test-model',
+    settings: { permission: 'read-only' },
   };
 }
 

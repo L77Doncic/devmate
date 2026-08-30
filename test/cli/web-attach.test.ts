@@ -10,7 +10,7 @@ import { clampMaxParallel } from '../../src/shared/workflow.js';
 /**
  * S14 CLI `web` attach 模式（新增）：createDevmateServer 的 deps 叠加
  * - 三个落盘回调 saveSkillsConfig / saveWorkflow / saveMcpConfig（→ mergeConfig 单点合并写）；
- * - 三节初值 workflow（夹紧 1-4）/ skillsRecord（缺省 {}）/ mcpServers（缺省 []）。
+ * - 三节初值 workflow（归一 0-8：0 = 无上限）/ skillsRecord（缺省 {}）/ mcpServers（缺省 []）。
  * 初值来源 config.json（loadStoredConfig）；损坏 JSON 走 ConfigError 路径（不回归）。
  */
 
@@ -138,7 +138,7 @@ describe('runWeb attach 模式：三节初值缺省（首次无配置）', () =>
     });
   });
 
-  it('a2) 初值加载：workflow maxParallel 越界（7/0）在 CLI 初值夹紧为 4/1；skills/mcp 原样注入', async () => {
+  it('a2) 初值加载：workflow maxParallel 归一 0-8（9→8、-1→0、7 保留）；0 = 无上限保留；skills/mcp 原样注入', async () => {
     const configPath = join(tmpHome, '.devmate', 'config.json');
     saveConfig(configPath, {
       workflow: { subagentsEnabled: false, maxParallel: 7 },
@@ -149,16 +149,27 @@ describe('runWeb attach 模式：三节初值缺省（首次无配置）', () =>
     const captured: Captured = { deps: undefined, events: [], onSignal: undefined };
     const code = await runWeb(['--no-open'], makeIo(configPath, captured));
     expect(code).toBe(0);
-    expect(depsOf(captured).workflow).toEqual({ subagentsEnabled: false, maxParallel: 4 });
+    // 7 ∈ 1-8：原样保留（不再是旧的「>4 → 4」夹紧口径）
+    expect(depsOf(captured).workflow).toEqual({ subagentsEnabled: false, maxParallel: 7 });
     expect(depsOf(captured).skillsRecord).toEqual({ tdd: false });
     expect(depsOf(captured).mcpServers).toEqual([
       { name: 'fs', command: 'npx', args: ['-y', '@x/fs'], enabled: false },
     ]);
 
-    saveConfig(configPath, { workflow: { subagentsEnabled: true, maxParallel: 0 } });
+    saveConfig(configPath, { workflow: { subagentsEnabled: true, maxParallel: 9 } });
     const second: Captured = { deps: undefined, events: [], onSignal: undefined };
     await runWeb(['--no-open'], makeIo(configPath, second));
-    expect(depsOf(second).workflow).toEqual({ subagentsEnabled: true, maxParallel: 1 });
+    expect(depsOf(second).workflow).toEqual({ subagentsEnabled: true, maxParallel: 8 });
+
+    saveConfig(configPath, { workflow: { subagentsEnabled: true, maxParallel: -1 } });
+    const third: Captured = { deps: undefined, events: [], onSignal: undefined };
+    await runWeb(['--no-open'], makeIo(configPath, third));
+    expect(depsOf(third).workflow).toEqual({ subagentsEnabled: true, maxParallel: 0 });
+
+    saveConfig(configPath, { workflow: { subagentsEnabled: false, maxParallel: 0 } });
+    const fourth: Captured = { deps: undefined, events: [], onSignal: undefined };
+    await runWeb(['--no-open'], makeIo(configPath, fourth));
+    expect(depsOf(fourth).workflow).toEqual({ subagentsEnabled: false, maxParallel: 0 });
   });
 });
 
@@ -292,12 +303,13 @@ describe('runWeb attach 模式：损坏 JSON / 非对象 deps', () => {
   });
 });
 
-describe('clampMaxParallel：初值夹紧 1-4（纯函数）', () => {
-  it('undefined → 2；0 → 1；7 → 4；2.5 → 2；负值 → 1', () => {
+describe('clampMaxParallel：初值夹紧 0-8（纯函数；subagent 无上限语义）', () => {
+  it('undefined → 2；0 → 0（无上限）；7 → 7；2.5 → 2；负 → 0；9 → 8', () => {
     expect(clampMaxParallel(undefined)).toBe(2);
-    expect(clampMaxParallel(0)).toBe(1);
-    expect(clampMaxParallel(7)).toBe(4);
+    expect(clampMaxParallel(0)).toBe(0);
+    expect(clampMaxParallel(7)).toBe(7);
     expect(clampMaxParallel(2.5)).toBe(2);
-    expect(clampMaxParallel(-3)).toBe(1);
+    expect(clampMaxParallel(-3)).toBe(0);
+    expect(clampMaxParallel(9)).toBe(8);
   });
 });

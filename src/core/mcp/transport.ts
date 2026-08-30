@@ -14,8 +14,10 @@
  *     transport-error  spawn 失败/进程退出/管道写失败/已关闭（传输死亡）
  *     protocol-error   收到非 JSON 行/非对象消息（传输死亡）
  *     unknown-tool     由 client 层按应答 error 内容判型（见 client.ts）
- * - close()：SIGTERM 优雅 + DEFAULT_KILL_GRACE_MS（2s）后 SIGKILL 兜底；stdin end
- *   （EOF 信号）一并发出；幂等（并发/重复 close 共享同一次等待）。pending 全部拒绝。
+ * - close()：**进程组** SIGTERM 优雅（POSIX detached：kill(-pid) 覆盖 npm→sh→node 整树——
+ *   VT-2 修复，避免中介进程先死、服务器成为孤儿）+ DEFAULT_KILL_GRACE_MS（2s）后组
+ *   SIGKILL 兜底；stdin end（EOF 信号）一并发出；幂等（并发/重复 close 共享同一次等待）。
+ *   pending 全部拒绝。
  *
  * 握手（initialize + notifications/initialized）在 client.ts 的 connectMcpServer：
  * 本层提供 request(id 路由)/notify 原语，协议编排（版本协商）归 client。
@@ -104,6 +106,11 @@ export class McpJsonRpcTransport {
     this.child = spawn(options.command, options.args ?? [], {
       stdio: ['pipe', 'pipe', 'pipe'],
       env: buildMcpEnv(options.env),
+      // VT-2 修复 b：POSIX 上独立进程组（detached）——close() 按【组】终止
+      // （kill(-pid) 命中 npm→sh→node 整棵树；只杀直接子进程会让中介（npm/sh）先死、
+      // 真正的服务器（node）成为孤儿常驻——实测 mcp-remote 组常驻 11h+）。
+      // Windows 无进程组语义：仍按直接子进程止（平台能力边界）。
+      ...(process.platform !== 'win32' ? { detached: true } : {}),
     });
     this.child.stdout?.on('data', (chunk: Buffer) => this.feed(chunk));
     // stderr 排空（MCP 服务器日志走 stderr；不消费会背压堵死服务器）
@@ -228,21 +235,36 @@ export class McpJsonRpcTransport {
     }
     if (this.spawnFail) return; // spawn 失败：无子进程可收
     if (this.exit === null) {
-      try {
-        this.child.kill('SIGTERM');
-      } catch {
-        // 可能已 PID 重置/不存在：兜底 SIGKILL 再试
-      }
+      // VT-2 修复 b：组信号优先（npm→sh→node 整棵进程树）；组杀失败（已退出/回收/
+      // Windows）回退直接子进程信号。
+      if (!this.signalGroup('SIGTERM')) this.signalChild('SIGTERM');
       if (this.exit === null && !(await waitExit(this.child, DEFAULT_KILL_GRACE_MS))) {
-        try {
-          this.child.kill('SIGKILL');
-        } catch {
-          // 已不存在
-        }
+        if (!this.signalGroup('SIGKILL')) this.signalChild('SIGKILL');
         await waitExit(this.child, 1000);
       }
     }
     this.die(new McpError('transport-error', 'transport closed'));
+  }
+
+  /** 进程组信号（POSIX detached 子进程组：kill(-pid, signal)）；不适用/失败 → false。 */
+  private signalGroup(signal: 'SIGTERM' | 'SIGKILL'): boolean {
+    const pid = this.child.pid;
+    if (pid === undefined || process.platform === 'win32') return false;
+    try {
+      process.kill(-pid, signal);
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
+  /** 直接子进程信号兜底（组杀失败/Windows）；失败静默（可能已不存在）。 */
+  private signalChild(signal: 'SIGTERM' | 'SIGKILL'): void {
+    try {
+      this.child.kill(signal);
+    } catch {
+      // 可能已 PID 重置/不存在：SIGKILL 再试已由调用方保证
+    }
   }
 
   /** 行定界解析：\n 定界 + \r 剥除（CRLF 容忍）；空行忽略；非 JSON → protocol-error。 */

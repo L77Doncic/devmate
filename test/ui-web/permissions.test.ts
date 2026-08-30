@@ -57,21 +57,23 @@ describe('档位标签/描述/glyph（展示单一来源；非法值回缺省）
     expect(permissionDescription('bogus')).toBe(PERMISSION_DESCRIPTIONS['workspace-write']);
   });
 
-  it('描述覆盖三档守卫语义（full-access 含「不再问询/删除/破坏性」字样）', () => {
+  it('描述覆盖三档矩阵契约（workspace-write 含风险声明；full-access 含「不再问询/删除」）', () => {
     expect(PERMISSION_DESCRIPTIONS['read-only']).toContain('只读');
-    expect(PERMISSION_DESCRIPTIONS['workspace-write']).toContain('自动拒绝');
+    expect(PERMISSION_DESCRIPTIONS['read-only']).toContain('逐项确认');
+    expect(PERMISSION_DESCRIPTIONS['workspace-write']).toContain('信任的工作区内使用');
+    expect(PERMISSION_DESCRIPTIONS['workspace-write']).toContain('破坏性命令');
     expect(PERMISSION_DESCRIPTIONS['full-access']).toContain('不再问询');
     expect(PERMISSION_DESCRIPTIONS['full-access']).toContain('删除');
   });
 
-  it('glyph 种类：只读=check / 写=pencil / 全部访问=alert', () => {
+  it('glyph 种类：只读=check / 工作区写入=lock（锁形）/ 全部访问=alert', () => {
     expect(PERMISSION_GLYPHS).toEqual({
       'read-only': 'check',
-      'workspace-write': 'pencil',
+      'workspace-write': 'lock',
       'full-access': 'alert',
     });
     expect(permissionGlyph('full-access')).toBe('alert');
-    expect(permissionGlyph('nope')).toBe('pencil'); // 非法 → 缺省档（写）
+    expect(permissionGlyph('nope')).toBe('lock'); // 非法 → 缺省档（工作区写入）
   });
 });
 
@@ -118,6 +120,8 @@ describe('风险门计算（shouldConfirmRisk：切 full-access 且未确认 →
 describe('风险确认门文案（复用删除确认视觉；逐字断言防漂移）', () => {
   it('标题/正文与任务书语义一致', () => {
     expect(RISK_CONFIRM_TITLE).toBe('启用全部访问');
-    expect(RISK_CONFIRM_TEXT).toBe('全部访问：不再问询，命令直接执行（含删除/破坏性操作）。确认？');
+    expect(RISK_CONFIRM_TEXT).toBe(
+      '全部放行：任何命令直接执行（含删除/破坏性操作），不再问询。确认？',
+    );
   });
 });

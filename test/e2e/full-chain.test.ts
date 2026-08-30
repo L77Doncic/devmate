@@ -1,6 +1,11 @@
 /**
  * # test/e2e/full-chain：真实链路 mock-LLM 端到端（零密钥、零外部网络）
  *
+ * E2E-H（附件管线，ADR-0015 服务端附件）：真实 assembleDeps 附件注入（AttachmentStore
+ *  on <sessionsDir>/attachments）→ POST /api/attachments（dataURL→sha256 ref）→
+ * /api/chat refs → FakeLlm 收展开 dataURL（vision 模型名放行 wire）→ 会话 .jsonl
+ * grep 无 dataURL 大串（slim 铁证）→ DELETE 联动（附件文件删除）。
+ *
  * 全链定义：真实 assembleDeps 装配（真 jail + 真 JsonlFileAdapter on tmp 目录 +
  * 真工具面 fs 六件 + run_command 常驻 shell + use_skill + spawn_subagent）+ 真服务
  * listen(0) + 全局 fetch（与浏览器同款：上行 POST JSON / 下行 SSE 帧）。
@@ -17,10 +22,12 @@
  *    GET /api/sessions/:id（回放与在线 done 帧逐字一致）→ GET /api/stats（sessions=1、
  *    rssMb/heapMb/memoryGuard 等内存字段在）。
  * B  工具+审批全链（B1 通过 / B2 带理由拒绝）：真实工具面 run_command（echo 类，
- *    本地 spawn）× 服务端审批簿：approval-request 到达后服务端悬停不推进（next 超时
- *    无帧）→ POST /api/approval approve → tool-result(ok:true, 真实 [out] echo) 前无
- *    更多 approval-request → 第二轮 → completed；deny+reason → tool-result ok:false
- *    + error=拒因（user-denied）→ 模型继续 → completed。
+ *    本地 spawn）× 服务端审批簿（审批面只在 read-only 档保留——默认档零弹窗；B 组演示
+ *    审批链本身：assembleDeps 播种 read-only）：approval-request 到达后服务端悬停不
+ *    推进（next 超时无帧）→ POST /api/approval approve → tool-result(ok:true, 真实
+ *    [out] echo) 前无更多 approval-request → 第二轮 → completed；deny+reason →
+ *    tool-result ok:false + error=拒因（user-denied）→ 模型继续 → completed。
+ *    默认档零弹窗的直接执行断言见 test/ui-server/permission.test.ts（m2/m7）。
  * C  subagent 与技能：GET /api/tools 工具面含 use_skill/spawn_subagent（无 mcp 前缀）；
  *    use_skill 经真实 SKILL.md 资产加载全文（tool-result ok:true 含正文）；
  *    spawn_subagent 经注入假池回注报告（pool.spawned 收证）；技能开关
@@ -36,7 +43,7 @@
  * server 实例（beforeEach 起 / afterEach close + tmp 清理），无 sleep 等待（帧驱动）。
  */
 import { existsSync } from 'node:fs';
-import { mkdtemp, rm, writeFile, mkdir } from 'node:fs/promises';
+import { mkdtemp, rm, writeFile, mkdir, readFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
@@ -243,7 +250,9 @@ describe('E2E-B：工具+审批全链（真实 run_command echo）', () => {
       sessionsDir: join(dir, 'sessions'),
       model: 'deepseek-v4-flash',
       // B 组聚焦审批链：关掉评审哨兵（run_command 属实质变更；哨兵路径由
-      // e2e/s2-methodology 的 assembleDeps 同链抽样覆盖）
+      // e2e/s2-methodology 的 assembleDeps 同链抽样覆盖）。
+      // 播种 read-only：审批面只在 read-only 档保留（默认档零弹窗——审批往返无挂点）
+      permission: 'read-only',
       reviewMode: false,
     });
     deps.llm = fake;
@@ -426,14 +435,16 @@ describe('E2E-C：subagent 与技能（假池经 createSessionToolsFactory 注�
   let deps: DevmateServerDeps;
   let handle: TestServerHandle | null = null;
   let fake: FakeLlm;
-  let pool: SubagentPool & { spawned: string[] };
+  let pool: SubagentPool & { spawned: string[]; tasks: SubagentTask[] };
   const clients: SseClient[] = [];
 
-  /** 假池：记录 spawn 请求；关闭档立即返回 subagents-disabled（与真池契约同形状）。 */
+  /** 假池：记录 spawn 请求（prompt 与完整任务；skill 注入抽样用后者）；关闭档立即返回
+   * subagents-disabled（与真池契约同形状）。 */
   function makeFakePool(config: { get: (() => WorkflowConfig) | null }): SubagentPool & {
     spawned: string[];
+    tasks: SubagentTask[];
   } {
-    const spawned: string[] = [];
+    const tasks: SubagentTask[] = [];
     let completed = 0;
     const disabled = (): SubagentResult => ({
       ok: false,
@@ -447,12 +458,16 @@ describe('E2E-C：subagent 与技能（假池经 createSessionToolsFactory 注�
       error: 'subagents-disabled',
     });
     return {
-      spawned,
+      // 单源：spawned 由 tasks 派生（无重复记账——两断言面同源）
+      get spawned(): string[] {
+        return tasks.map((t) => t.prompt);
+      },
+      tasks,
       async spawn(task: SubagentTask): Promise<SubagentResult> {
         if (config.get !== null && config.get().subagentsEnabled === false) {
           return disabled(); // 绝不触网：关闭即拒绝（真池同语义）
         }
-        spawned.push(task.prompt);
+        tasks.push(task);
         completed += 1;
         return {
           ok: true,
@@ -542,7 +557,11 @@ describe('E2E-C：subagent 与技能（假池经 createSessionToolsFactory 注�
         content: '并行要工具',
         toolCalls: [
           { id: 'call-skill-1', name: 'use_skill', arguments: '{"skill":"alpha"}' },
-          { id: 'call-sub-1', name: 'spawn_subagent', arguments: '{"prompt":"独立子任务A"}' },
+          {
+            id: 'call-sub-1',
+            name: 'spawn_subagent',
+            arguments: '{"prompt":"独立子任务A","skill":"alpha"}',
+          },
         ],
       },
       { content: '任务完成' },
@@ -609,6 +628,14 @@ describe('E2E-C：subagent 与技能（假池经 createSessionToolsFactory 注�
     expect(sub).toMatchObject({ name: 'spawn_subagent', ok: true });
     expect(sub.content).toBe('SUBAGENT-REPORT:独立子任务A');
     expect(pool.spawned).toEqual(['独立子任务A']); // 池收证（假池零网络）
+    // skill 注入抽样（全链：真技能索引 → 工具 skillContent 解析 → 池任务形状；
+    // 服务端索引对 alpha 的 content 与 use_skill 同源——见上方 skill.content 断言）
+    expect(pool.tasks[0]).toEqual({
+      prompt: '独立子任务A',
+      skillId: 'alpha',
+      skillContent:
+        '---\nname: Alpha asset\ndescription: An alpha asset for tests.\n---\nALPHA BODY\nline2',
+    });
   });
 
   it('C2) 技能开关 false → use_skill skill-disabled 回注（事件流 tool-result ok:false）；workflow 关闭 → spawn 即拒', async () => {
@@ -703,6 +730,8 @@ describe('E2E-D：全程无泄漏（api key 掩码 · 内存统计字段）', ()
       model: 'deepseek-v4-flash',
       // 初始密钥：仅进程内持有；GET /api/settings 只回掩码
       apiKey: 'sk-0123456789abcdef',
+      // 三源取窗网关探测：关闭（本用例锁「零外部网络面」——探测也不放行）
+      windowDiscovery: false,
       // 空 MCP 配置：无服务器 → 无任何 launcher 连接（零外部网络面）
       mcpServers: [],
     });
@@ -852,11 +881,154 @@ describe('E2E-F：CLI web 设置读回（permission/reasoning/windowTokens）', 
       expect(settings2).toMatchObject({
         reasoning: 'medium',
         permission: 'workspace-write',
-        window: 64_000, // deepseek preset contextWindowTokens 估算（settings 未覆盖）
+        window: 128_000, // deepseek preset contextWindowTokens 估算（settings 未覆盖）
       });
       await second.close();
     } finally {
       await rm(dir, { recursive: true, force: true });
     }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// E2E-G：模型名尾标注全链（B 档取样）——发送净化保留（窗口标注层已取消）
+// ---------------------------------------------------------------------------
+
+describe('E2E-G：模型名尾标注（发送净化；窗口标注层已取消——2026-08-30 用户裁定），assembleDeps + FakeLlm', () => {
+  let dir: string;
+  let deps: DevmateServerDeps;
+  let handle: TestServerHandle | null = null;
+  let fake: FakeLlm;
+
+  beforeEach(async () => {
+    dir = await mkdtemp(join(tmpdir(), 'devmate-e2e-g-'));
+    fake = new FakeLlm([{ content: 'ok', usage: { promptTokens: 2, completionTokens: 1, totalTokens: 3 } }]);
+    deps = await assembleDeps({
+      workspaceRoot: dir,
+      sessionsDir: join(dir, 'sessions'),
+      // B 档：模型名带尾标注 —— 发送值时净化（无 apiKey → 无网关探测；窗口 = preset 128000）
+      model: 'deepseek-v4-flash[128k]',
+    });
+    deps.llm = fake;
+    deps.createLlm = () => fake;
+    handle = await startServer(deps);
+  });
+
+  afterEach(async () => {
+    await handle?.server.close();
+    await rm(dir, { recursive: true, force: true });
+  });
+
+  it('G1) GET /api/settings window=128000（preset 兜底）；chat 全链完成（净化仅发送值，引擎侧模型名原样）', async () => {
+    const base = handle!.base;
+    // 取窗：无显式覆盖 / 无网关探测（未注入 apiKey）→ preset 128000 兜底
+    const settings = (await (await fetch(new URL('/api/settings', base))).json()) as {
+      window?: number;
+    };
+    expect(settings.window).toBe(128_000);
+
+    // 全链：POST /api/chat → run 完成（FakeLlm 收到引擎侧模型名 = 配置原样 [128k]；
+    // 净化发生在 adapter 发送值层 —— provider-adapter.test / client.test 已对 wire 断言）
+    const res = await postJson(base, '/api/chat', { text: '抽样' });
+    expect(res.status).toBe(200);
+    const { sessionId } = (await res.json()) as { sessionId: string };
+    const client = await SseClient.connect(base, sessionId);
+    await waitForFrames(client, 5, 10_000);
+    expect(client.frames.map((f) => f.event)).toEqual([
+      'session-user',
+      'assistant-delta',
+      'assistant-done',
+      'usage',
+      'run-status',
+    ]);
+    expect(fake.requests[0]?.model).toBe('deepseek-v4-flash[128k]');
+    expect(client.frames[4]!.data).toMatchObject({ status: 'completed' });
+  });
+});
+
+// ---------------------------------------------------------------------------
+// E2E-H：附件管线全链（服务端附件存储：上传 refs → wire 展开 → jsonl slim → 删除联动）
+// ---------------------------------------------------------------------------
+
+describe('E2E-H：附件管线全链（assembleDeps + AttachmentStore + FakeLlm vision 模型）', () => {
+  let dir: string;
+  let sessionsDir: string;
+  let deps: DevmateServerDeps;
+  let handle: TestServerHandle | null = null;
+  let fake: FakeLlm;
+
+  const PNG_B64 =
+    'iVBORw0KGgoAAAANSUhEUgAAAAgAAAAICAYAAADED76LAAAALElEQVR4nGP4L6fxHx9m+A8CBBXgUYRQgEMRqgIsijAVoCnCrgBJEW4FUEUAbLnBIWag8SAAAAAASUVORK5CYII=';
+  const PNG_SHA = 'f0ffe716e4705c9f50a94c4a1c2ee180af2ad6261cd4e727f1a106787ba60d13';
+  const PNG_REF = `sha256/${PNG_SHA}.png`;
+  const PNG_DATAURL = `data:image/png;base64,${PNG_B64}`;
+
+  beforeEach(async () => {
+    dir = await mkdtemp(join(tmpdir(), 'devmate-e2e-h-'));
+    sessionsDir = join(dir, 'sessions');
+    fake = new FakeLlm([
+      { content: '图中的三角形', usage: { promptTokens: 9, completionTokens: 3, totalTokens: 12 } },
+    ]);
+    deps = await assembleDeps({
+      workspaceRoot: dir,
+      sessionsDir,
+      // vision 模型名：适配层放行图片（wire 展开面；非 vision 模型走 provider-adapter 降级测试）
+      model: 'deepseek-v4-flash-vision-exp',
+    });
+    deps.llm = fake;
+    deps.createLlm = () => fake;
+    handle = await startServer(deps);
+  });
+
+  afterEach(async () => {
+    await handle?.server.close();
+    await rm(dir, { recursive: true, force: true });
+  });
+
+  it('H1) upload→chat refs→FakeLlm 收 dataURL→jsonl 无 dataURL 大串→DELETE 删除附件文件', async () => {
+    const base = handle!.base;
+    // ① 上传（真实 attachments 目录 <sessionsDir>/attachments）
+    const up = await postJson(base, '/api/attachments', {
+      sessionId: 's-attach-e2e',
+      dataUrl: PNG_DATAURL,
+      width: 8,
+      height: 8,
+    });
+    expect(up.status).toBe(200);
+    expect(((await up.json()) as { ref: string }).ref).toBe(PNG_REF);
+    expect(existsSync(join(sessionsDir, 'attachments', `${PNG_SHA}.png`))).toBe(true);
+
+    // ② 聊天（refs 上行）
+    const res = await postJson(base, '/api/chat', {
+      sessionId: 's-attach-e2e',
+      text: '描述图片',
+      images: [{ ref: PNG_REF, width: 8, height: 8 }],
+    });
+    expect(res.status).toBe(200);
+    const client = await SseClient.connect(base, 's-attach-e2e');
+    await waitForFrames(client, 5, 10_000);
+    // 回显帧 slim（refs，无 dataURL）
+    expect((client.frames[0]!.data as { images: unknown[] }).images).toEqual([
+      { ref: PNG_REF, width: 8, height: 8 },
+    ]);
+    // ③ FakeLlm 收展开 dataURL（真实 resolver 读文件 + wire 放行）
+    expect(fake.requests).toHaveLength(1);
+    const firstUser = fake.requests[0]!.messages.find((m) => m.role === 'user');
+    expect(
+      (firstUser as unknown as { content: Array<Record<string, unknown>> }).content,
+    ).toEqual([
+      { type: 'text', text: '描述图片' },
+      { type: 'image_url', image_url: { url: PNG_DATAURL }, width: 8, height: 8 },
+    ]);
+    // ④ 会话文件 slim：grep 无 dataURL 大串（铁证：图片字节不进会话文件）
+    const jsonl = await readFile(join(sessionsDir, 's-attach-e2e.jsonl'), 'utf8');
+    expect(jsonl).toContain('sha256/');
+    expect(jsonl).not.toContain('data:image');
+    expect(jsonl).not.toContain(PNG_B64);
+
+    // ⑤ DELETE 联动：附件文件被引用扫描删除
+    const del = await fetch(new URL('/api/sessions/s-attach-e2e', base), { method: 'DELETE' });
+    expect(del.status).toBe(200);
+    expect(existsSync(join(sessionsDir, 'attachments', `${PNG_SHA}.png`))).toBe(false);
   });
 });

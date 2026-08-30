@@ -9,6 +9,7 @@ import {
   getProviderPreset,
   normalizeFinishReason,
   normalizeError,
+  sanitizeProviderModel,
 } from '../../src/core/llm/index.js';
 import type { ChatRequest, WireRequest } from '../../src/core/llm/index.js';
 
@@ -778,11 +779,201 @@ describe('buildRequest：reasoningEffort 映射（C 档切片）', () => {
 });
 
 describe('presets：contextWindowTokens（估算，可在设置覆盖）', () => {
-  it('五家预设窗口值：deepseek 64000；qwen/glm/kimi/openai 128000', () => {
-    expect(PROVIDER_PRESETS.deepseek.contextWindowTokens).toBe(64000);
+  it('五家预设窗口值：deepseek 128000（V3.x 代际公开 128K）；qwen/glm/kimi/openai 128000', () => {
+    expect(PROVIDER_PRESETS.deepseek.contextWindowTokens).toBe(128000);
     expect(PROVIDER_PRESETS.dashscope.contextWindowTokens).toBe(128000);
     expect(PROVIDER_PRESETS.glm.contextWindowTokens).toBe(128000);
     expect(PROVIDER_PRESETS.kimi.contextWindowTokens).toBe(128000);
     expect(PROVIDER_PRESETS.openai.contextWindowTokens).toBe(128000);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// B 档：模型名发送净化（sanitizeProviderModel）——窗口标注解析层已取消
+// （2026-08-30 用户裁定；仅保留净化测试，解析用例删除）
+// ---------------------------------------------------------------------------
+
+describe('B 档：sanitizeProviderModel（尾标注剥离，其余逐字）', () => {
+  it('尾部 `[1m]` 剥离：my/model[1m] → my/model；DeepSeek 直发 deepseek-v4-flash[1m] → deepseek-v4-flash', () => {
+    expect(sanitizeProviderModel('my/model[1m]')).toBe('my/model');
+    expect(sanitizeProviderModel('deepseek-v4-flash[1m]')).toBe('deepseek-v4-flash');
+  });
+
+  it('无后缀原样（逐字）：deepseek-v4-flash / my-model-v2 / 逗号+花括号等边界不动', () => {
+    expect(sanitizeProviderModel('deepseek-v4-flash')).toBe('deepseek-v4-flash');
+    expect(sanitizeProviderModel('my-model-v2')).toBe('my-model-v2');
+    expect(sanitizeProviderModel('')).toBe('');
+  });
+
+  it('参数化：数值/小数/k 单位/大小写宽容', () => {
+    expect(sanitizeProviderModel('my/model[2m]')).toBe('my/model');
+    expect(sanitizeProviderModel('my/model[1.5m]')).toBe('my/model');
+    expect(sanitizeProviderModel('my/model[128k]')).toBe('my/model');
+    expect(sanitizeProviderModel('my/model[64K]')).toBe('my/model');
+  });
+
+  it('多后缀尾：my/model[1m][2m] → my/model；`[m]` 留在中间不动', () => {
+    expect(sanitizeProviderModel('my/model[1m][2m]')).toBe('my/model');
+    expect(sanitizeProviderModel('my[m]model')).toBe('my[m]model');
+    expect(sanitizeProviderModel('my/model[1m]x')).toBe('my/model[1m]x'); // 不在尾部 → 不剥
+    expect(sanitizeProviderModel('my/model-1m')).toBe('my/model-1m'); // 无括号 → 不属标注
+  });
+
+  it('buildRequest 应用：发送值净化（wire body.model 无尾标；baseUrl/messages 不变）', () => {
+    const req = buildRequest(
+      unified({ model: 'deepseek-v4-flash[1m]' }),
+      PROVIDER_PRESETS.deepseek,
+    );
+    expect(req.body.model).toBe('deepseek-v4-flash');
+    expect(req.baseUrl).toBe('https://api.deepseek.com');
+    expect(req.body.messages).toEqual([{ role: 'system', content: 'sys' }]);
+    // 净化只作用于发送值：unified 入参不被改造（纯变换契约）
+    const src: ChatRequest = unified({ model: 'deepseek-v4-flash[1m]' });
+    buildRequest(src, PROVIDER_PRESETS.deepseek);
+    expect(src.model).toBe('deepseek-v4-flash[1m]');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// 多模态（ADR-0015）：图像块 wire 序列化 + 非 vision 降级（纯函数，见 deepseek-vision.md §1/§4/§7）
+// ---------------------------------------------------------------------------
+
+const IMAGE_URL = 'data:image/png;base64,iVBORw0KGgo=';
+
+describe('多模态（ADR-0015）：图像块序列化与降级', () => {
+  it('vision 放行（deepseek preset.vision=true ∧ 模型名含 vision）：content 块数组逐字序列化（text + image_url 同官方形状）', () => {
+    const req = buildRequest(
+      unified({
+        model: 'deepseek-v4-flash-vision-exp',
+        messages: [
+          {
+            role: 'user',
+            content: [
+              { type: 'text', text: '描述这张图' },
+              { type: 'image_url', image_url: { url: IMAGE_URL }, width: 800, height: 600 },
+            ],
+          },
+        ],
+      }),
+      PROVIDER_PRESETS.deepseek,
+    );
+    const wire = (req.body.messages as Array<Record<string, unknown>>)[0] as {
+      content: unknown[];
+    };
+    expect(wire.content).toEqual([
+      { type: 'text', text: '描述这张图' },
+      // width/height 只在部分级供估算——wire 只序列化 image_url（官方形状逐字）
+      { type: 'image_url', image_url: { url: IMAGE_URL } },
+    ]);
+    expect(req.meta).toBeUndefined(); // 无剔除/降级 → 不带 meta
+  });
+
+  it('纯文本+图片且文本为空：只发 image_url 块（无空 text 块）', () => {
+    const req = buildRequest(
+      unified({
+        model: 'deepseek-v4-flash-vision-exp',
+        messages: [
+          { role: 'user', content: [{ type: 'image_url', image_url: { url: IMAGE_URL } }] },
+        ],
+      }),
+      PROVIDER_PRESETS.deepseek,
+    );
+    const wire = (req.body.messages as Array<Record<string, unknown>>)[0] as {
+      content: unknown[];
+    };
+    expect(wire.content).toEqual([{ type: 'image_url', image_url: { url: IMAGE_URL } }]);
+  });
+
+  it('非 vision 模型（deepseek-v4-flash 不含 vision）：图像降级为纯文本 + 系统说明（meta.degradedImages=2）——绝不 400', () => {
+    const req = buildRequest(
+      unified({
+        model: 'deepseek-v4-flash', // 文本模型（官方会 400——本地预案先降级）
+        messages: [
+          {
+            role: 'user',
+            content: [
+              { type: 'text', text: '看这两张图' },
+              { type: 'image_url', image_url: { url: IMAGE_URL } },
+              { type: 'image_url', image_url: { url: IMAGE_URL } },
+            ],
+          },
+        ],
+      }),
+      PROVIDER_PRESETS.deepseek,
+    );
+    const wire = (req.body.messages as Array<Record<string, unknown>>)[0] as {
+      content: string;
+    };
+    expect(typeof wire.content).toBe('string');
+    expect(wire.content).toContain('看这两张图');
+    expect(wire.content).toContain('图像未能处理');
+    expect(wire.content).toContain('2 张图');
+    expect(req.meta).toEqual({ degradedImages: 2 });
+  });
+
+  it('用户消息纯字符串 + vision 模型：按字符串直透（旧请求形态不变）', () => {
+    const req = buildRequest(
+      unified({
+        model: 'deepseek-v4-flash-vision-exp',
+        messages: [{ role: 'user', content: '纯文本消息' }],
+      }),
+      PROVIDER_PRESETS.deepseek,
+    );
+    const wire = (req.body.messages as Array<Record<string, unknown>>)[0] as {
+      content: string;
+    };
+    expect(wire.content).toBe('纯文本消息');
+  });
+
+  it('非 deepseek 供应商（vision 未标记）：带图消息同样降级（不发送图片块）', () => {
+    const req = buildRequest(
+      unified({
+        messages: [
+          { role: 'user', content: [{ type: 'image_url', image_url: { url: IMAGE_URL } }] },
+        ],
+      }),
+      PROVIDER_PRESETS.kimi,
+    );
+    const wire = (req.body.messages as Array<Record<string, unknown>>)[0] as {
+      content: string;
+    };
+    expect(typeof wire.content).toBe('string');
+    expect(req.meta).toEqual({ degradedImages: 1 });
+  });
+});
+
+// ---------------------------------------------------------------------------
+// A 档：maxInputTokens 白名单（deepseek-vision.md §8：仅 DashScope 发送，其余剔除并记 meta）
+// ---------------------------------------------------------------------------
+
+describe('A 档：maxInputTokens（白名单发送）', () => {
+  it('dashscope（maxInputTokensField）：extra_body.max_input_tokens = 请求值；body 无该字段', () => {
+    const req = buildRequest(unified({ maxInputTokens: 16_384 }), PROVIDER_PRESETS.dashscope);
+    expect((req.body as Record<string, unknown>).max_input_tokens).toBeUndefined();
+    expect(req.extraBody).toEqual({ max_input_tokens: 16_384 });
+    expect(req.meta).toBeUndefined();
+  });
+
+  it('deepseek（无 maxInputTokensField）：剔除 + meta.strippedParams 记录（绝不发送未核实字段）', () => {
+    const req = buildRequest(unified({ maxInputTokens: 16_384 }), PROVIDER_PRESETS.deepseek);
+    expect((req.body as Record<string, unknown>).max_input_tokens).toBeUndefined();
+    expect(req.extraBody).toBeUndefined();
+    expect(req.meta).toEqual({ strippedParams: ['max_input_tokens'] });
+  });
+
+  it('未提供 maxInputTokens：不产生任何字段/meta（缺省路径零扰动）', () => {
+    const req = buildRequest(unified(), PROVIDER_PRESETS.dashscope);
+    expect(req.extraBody).toBeUndefined();
+    expect(req.meta).toBeUndefined();
+  });
+
+  it('maxInputTokens 与 Qwen preset 默认（enable_thinking 等）共存：extra_body 合并', () => {
+    // dashscope preset 未设 thinkingBudget（缺省覆盖 undefined）——只验证与既有字段共存不互斥
+    const req = buildRequest(
+      unified({ maxInputTokens: 8_000, reasoningEffort: 'high' }),
+      PROVIDER_PRESETS.dashscope,
+    );
+    expect(req.extraBody).toEqual({ max_input_tokens: 8_000 });
+    expect((req.body as Record<string, unknown>).thinking).toBeUndefined();
   });
 });

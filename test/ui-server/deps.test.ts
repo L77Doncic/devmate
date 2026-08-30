@@ -41,6 +41,8 @@ describe('ui/server/deps：assembleDeps 一次组装', () => {
       maxSteps: 50,
       windowTokens: 128_000,
       systemPrompt: 'rules…',
+      // 三源取窗网关探测的开关接缝：本用例只锁装配形状——关闭后台探测（零真实网络）
+      windowDiscovery: false,
     });
     expect(deps.store).toBeInstanceOf(JsonlFileAdapter);
     expect(deps.tools!.list().map((d) => d.name)).toEqual(
@@ -88,6 +90,8 @@ describe('ui/server/deps：assembleDeps 一次组装', () => {
       sessionsDir: join(dir, 'sessions'),
       model: 'deepseek-v4-flash',
       apiKey: 'sk-0123456789abcdef',
+      // 三源取窗网关探测：关闭（本用例锁「全程零真实网络」——探测也不放行）
+      windowDiscovery: false,
     });
     const server = createDevmateServer(deps);
     servers.push(server);

@@ -167,4 +167,106 @@ describe('tools/subagent：spawn_subagent', () => {
     expect(r.error?.type).toBe('subagent-error');
     expect(r.error?.message).toContain('pool exploded');
   });
+
+  it('schema：新增可选 skill（字符串；required 仍只 prompt）；skill 给出 → 池任务带 skillId+skillContent', async () => {
+    const { pool, spawned } = fakePool({
+      ok: true,
+      report: 'ok',
+      promptTokens: 0,
+      completionTokens: 0,
+      totalTokens: 0,
+      costUsd: 0,
+      estimated: false,
+      durationMs: 0,
+    });
+    const tool = createSubagentTool({
+      pool,
+      skillContent: async (id) => (id === 'code-review' ? '审查双轴方法论' : null),
+    });
+
+    expect(tool.parameters?.properties?.skill).toMatchObject({ type: 'string' });
+    expect(tool.parameters?.required).toEqual(['prompt']);
+
+    const r = await tool.execute(
+      {
+        id: 'c1',
+        name: 'spawn_subagent',
+        arguments: JSON.stringify({ prompt: 'p', skill: 'code-review' }),
+      },
+      { sessionId: 's1' },
+    );
+    expect(r.ok).toBe(true);
+    expect(spawned).toHaveLength(1);
+    expect(spawned[0]).toEqual({
+      prompt: 'p',
+      skillId: 'code-review',
+      skillContent: '审查双轴方法论',
+    });
+  });
+
+  it('skill 未知 / 索引未回填（解析器 null）/ 解析器抛错 → 跳过注入不硬失败；无 skill 参数 → task 只 {prompt}', async () => {
+    const ok = {
+      ok: true,
+      report: 'ok',
+      promptTokens: 0,
+      completionTokens: 0,
+      totalTokens: 0,
+      costUsd: 0,
+      estimated: false,
+      durationMs: 0,
+    };
+    const { pool: poolA, spawned: a } = fakePool(ok);
+    const toolA = createSubagentTool({ pool: poolA, skillContent: async () => null });
+    await toolA.execute(
+      {
+        id: 'c1',
+        name: 'spawn_subagent',
+        arguments: JSON.stringify({ prompt: 'p', skill: 'ghost' }),
+      },
+      { sessionId: 's1' },
+    );
+    expect(a[0]).toEqual({ prompt: 'p', skillId: 'ghost' }); // skillId 记录，内容跳过
+
+    const { pool: poolB, spawned: b } = fakePool(ok);
+    const toolB = createSubagentTool({ pool: poolB }); // 未接线解析器
+    await toolB.execute(
+      {
+        id: 'c2',
+        name: 'spawn_subagent',
+        arguments: JSON.stringify({ prompt: 'p', skill: 'code-review' }),
+      },
+      { sessionId: 's1' },
+    );
+    expect(b[0]).toEqual({ prompt: 'p', skillId: 'code-review' });
+    expect(b[0]?.skillContent).toBeUndefined();
+
+    const { pool: poolC, spawned: c } = fakePool(ok);
+    const toolC = createSubagentTool({
+      pool: poolC,
+      skillContent: async () => {
+        throw new Error('index fault');
+      },
+    });
+    const rc = await toolC.execute(
+      {
+        id: 'c3',
+        name: 'spawn_subagent',
+        arguments: JSON.stringify({ prompt: 'p', skill: 'code-review' }),
+      },
+      { sessionId: 's1' },
+    );
+    // 解析器异常不硬失败：任务仍 spawn（内容跳过），结果普通成功
+    expect(rc.ok).toBe(true);
+    expect(c[0]).toEqual({ prompt: 'p', skillId: 'code-review' });
+    expect(c[0]?.skillContent).toBeUndefined();
+
+    // 无 skill 参数：任务形状仍只 {prompt}（不新增空字段）
+    const { pool: poolD, spawned: d } = fakePool(ok);
+    const toolD = createSubagentTool({ pool: poolD, skillContent: async () => 'x' });
+    await toolD.execute(
+      { id: 'c4', name: 'spawn_subagent', arguments: JSON.stringify({ prompt: 'p' }) },
+      { sessionId: 's1' },
+    );
+    expect(d[0]).toEqual({ prompt: 'p' });
+  });
 });

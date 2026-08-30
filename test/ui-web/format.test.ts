@@ -28,6 +28,12 @@ import {
   TOOL_STATE_LABEL,
   methodologyLine,
   methodologyBadgeText,
+  REVIEW_BLOCK_TITLE,
+  isReviewSubagent,
+  reviewBlockText,
+  TOAST_COPY_TITLE,
+  TOAST_COPIED_TEXT,
+  continueVisible,
 } from '../../src/ui/web/format.js';
 
 describe('truncate', () => {
@@ -233,6 +239,31 @@ describe('statusLabel / runStatusLine', () => {
       '已中断 · 2 步 · 1.5s',
     );
     expect(runStatusLine({})).toBe('');
+  });
+});
+
+describe('continueVisible（run-strip「继续」钮裁决——仅 user-interrupted 可续跑）', () => {
+  it('user-interrupted 终态 + 有会话 + 非运行 + 无错误 → 显示', () => {
+    expect(
+      continueVisible({ status: 'user-interrupted' }, { runActive: false, hasSession: true }),
+    ).toBe(true);
+  });
+  it('仅 user-interrupted 显示；completed/cost-guard/max-steps/wall-time 均不显示', () => {
+    for (const status of ['completed', 'cost-guard', 'max-steps', 'wall-time', 'fatal']) {
+      expect(continueVisible({ status }, { runActive: false, hasSession: true })).toBe(false);
+    }
+  });
+  it('无会话 / 运行中 / 有错误 → 隐藏', () => {
+    const base = { runActive: false, hasSession: true };
+    expect(continueVisible({ status: 'user-interrupted' }, { ...base, hasSession: false })).toBe(
+      false,
+    );
+    expect(continueVisible({ status: 'user-interrupted' }, { ...base, runActive: true })).toBe(
+      false,
+    );
+    expect(continueVisible({ status: 'user-interrupted' }, { ...base, lastError: 'boom' })).toBe(
+      false,
+    );
   });
 });
 
@@ -471,4 +502,106 @@ describe('methodologyBadgeText（方法线小牌文本「方法线 tdd」单一�
     expect(methodologyBadgeText('')).toBe('');
     expect(methodologyBadgeText(null)).toBe('');
   });
+});
+
+// ---------------------------------------------------------------------------
+// 审查块判定与两行摘要（B：spawn_subagent + arguments.prompt 含 审查|review）
+// ---------------------------------------------------------------------------
+
+describe('isReviewSubagent（判据 = arguments.prompt 含 审查|review）', () => {
+  const call = (name: string, argumentsJson: string) => ({ name, arguments: argumentsJson });
+
+  it('spawn_subagent + prompt 含中文「审查」→ true', () => {
+    const args = JSON.stringify({ prompt: '请用 subagent 独立审查以下文件（缺项清单）' });
+    expect(isReviewSubagent(call('spawn_subagent', args))).toBe(true);
+  });
+
+  it('prompt 含英文 review（大小写不敏感）→ true', () => {
+    expect(
+      isReviewSubagent(call('spawn_subagent', JSON.stringify({ prompt: 'Do a REVIEW of src/' }))),
+    ).toBe(true);
+    expect(
+      isReviewSubagent(call('spawn_subagent', JSON.stringify({ prompt: 'review this file' }))),
+    ).toBe(true);
+  });
+
+  it('非 spawn_subagent 工具名（即使 prompt 含审查）→ false', () => {
+    expect(isReviewSubagent(call('read_file', JSON.stringify({ prompt: '审查' })))).toBe(false);
+    expect(
+      isReviewSubagent({ name: undefined, arguments: JSON.stringify({ prompt: '审查' }) }),
+    ).toBe(false);
+  });
+
+  it('prompt 不带 审查/review（即使用户文本提到）→ false', () => {
+    expect(
+      isReviewSubagent(call('spawn_subagent', JSON.stringify({ prompt: '重构这段代码' }))),
+    ).toBe(false);
+  });
+
+  it('参数非 JSON / 无 prompt / 非对象 → false（防御不误判）', () => {
+    expect(isReviewSubagent(call('spawn_subagent', '{not json'))).toBe(false);
+    expect(isReviewSubagent(call('spawn_subagent', ''))).toBe(false);
+    expect(isReviewSubagent(call('spawn_subagent', '[]'))).toBe(false);
+    expect(isReviewSubagent(call('spawn_subagent', JSON.stringify({ title: '审查' })))).toBe(
+      false, // 判据只认 prompt（任务书）：title 含审查不触发
+    );
+    expect(isReviewSubagent(null)).toBe(false);
+    expect(isReviewSubagent(undefined)).toBe(false);
+    expect(isReviewSubagent('x')).toBe(false);
+  });
+});
+
+describe('reviewBlockText（副题 + 结论首行）', () => {
+  const call = { name: 'spawn_subagent', arguments: JSON.stringify({ prompt: 'P'.repeat(80) }) };
+
+  it('无 title → subject = prompt 首 40（压平换行）', () => {
+    const t = reviewBlockText(call, null);
+    expect(t.subject).toBe('P'.repeat(40) + '…');
+  });
+
+  it('有 title → subject 取 title（40 上限），prompt 只用兜底', () => {
+    const t = reviewBlockText(
+      { name: 'spawn_subagent', arguments: JSON.stringify({ title: '审查 /src（本轮总结页面）' }) },
+      null,
+    );
+    expect(t.subject).toBe('审查 /src（本轮总结页面）');
+    const long = reviewBlockText(
+      { name: 'spawn_subagent', arguments: JSON.stringify({ title: 'T'.repeat(50) }) },
+      null,
+    );
+    expect(long.subject).toBe('T'.repeat(40) + '…');
+  });
+
+  it('verdict = 报告首行（content → preview 兜底）取 60 字符；空结果 → 空串', () => {
+    const firstLine = 'R'.repeat(80);
+    const report = `${firstLine}\n详情……`;
+    const result = { ok: true, content: report, preview: report };
+    expect(reviewBlockText(call, result).verdict).toBe('R'.repeat(60) + '…');
+    expect(
+      reviewBlockText(call, { ok: true, content: null, preview: 'R'.repeat(40) }).verdict,
+    ).toBe('R'.repeat(40));
+    expect(reviewBlockText(call, null).verdict).toBe('');
+    expect(reviewBlockText(call, { ok: true }).verdict).toBe('');
+  });
+
+  it('首行跳过空行（空白行不算首行）；REVIEW_BLOCK_TITLE 单一来源', () => {
+    const t = reviewBlockText(call, { ok: true, content: '\n\n结论行\n后文' });
+    expect(t.verdict).toBe('结论行');
+    expect(REVIEW_BLOCK_TITLE).toBe('独立审查');
+  });
+
+  it('非对象/无 arguments → 全兜底（不抛）', () => {
+    const t = reviewBlockText(null, { ok: true, content: 'x' });
+    expect(t.subject).toBe('');
+    expect(t.verdict).toBe('x');
+  });
+});
+
+describe('toast 点击复制（clickable 选项）—— 文案/提示单一来源', () => {
+  it('TOAST_COPY_TITLE / TOAST_COPIED_TEXT 常量（与 app.js 消费方同字面量）', () => {
+    expect(TOAST_COPY_TITLE).toBe('点击复制完整会话 ID');
+    expect(TOAST_COPIED_TEXT).toBe('已复制');
+  });
+  // 「恢复会话」toast 文案已随恢复静默移除（2026-08-30）——toast clickable 机制仍
+  // 在（复制 ID 提示属该机制），其余场景复用；restoredToastText 无调用方即删除。
 });

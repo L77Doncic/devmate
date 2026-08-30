@@ -1,18 +1,20 @@
 /**
  * # test/ui-server/permission：权限预设（dsh 式三档）——settings 契约 + 判定矩阵逐格 + 真实 approver 决策
  *
- * CTO 语义定案：
+ * CTO 语义定案 → 全同 dsh 实测（零弹窗对照）：
  * - 预设枚举 read-only / workspace-write（缺省）/ full-access；settings 持久化（与 reasoning
  *   同机制：GET/POST /api/settings + persistSettings 快照触碰语义 + config 顶层键）；
  * - 判定矩阵：read-only = 读放行 + fs 写/编辑与 ask/deny 级命令 ask（问询兜底）；
- *   workspace-write = fs 全放行 + 只读放行 + ask 弹窗 + deny 直拒（permission-denied 回注，
- *   不弹窗）；full-access = 全放行（一次性风险确认由前端负责，后端记录 permissionConfirmedAt）；
- * - deny 路径不产生 approval-request（纯工具节点）；approver 只在 ask 项触发 approval-request。
+ *   workspace-write（默认）= fs 全放行 + 命令全放行（含 ask/deny 级——dsh 实测零弹窗；
+ *   无 OS 沙箱强制层，破坏性命令同执行——选档即接受风险）；
+ *   full-access = 全放行（一次性风险确认由前端负责，后端记录 permissionConfirmedAt）；
+ * - 审批面（approval-request）只在 read-only 档产生；deny 直拒路径已删除
+ *   （permissionDeniedMessage 移除；errorType='permission-denied' 由 loop 保留兼容、不再触发）。
  *
  * 矩阵逐格先以纯函数单测全覆盖（decidePermission）；关键行经真 assembleDeps + fake llm
  * 走真工具面（真实 fs 写、真实 run_command spawn）断言 approval-request 出现与否。
  */
-import { mkdtemp, rm } from 'node:fs/promises';
+import { access, mkdir, mkdtemp, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
@@ -22,11 +24,7 @@ import type {
   DevmateServerDeps,
   PermissionPreset,
 } from '../../src/ui/server/index.js';
-import {
-  classifyPermissionCall,
-  decidePermission,
-  permissionDeniedMessage,
-} from '../../src/ui/server/index.js';
+import { classifyPermissionCall, decidePermission } from '../../src/ui/server/index.js';
 import type { ToolCall } from '../../src/shared/session-types.js';
 import { MemorySessionAdapter } from '../../src/core/session/index.js';
 import { assembleDeps } from '../../src/ui/server/deps.js';
@@ -44,7 +42,7 @@ const call = (name: string, arguments_ = '{}'): ToolCall => ({
 // ---------------------------------------------------------------------------
 
 describe('ui/server：权限判定矩阵（decidePermission 逐格）', () => {
-  const CELLS: Array<[PermissionPreset, string, string, 'allow' | 'ask' | 'deny']> = [
+  const CELLS: Array<[PermissionPreset, string, string, 'allow' | 'ask']> = [
     // fs 读类（read_file/list_dir/glob/grep）：三档均放行
     ['read-only', 'read_file', '{}', 'allow'],
     ['workspace-write', 'read_file', '{}', 'allow'],
@@ -67,14 +65,15 @@ describe('ui/server：权限判定矩阵（decidePermission 逐格）', () => {
     ['read-only', 'run_command', '{"command":"ls"}', 'allow'],
     ['workspace-write', 'run_command', '{"command":"ls"}', 'allow'],
     ['full-access', 'run_command', '{"command":"ls"}', 'allow'],
-    // shell ask 级命令（未知命令等）：read-only/workspace-write → ask；full-access → 放行
+    // shell ask 级命令（未知命令等）：read-only → ask（问询兜底）；workspace-write/full-access
+    // → 放行（dsh 实测零弹窗——默认档不再弹窗）
     ['read-only', 'run_command', '{"command":"echo hi"}', 'ask'],
-    ['workspace-write', 'run_command', '{"command":"echo hi"}', 'ask'],
+    ['workspace-write', 'run_command', '{"command":"echo hi"}', 'allow'],
     ['full-access', 'run_command', '{"command":"echo hi"}', 'allow'],
-    // shell deny 级命令（rm -rf 等）：read-only → ask（问询兜底）；workspace-write → deny
-    // （不弹窗直拒——唯一保留的红色护栏）；full-access → 放行（用户已接受无障碍执行）
+    // shell deny 级命令（rm -rf 等）：read-only → ask（问询兜底）；workspace-write/full-access
+    // → 放行（deny 直拒路径已删除——workspace-write 下同 dsh：命令直接执行（含破坏性））
     ['read-only', 'run_command', '{"command":"rm -rf foo"}', 'ask'],
-    ['workspace-write', 'run_command', '{"command":"rm -rf foo"}', 'deny'],
+    ['workspace-write', 'run_command', '{"command":"rm -rf foo"}', 'allow'],
     ['full-access', 'run_command', '{"command":"rm -rf foo"}', 'allow'],
     // 矩阵外普通工具（use_skill/spawn_subagent/mcp 等）：三档均放行（dsh 口径：普通工具调用不弹窗）
     ['read-only', 'use_skill', '{}', 'allow'],
@@ -85,23 +84,7 @@ describe('ui/server：权限判定矩阵（decidePermission 逐格）', () => {
   ];
 
   it.each(CELLS)('%s × %s(%s) → %s', (permission, name, args, expected) => {
-    const decision = decidePermission(permission, call(name, args));
-    if (expected === 'allow') {
-      expect(decision).toBe('allow');
-    } else if (expected === 'ask') {
-      expect(decision).toBe('ask');
-    } else {
-      expect(decision).toMatchObject({ deny: true });
-      expect((decision as { reason: string }).reason).toContain('[permission: 命令被安全策略拒绝');
-    }
-  });
-
-  it('deny 直拒文案逐字（dsh marker 风格 + classify 拒因）', () => {
-    expect(
-      permissionDeniedMessage('workspace-write', ['rm 是危险命令（不可恢复的破坏性操作）']),
-    ).toBe(
-      '[permission: 命令被安全策略拒绝 under workspace-write mode]：rm 是危险命令（不可恢复的破坏性操作）',
-    );
+    expect(decidePermission(permission, call(name, args))).toBe(expected);
   });
 
   it('classifyPermissionCall：run_command 参数畸形/空命令 → 按未知命令 ask（不放行不明命令）', () => {
@@ -324,10 +307,17 @@ describe('ui/server：权限矩阵真装配决策（assembleDeps + fake llm）',
     expect(client.frames[client.frames.length - 1]!.data).toMatchObject({ status: 'completed' });
   });
 
-  it('m2) 默认档：deny 级命令不弹窗直拒——permission-denied 回注，模型继续', async () => {
+  it('m2) 默认档：deny 级命令（rm -rf demo-tmp）不弹窗且真实执行（目录确实被删）', async () => {
     const dir = await mkdtemp(join(tmpdir(), 'devmate-perm-m2-'));
     tempDirs.push(dir);
-    const denyCall = { id: 'r1', name: 'run_command', arguments: '{"command":"rm -rf perm-gone"}' };
+    await mkdir(join(dir, 'demo-tmp'));
+    // dsh 对照：workspace-write 下 rm -rf 类执行（无命令名黑名单——沙箱只看文件效应）；
+    // DevMate 无 OS 沙箱强制层，等价执行——选档即接受的风险，前端文案声明
+    const denyCall = {
+      id: 'r1',
+      name: 'run_command',
+      arguments: '{"command":"rm -rf demo-tmp"}',
+    };
     const { base, server } = await startReal(dir, [
       { content: 'do it', toolCalls: [denyCall] },
       { content: '收尾，不动了' },
@@ -341,16 +331,10 @@ describe('ui/server：权限矩阵真装配决策（assembleDeps + fake llm）',
     const events = client.frames.map((f) => f.event);
     expect(events).not.toContain('approval-request');
     const result = client.frames.find((f) => f.event === 'tool-result')!;
-    expect(result.data).toMatchObject({
-      id: 'r1',
-      name: 'run_command',
-      ok: false,
-      error:
-        '[permission: 命令被安全策略拒绝 under workspace-write mode]：rm 是危险命令（不可恢复的破坏性操作）',
-    });
-    expect(result.data).toMatchObject({
-      content: expect.stringContaining('"type":"permission-denied"'),
-    });
+    expect(result.data).toMatchObject({ id: 'r1', name: 'run_command', ok: true });
+    expect((result.data as { content: string }).content).toContain('--- exit code: 0 ---');
+    // 执行真：demo-tmp 已被真实删除
+    await expect(access(join(dir, 'demo-tmp'))).rejects.toThrow();
     expect(client.frames[client.frames.length - 1]!.data).toMatchObject({ status: 'completed' });
   });
 
@@ -468,6 +452,36 @@ describe('ui/server：权限矩阵真装配决策（assembleDeps + fake llm）',
     expect(results[0]).toMatchObject({ id: 'r1', name: 'run_command', ok: true });
     expect(results[1]).toMatchObject({ id: 'r2', name: 'run_command', ok: true });
     expect((results[1] as { content: string }).content).toContain('[out] hi');
+    expect(client.frames[client.frames.length - 1]!.data).toMatchObject({ status: 'completed' });
+  });
+
+  it('m7) 默认档：ask 级命令（npm view — classify 未知命令→ask）不弹窗且真实执行', async () => {
+    const dir = await mkdtemp(join(tmpdir(), 'devmate-perm-m7-'));
+    tempDirs.push(dir);
+    // npm view：classify 未知命令 → ask 级——默认档零弹窗的直接执行代表（用户诉求「不再弹窗」）
+    const npmCall = {
+      id: 'n1',
+      name: 'run_command',
+      arguments: '{"command":"npm view lodash version"}',
+    };
+    const { base, server } = await startReal(dir, [
+      { content: 'view it', toolCalls: [npmCall] },
+      { content: 'done' },
+    ]);
+    servers.push(server);
+    const sessionId = await chatSession(base);
+
+    const client = await SseClient.connect(base, sessionId);
+    clients.push(client);
+    await waitForFrames(client, 9, 20_000);
+    const events = client.frames.map((f) => f.event);
+    expect(events).not.toContain('approval-request');
+    const result = client.frames.find((f) => f.event === 'tool-result')!;
+    expect(result.data).toMatchObject({ id: 'n1', name: 'run_command', ok: true });
+    // 执行真：npm 真实输出（registry 版本号）与退出码 0
+    const content = (result.data as { content: string }).content;
+    expect(content).toContain('--- exit code: 0 ---');
+    expect(content).toMatch(/\d+\.\d+\.\d+/);
     expect(client.frames[client.frames.length - 1]!.data).toMatchObject({ status: 'completed' });
   });
 });

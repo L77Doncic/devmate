@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-/* global process:readonly, setTimeout:readonly */
+/* global process:readonly, setTimeout:readonly, setInterval:readonly */
 /**
  * # test/mcp/fixture-server：假 stdio MCP 服务器（jsonrpc 应答 initialize/list/call）
  *
@@ -20,6 +20,8 @@
  * - --crashAfterCall     应答首个 tools/call 后 20ms 进程 exit(0)（崩溃测试）
  * - --exitAfterMs=<n>    启动 n ms 后自行 exit(0)
  * - --badJson=<n>        第 n 条收到的消息后输出一行非 JSON（协议错误测试）
+ * - --stayOnEof         stdin EOF 后不退出（默认立即退）——模拟 mcp-remote 类「父死仍常驻」
+ *                       （VT-2 进程组终止测试：组杀必须能终止它；只杀直接子进程会留孤儿）。
  */
 import { appendFileSync } from 'node:fs';
 
@@ -50,6 +52,7 @@ const cfg = {
   crashAfterCall: flag('crashAfterCall') === 'true',
   exitAfterMs: Number(flag('exitAfterMs') ?? 0),
   badJsonAfter: Number(flag('badJson') ?? 0),
+  stayOnEof: flag('stayOnEof') === 'true',
 };
 
 if (cfg.log === undefined) {
@@ -85,6 +88,12 @@ function log(ev) {
 }
 
 log({ ev: 'start', pid: process.pid });
+// SIGTERM 记录后退出（进程组终止测试的观察点：EOF 之后进程仍存活、由信号终止——
+// 只杀直接子进程会留下孤儿；缺省 kill 无记录可断言，故 fixture 自带 handler）。
+process.on('SIGTERM', () => {
+  log({ ev: 'sigterm' });
+  process.exit(0);
+});
 if (cfg.logEnv.length > 0) {
   const snapshot = {};
   for (const key of cfg.logEnv) snapshot[key] = process.env[key] ?? '';
@@ -208,4 +217,13 @@ process.stdin.on('data', (chunk) => {
     handle(msg);
   }
 });
-process.stdin.on('end', () => process.exit(0));
+process.stdin.on('end', () => {
+  if (cfg.stayOnEof) {
+    // 常驻模拟（mcp-remote 类：stdin 断管后仍保持进程）；被 SIGTERM 组杀终止。
+    // 无定时器进程会自动退出——挂一个 interval 保持事件循环。
+    log({ ev: 'stay-eof' });
+    setInterval(() => {}, 60000);
+    return;
+  }
+  process.exit(0);
+});

@@ -20,10 +20,10 @@ import { afterEach, describe, expect, it } from 'vitest';
 import { createJail } from '../../src/core/jail/index.js';
 import { defineRegistry } from '../../src/core/loop/index.js';
 import type { LlmAdapter, ToolRegistry } from '../../src/core/loop/index.js';
-import { MemorySessionAdapter } from '../../src/core/session/index.js';
+import { JsonlFileAdapter, MemorySessionAdapter } from '../../src/core/session/index.js';
 import type { ChatRequest, StreamEvent } from '../../src/shared/llm-types.js';
 import type { DevmateServer, DevmateServerDeps } from '../../src/ui/server/index.js';
-import { createSessionToolsFactory } from '../../src/ui/server/deps.js';
+import { createSessionToolsFactory, makeSessionLister } from '../../src/ui/server/deps.js';
 import { sessionWorkspaceOf } from '../../src/ui/server/emit.js';
 import { FakeLlm } from '../loop/support.js';
 import { canonicalTmpBase, shellCwdForm } from '../shell-tools/support.js';
@@ -45,7 +45,12 @@ class RoutingLlm implements LlmAdapter {
 
   async *chat(request: ChatRequest, signal?: AbortSignal): AsyncIterable<StreamEvent> {
     const first = request.messages.find((m) => m.role === 'user');
-    const key = first !== undefined && first.role === 'user' ? first.content : '';
+    const key =
+      first !== undefined && first.role === 'user'
+        ? typeof first.content === 'string'
+          ? first.content
+          : JSON.stringify(first.content)
+        : '';
     const fake = this.routes.get(key);
     if (fake === undefined) {
       throw new Error(`RoutingLlm: no route for ${JSON.stringify(key)}`);
@@ -458,6 +463,62 @@ describe('ui/server：会话级根（workspaceRoot 参数）', () => {
     });
     expect(resumeUnregistered.status).toBe(200);
     expect(await workspaceEventsOf(store, created.sessionId)).toEqual([dirB]);
+  });
+
+  it('v4) 未注册根 POST /api/chat → 400 且零持久副作用（无会话文件/无列表项——VT-4 修复）', async () => {
+    const dirA = await tempDir();
+    const storeDir = await tempDir();
+    const store = new JsonlFileAdapter({ dir: storeDir });
+    const lister = makeSessionLister({ store, dir: storeDir });
+    const { base, server } = await startServer(
+      depsFor({ store, workspaceRoot: dirA, workspaces: [dirA], sessionLister: lister }),
+    );
+    servers.push(server);
+
+    const res = await postJson(base, '/api/chat', {
+      text: 'x',
+      sessionId: 's-vt-orphan-1',
+      workspaceRoot: join(dirA, 'never-registered-xyz'),
+    });
+    expect(res.status).toBe(400);
+    expect(((await res.json()) as { error: string }).error).toBe('workspace-not-registered');
+    // 校验先于会话文件创建：失败请求无持久副作用
+    expect(await store.exists('s-vt-orphan-1')).toBe(false);
+    const list = (await (await fetch(new URL('/api/sessions', base))).json()) as {
+      sessions: unknown[];
+    };
+    expect(list.sessions).toHaveLength(0);
+  });
+
+  it('v5) 字面 vs canonical：注册与创建两端同口径——`/tmp/x/` 与 `/tmp/x` 等效（尾斜杠不再 400；meta 落 canonical）', async () => {
+    const dirA = await tempDir();
+    const dirB = await tempDir();
+    const store = new MemorySessionAdapter();
+    const { base, server } = await startServer(
+      depsFor({ store, workspaceRoot: dirA, workspaces: [dirA] }),
+    );
+    servers.push(server);
+    const withSlash = `${dirB}/`;
+
+    // 注册带尾斜杠：注册表存 canonical（去尾斜杠；与 realpath 一致）
+    const add = await postJson(base, '/api/workspaces', { path: withSlash });
+    expect(add.status).toBe(200);
+    expect(((await add.json()) as { roots: string[] }).roots).toEqual([dirA, dirB]);
+
+    // 创建端：参数带尾斜杠 → 200（旧实现字面 includes → 400 workspace-not-registered）
+    const res = await postJson(base, '/api/sessions', { workspaceRoot: withSlash, text: 'x' });
+    expect(res.status).toBe(200);
+    const { sessionId } = (await res.json()) as { sessionId: string };
+    expect(await workspaceEventsOf(store, sessionId)).toEqual([dirB]); // meta 落 canonical 形
+
+    // POST /api/chat 首建同一口径（canonical 参数）
+    const chat = await postJson(base, '/api/chat', { text: 'y', workspaceRoot: withSlash });
+    expect(chat.status).toBe(200);
+    const chatBody = (await chat.json()) as { sessionId: string };
+    const client = await SseClient.connect(base, chatBody.sessionId);
+    await waitForFrames(client, 5, 10_000); // 让 run 完整收尾
+    client.close();
+    expect(await workspaceEventsOf(store, chatBody.sessionId)).toEqual([dirB]);
   });
 
   it('s4) 缺省（不带参数）→ meta = deps.workspaceRoot（默认根）', async () => {

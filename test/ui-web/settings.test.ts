@@ -577,3 +577,56 @@ describe('reviewMode（R2-S2 收尾评审哨兵开关：缺省 true / 布尔补�
     expect(after.reviewMode).toBe(true);
   });
 });
+
+describe('A 档：normalizeTokenLimit / saveSettings 上限字段（ADR-0015）', () => {
+  it('normalizeTokenLimit：正整数原样；非法/缺失 → null（null = 未设置=留空）', async () => {
+    const { normalizeTokenLimit } = await import('../../src/ui/web/settings.js');
+    expect(normalizeTokenLimit(4096)).toBe(4096);
+    expect(normalizeTokenLimit(1)).toBe(1);
+    expect(normalizeTokenLimit(0)).toBeNull();
+    expect(normalizeTokenLimit(1.5)).toBeNull();
+    expect(normalizeTokenLimit('4096')).toBeNull();
+    expect(normalizeTokenLimit(undefined)).toBeNull();
+  });
+
+  it('saveSettings：maxInputTokens/maxOutputTokens 只在非空值上行；null/undefined → 不带键', async () => {
+    const seen: Array<{ body: unknown }> = [];
+    const fetchImpl = async (_url: string, init: RequestInit) => {
+      seen.push({ body: JSON.parse(String(init.body)) });
+      return new Response(
+        JSON.stringify({
+          baseUrl: 'https://api.deepseek.com',
+          model: 'deepseek-v4-flash',
+          maxInputTokens: 4096,
+          maxOutputTokens: 2048,
+        }),
+        { status: 200, headers: { 'content-type': 'application/json' } },
+      );
+    };
+    await saveSettings(
+      {
+        baseUrl: 'https://api.deepseek.com',
+        model: 'deepseek-v4-flash',
+        maxInputTokens: 4096,
+        maxOutputTokens: 2048,
+      },
+      { fetchImpl: fetchImpl as never },
+    );
+    expect(seen[0]!.body).toMatchObject({ maxInputTokens: 4096, maxOutputTokens: 2048 });
+
+    const seen2: Array<{ body: unknown }> = [];
+    const fetchImpl2 = async (_url: string, init: RequestInit) => {
+      seen2.push({ body: JSON.parse(String(init.body)) });
+      return new Response(JSON.stringify({ baseUrl: 'https://api.deepseek.com', model: 'm' }), {
+        status: 200,
+        headers: { 'content-type': 'application/json' },
+      });
+    };
+    await saveSettings(
+      { baseUrl: 'https://api.deepseek.com', model: 'm', maxInputTokens: null },
+      { fetchImpl: fetchImpl2 as never },
+    );
+    expect('maxInputTokens' in (seen2[0]!.body as Record<string, unknown>)).toBe(false);
+    expect('maxOutputTokens' in (seen2[0]!.body as Record<string, unknown>)).toBe(false);
+  });
+});
