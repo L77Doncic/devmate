@@ -30,6 +30,8 @@ export interface ShellFixture {
   /** 兄弟目录（越界代表；不登记为 extraRoot）。 */
   outside: string;
   tool: Tool;
+  /** 常驻 shell 实例（P2-3 killActiveCommand 测试面：直接调用击杀接口）。 */
+  shell: ReturnType<typeof createPersistentShell>;
   sessionId: string;
   dispose: () => Promise<void>;
 }
@@ -79,7 +81,7 @@ export async function makeShellFixture(
   const outside = mkdtempSync(join(wsBase, 'devmate-shell-out-'));
   created.push(ws, outside);
   const jail = await createJail({ workspaceRoot: ws });
-  const { tool, dispose } = createPersistentShell({
+  const shell = createPersistentShell({
     workspaceRoot: ws,
     jail,
     timeoutMs: opts.timeoutMs ?? 5_000,
@@ -91,9 +93,10 @@ export async function makeShellFixture(
   return {
     ws,
     outside,
-    tool,
+    tool: shell.tool,
+    shell,
     sessionId: opts.sessionId ?? 'test-session',
-    dispose,
+    dispose: shell.dispose,
   };
 }
 

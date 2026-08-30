@@ -172,6 +172,9 @@ export interface SessionToolsFactory {
   disposeIdleShells(now: number, activeSessionIds?: ReadonlySet<string>): Promise<void>;
   /** 常驻 shell 实例数（GET /api/stats 的 activeShells；只含已构建未释放实例）。 */
   activeShellCount(): number;
+  /** 终止该会话当前执行中的 run_command（P2-3 停止杀命令树）：杀进程组 + interrupted 回注；
+   *  无活动命令 → false。服务端 /api/interrupt 接线点（deps.killActiveCommand）。 */
+  killActiveCommand(sessionId: string): boolean;
 }
 
 /**
@@ -265,10 +268,10 @@ export function createSessionToolsFactory(options: {
     // lastUsedAt（TTL 判据更精确——长 run 内多次工具调用不会触发误杀）
     return {
       list: () => base.list(),
-      async execute(call) {
+      async execute(call, context) {
         executing.set(sessionId, (executing.get(sessionId) ?? 0) + 1);
         try {
-          return await base.execute(call);
+          return await base.execute(call, context); // 运行时上下文透传（P2-3：signal 达工具）
         } finally {
           const next = (executing.get(sessionId) ?? 1) - 1;
           if (next <= 0) executing.delete(sessionId);
@@ -353,6 +356,7 @@ export function createSessionToolsFactory(options: {
       for (const shell of all) await shell.dispose();
     },
     disposeSession,
+    killActiveCommand: (sessionId) => shells.get(sessionId)?.killActiveCommand(sessionId) ?? false,
     async disposeIdleShells(now: number, activeSessionIds?: ReadonlySet<string>): Promise<void> {
       const victims = [...lastUsedAt.entries()]
         .filter(([sessionId, usedAt]) => {
@@ -625,9 +629,9 @@ export function mergeMcpTools(
         parameters: t.parameters ?? {},
       })),
     ],
-    async execute(call) {
-      if (mcpNames.has(call.name)) return mcpRegistry.execute(call);
-      if (baseNames.has(call.name)) return base.execute(call);
+    async execute(call, context) {
+      if (mcpNames.has(call.name)) return mcpRegistry.execute(call, context);
+      if (baseNames.has(call.name)) return base.execute(call, context);
       return unknownToolResult(call.name, [...baseNames, ...mcpNames]);
     },
   };
@@ -968,6 +972,7 @@ function disabledPool(): SubagentPool {
       rejected: 0,
     }),
     dispose: () => {},
+    nextCostEstimateUsd: () => 0,
   };
 }
 
@@ -1236,6 +1241,10 @@ export async function assembleDeps(config: DevmateConfig): Promise<DevmateServer
     userSkillsDir: config.userSkillsDir ?? defaultUserSkillsDir(),
     sessionLister: makeSessionLister({ store, dir: sessionsDir }),
     activeShellCount: () => sessionTools.activeShellCount(),
+    // P2-3 停止杀命令树：/api/interrupt 接线点（终止该会话活动 run_command——杀进程组）
+    killActiveCommand: (sessionId) => sessionTools.killActiveCommand(sessionId),
+    // P2-8 评审预算门：一次评审的成本估算 = 池的 self-similar 下一次成本锚（无历史 = 0）
+    reviewCostEstimate: () => subagentPool.nextCostEstimateUsd(),
     // stats 的 queuedSubagents（池注入后出现；即池 stats 的排队数）
     queuedSubagentCount: () => subagentPool.stats().queued,
     // Workflow 晚绑定回填（服务端构造期调用；索引单源是服务端缓存——deps 组装的是引用适配）

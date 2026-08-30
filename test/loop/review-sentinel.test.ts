@@ -14,9 +14,11 @@
  */
 import { describe, expect, it } from 'vitest';
 import {
+  DEFAULT_MAX_REVIEW_COST_USD,
   hasReviewRun,
   hasSubstantiveWork,
   REVIEW_SENTINEL_USER_CONTENT,
+  reviewBudgetSkipNote,
   run,
 } from '../../src/core/loop/index.js';
 import type { ReviewGate, RunOptions, RunStats } from '../../src/core/loop/index.js';
@@ -330,5 +332,143 @@ describe('loop：评审哨兵子代理可用性（P2-10 静默 —— subagents-
     expect(result.status).toBe('completed');
     expect(result.steps).toBe(1);
     expect(sentinelEvent(await collectEvents(store, 's1'))).toBeUndefined();
+  });
+});
+
+describe('loop：评审预算门（P2-8 —— maxReviewCostUsd 缺省 0.02）', () => {
+  it('r9) 估算超预算（0.03 > 缺省 0.02）→ 跳过哨兵注入 + 一行系统注记「本轮未派独立评审（评审预算 $0.02 内：超支风险）」；一步自然结束；护栏不置位', async () => {
+    const store = readyStore();
+    const gate = gateOf({ substantive: true });
+    (gate as ReviewGate & { reviewCostEstimate?: () => number }).reviewCostEstimate = () => 0.03;
+    const llm = new FakeLlm([{ content: '改完了，收尾' }]);
+
+    const result = await run(
+      { sessionId: 's1', task: '修一个 bug' },
+      baseOpts({
+        store,
+        tools: defineRegistry([echoTool()], { sessionId: 's1' }),
+        llm,
+        review: gate,
+      }),
+    );
+
+    expect(result.status).toBe('completed');
+    expect(result.steps).toBe(1); // 无续跑：注记不驱动模型再回合（纯提示行）
+    expect(llm.requests).toHaveLength(1);
+    expect(gate.markCalls).toEqual([]); // 护栏未置位：预算内容许后仍可再试
+    const events = await collectEvents(store, 's1');
+    expect(kindsOf(events)).toEqual(['user', 'assistant(0tc)', 'user', 'event(run_result)']);
+    const systemNotes = events.filter((ev) => ev.kind === 'user' && ev.meta?.system === true);
+    expect(systemNotes).toHaveLength(1);
+    expect((systemNotes[0]!.payload as { content: string }).content).toBe(
+      '本轮未派独立评审（评审预算 $0.02 内：超支风险）',
+    );
+    // 注记 ≠ 哨兵（不是让模型去审查的提示）
+    expect((systemNotes[0]!.payload as { content: string }).content).not.toBe(
+      REVIEW_SENTINEL_USER_CONTENT,
+    );
+  });
+
+  it('r10) 估算在预算内（0.01 ≤ 0.02）→ 正常注入哨兵（与经济门共存：预算够就照常审查）', async () => {
+    const store = readyStore();
+    const gate = gateOf({ substantive: true });
+    (gate as ReviewGate & { reviewCostEstimate?: () => number }).reviewCostEstimate = () => 0.01;
+    const llm = new FakeLlm([{ content: '改完了' }, { content: '先审查再收尾' }]);
+
+    const result = await run(
+      { sessionId: 's1', task: '修一个 bug' },
+      baseOpts({
+        store,
+        tools: defineRegistry([echoTool()], { sessionId: 's1' }),
+        llm,
+        review: gate,
+      }),
+    );
+
+    expect(result.status).toBe('completed');
+    expect(result.steps).toBe(2);
+    expect(gate.markCalls).toEqual(['s1']);
+    const events = await collectEvents(store, 's1');
+    const sentinel = sentinelEvent(events);
+    expect(sentinel).toBeDefined();
+    expect(sentinel!.payload.content).toBe(REVIEW_SENTINEL_USER_CONTENT);
+  });
+
+  it('r11) 自定义预算（maxReviewCostUsd=0.1）+ 估算 0.5 → 跳过；注记带预算值 $0.10', async () => {
+    const store = readyStore();
+    const gate = gateOf({ substantive: true });
+    const g = gate as ReviewGate & { reviewCostEstimate?: () => number; maxReviewCostUsd?: number };
+    g.reviewCostEstimate = () => 0.5;
+    g.maxReviewCostUsd = 0.1;
+    const llm = new FakeLlm([{ content: '收尾' }]);
+
+    const result = await run(
+      { sessionId: 's1', task: '做一个功能' },
+      baseOpts({
+        store,
+        tools: defineRegistry([echoTool()], { sessionId: 's1' }),
+        llm,
+        review: gate,
+      }),
+    );
+
+    expect(result.status).toBe('completed');
+    expect(result.steps).toBe(1);
+    const note = (await collectEvents(store, 's1')).find(
+      (ev) => ev.kind === 'user' && ev.meta?.system === true,
+    );
+    expect((note!.payload as { content: string }).content).toBe(reviewBudgetSkipNote(0.1));
+  });
+
+  it('r12) 估算抛错 → 按无预算信息处理：哨兵照常注入（门故障不放大为行为故障）', async () => {
+    const store = readyStore();
+    const gate = gateOf({ substantive: true });
+    (gate as ReviewGate & { reviewCostEstimate?: () => number }).reviewCostEstimate = () => {
+      throw new Error('estimate broken');
+    };
+    const llm = new FakeLlm([{ content: '搞定' }, { content: '审查' }]);
+
+    const result = await run(
+      { sessionId: 's1', task: '改一下' },
+      baseOpts({
+        store,
+        tools: defineRegistry([echoTool()], { sessionId: 's1' }),
+        llm,
+        review: gate,
+      }),
+    );
+
+    expect(result.status).toBe('completed');
+    expect(result.steps).toBe(2);
+    expect(sentinelEvent(await collectEvents(store, 's1'))?.payload.content).toBe(
+      REVIEW_SENTINEL_USER_CONTENT,
+    );
+  });
+
+  it('r13) 估算值 = 0（池无先例：self-similar 锚缺省）→ 预算内：正常注入', async () => {
+    const store = readyStore();
+    const gate = gateOf({ substantive: true });
+    (gate as ReviewGate & { reviewCostEstimate?: () => number }).reviewCostEstimate = () => 0;
+    const llm = new FakeLlm([{ content: '收尾' }, { content: '审查再收尾' }]);
+
+    const result = await run(
+      { sessionId: 's1', task: '改一下' },
+      baseOpts({
+        store,
+        tools: defineRegistry([echoTool()], { sessionId: 's1' }),
+        llm,
+        review: gate,
+      }),
+    );
+
+    expect(result.status).toBe('completed');
+    expect(result.steps).toBe(2);
+  });
+
+  it('r14) 常量契约：DEFAULT_MAX_REVIEW_COST_USD = 0.02（缺省预算口径）', () => {
+    expect(DEFAULT_MAX_REVIEW_COST_USD).toBe(0.02);
+    expect(reviewBudgetSkipNote(DEFAULT_MAX_REVIEW_COST_USD)).toBe(
+      '本轮未派独立评审（评审预算 $0.02 内：超支风险）',
+    );
   });
 });

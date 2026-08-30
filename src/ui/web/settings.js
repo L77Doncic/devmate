@@ -119,9 +119,11 @@ export function tokenLimitError(value, label = '输入/输出上限') {
 }
 
 /**
- * 上限软提示（S 档 · ADR-0016）：值 > 窗口预算（settings.window——三源取窗回显值）→
- * 红字软提示（**不阻止保存**——由服务端钳制兜底：clampLimits 之后回执 clamped 键）；
- * 窗口未知（null/缺省估算模式）/ 值合法 / 值非法 → `''`（硬校验另负责必填/非正）。
+ * 上限软提示（S 档 · ADR-0016；P2-6 措辞修正 2026-08-31）：值 ≥ 窗口预算
+ * （settings.window——三源取窗回显值）→ 红字软提示（**不阻止保存**——由服务端钳制
+ * 兜底：clampLimits 之后回执 clamped 键）；`>=` 触发 = 恰好等于窗口也被预提示
+ * （P2-6 实测：1000000 恰好 == window 时旧 `>` 无提示，只有保存兜底）；
+ * 窗口未知（null/缺省估算模式）/ 值非法 → `''`（硬校验另负责必填/非正）。
  */
 export function softLimitHint(value, windowTokens, label = '输入上限') {
   if (windowTokens === null || typeof windowTokens !== 'number') return '';
@@ -129,8 +131,8 @@ export function softLimitHint(value, windowTokens, label = '输入上限') {
   if (!/^[0-9]+$/.test(raw)) return '';
   const n = Number(raw);
   if (!Number.isSafeInteger(n) || n < 1) return '';
-  if (n > windowTokens) {
-    return `${label}超过窗口预算 ${windowTokens}，保存后将被供应商上限钳制（本地不拦，由服务端兜底）`;
+  if (n >= windowTokens) {
+    return `${label}不能超过该模型上限 ${windowTokens}：保存时将被钳制`;
   }
   return '';
 }
@@ -151,6 +153,37 @@ export function sanitizeModel(model) {
     if (next === out) return out;
     out = next;
   }
+}
+
+/**
+ * 模型名尾标实时提示（P2-5）：输入值（未净化原文）含 UI 标记后缀 → 行内提示文案
+ * 「将自动移除 UI 标记后缀」（失焦/防抖后展示——不静默「魔法」）；
+ * 已纯净/空 → `''`（无提示）。**不**检查服务端 modelSanitized（那是存量回显，
+ * 用户输入面以文法即判——净化前 ≠ 净化后即含尾标）。
+ */
+export function modelMarkerHint(rawModel) {
+  const raw = String(rawModel ?? '');
+  if (raw === '') return '';
+  return sanitizeModel(raw) === raw ? '' : '将自动移除 UI 标记后缀';
+}
+
+/**
+ * 工作区路径的友好回显（P2-7）：HOME 前缀折叠为 `~`（posix /home/u、win C:\Users\u；
+ * 大小写不敏感的前缀比对——win 盘符/用户目录大小写差异容忍）。
+ * 未命中 HOME / 空路径 → 原样（空串仍空串——调用方按「（由启动目录决定）」占位兜底）。
+ */
+export function friendlyWorkspacePath(path, home) {
+  const ref = String(path ?? '');
+  if (typeof home === 'string' && home !== '') {
+    const base = home.replace(/[/\\]+$/, '');
+    if (ref.length > base.length) {
+      if (ref.toLowerCase().startsWith(`${base.toLowerCase()}/`))
+        return `~${ref.slice(base.length)}`;
+      if (ref.toLowerCase().startsWith(`${base.toLowerCase()}\\`))
+        return `~${ref.slice(base.length)}`;
+    }
+  }
+  return ref;
 }
 
 /**
@@ -267,9 +300,18 @@ function normalize(json) {
   };
 }
 
-/** GET /api/settings。失败抛错（调用方决定降级表现）。 */
-export async function loadSettings({ fetchImpl = globalThis.fetch } = {}) {
-  const res = await fetchImpl('/api/settings', { credentials: 'same-origin' });
+/**
+ * GET /api/settings。失败抛错（调用方决定降级表现）。
+ * 可选 sessionId（P2-7 工作区目录回显）：服务端据此回显该会话登记的根——
+ * 设置抽屉打开时传当前会话（无会话/未传 → 服务端回默认根）。
+ * @param {{ fetchImpl?: typeof globalThis.fetch; sessionId?: string }} [opts]
+ */
+export async function loadSettings({ fetchImpl = globalThis.fetch, sessionId } = {}) {
+  const url =
+    sessionId !== undefined && sessionId !== ''
+      ? `/api/settings?sessionId=${encodeURIComponent(sessionId)}`
+      : '/api/settings';
+  const res = await fetchImpl(url, { credentials: 'same-origin' });
   if (!res.ok) throw new Error(`HTTP ${res.status}`);
   return normalize(await res.json());
 }

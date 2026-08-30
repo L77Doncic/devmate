@@ -125,10 +125,17 @@ export interface Tool extends ToolDef {
   execute(call: ToolCall, ctx: ToolExecutionContext): Promise<ToolResult>;
 }
 
-/** 工具注册表接缝：list 暴露模型可见定义；execute 执行一次调用（按 name 分发）。 */
+/**
+ * 工具注册表接缝：list 暴露模型可见定义；execute 执行一次调用（按 name 分发）。
+ * execute 的第二参（可选）是**运行时上下文补丁**：run 每次执行现传 {sessionId, signal}>
+ * （与 defineRegistry 构造期静态上下文合并——运行时覆盖静态）。
+ * 背景（P2-3 停止不杀命令树）：泄漏根因是工具面构造时固定 {sessionId} 静态上下文，
+ * 运行时的中断 signal 从不到达工具（常驻 shell 的 waitForCompletion 听不到 abort →
+ * sleep-30 自然跑完才落「已中断」）。可选参让 signal 现传（缺省调用方不传 = 旧行为）。
+ */
 export interface ToolRegistry {
   list(): readonly ToolDef[];
-  execute(call: ToolCall): Promise<ToolResult>;
+  execute(call: ToolCall, context?: ToolExecutionContext): Promise<ToolResult>;
 }
 
 // ---------------------------------------------------------------------------
@@ -223,7 +230,21 @@ export interface ReviewGate {
    * 「本次未派独立评审（子代理不可用）」，见 app.js maybeHintReviewSkipped）。
    */
   subagentAvailable?(): boolean;
+  /**
+   * 评审预算门（P2-8 修复 · UX 终版裁决）：一次的评审成本**估算**。提供时，哨兵注入
+   * 前比对：估算 > 预算（maxReviewCostUsd ?? DEFAULT_MAX_REVIEW_COST_USD）→ **跳过注入**
+   * （不含护栏置位——预算内容许后仍可再试）+ 一行系统注记
+   * reviewBudgetSkipNote(预算)「本轮未派独立评审（评审预算 $0.02 内：超支风险）」。
+   * 缺省 undefined = 不设预算门（旧行为——从不跳过）。
+   * 真实装配为子代理池的 self-similar 下一次成本锚（池 cost-guard 同假设），见 subagent.ts。
+   */
+  reviewCostEstimate?(): number;
+  /** 评审预算（USD）；缺省 DEFAULT_MAX_REVIEW_COST_USD（0.02）。仅 reviewCostEstimate 提供时生效。 */
+  maxReviewCostUsd?: number;
 }
+
+/** 评审预算门缺省上限（USD；P2-8 裁决——一次评审估算超此即跳过）。 */
+export const DEFAULT_MAX_REVIEW_COST_USD = 0.02;
 
 // ---------------------------------------------------------------------------
 // 方法论前置门（R2-S1：方法论内化）

@@ -701,3 +701,79 @@ async function waitRun(fake: FakeLlm, count: number): Promise<void> {
   }
   if (fake.callCount < count) throw new Error(`fake llm callCount ${fake.callCount} < ${count}`);
 }
+
+describe('ui/server：P2-7 工作区目录回显（GET /api/settings）', () => {
+  const servers: DevmateServer[] = [];
+
+  afterEach(async () => {
+    for (const server of servers.splice(0)) await server.close();
+  });
+
+  it('f-w1) deps.workspaceRoot 注入 → GET 带 workspaceDir（缺省根）；未注入 → 无键（UI 占位兜底）', async () => {
+    const { base, server } = await startServer({
+      ...baseDeps(new FakeLlm([{ content: 'x' }])),
+      workspaceRoot: '/work/default-root',
+    });
+    servers.push(server);
+    const body = (await (await fetch(new URL('/api/settings', base))).json()) as {
+      workspaceDir?: string;
+    };
+    expect(body.workspaceDir).toBe('/work/default-root');
+
+    const { base: base2, server: server2 } = await startServer(
+      baseDeps(new FakeLlm([{ content: 'x' }])),
+    );
+    servers.push(server2);
+    const body2 = (await (await fetch(new URL('/api/settings', base2))).json()) as {
+      workspaceDir?: string;
+    };
+    expect(body2.workspaceDir).toBeUndefined(); // 未注入根 → 不带键（「由启动目录决定」）
+  });
+
+  it('f-w2) GET /api/settings?sessionId=<带 meta 的会话> → 回该会话登记的根；无 meta → 缺省根', async () => {
+    const { base, server } = await startServer({
+      ...baseDeps(new FakeLlm([{ content: 'x' }])),
+      workspaceRoot: '/work/default-root',
+    });
+    servers.push(server);
+
+    // 会话 s1 携带 session-workspace meta（根 = /work/session-root）
+    const store = new MemorySessionAdapter();
+    await store.create('s1');
+    await store.append('s1', {
+      kind: 'event',
+      payload: { type: 'session-workspace', data: { workspaceRoot: '/work/session-root' } },
+    });
+    // 该测试接缝：把带 meta 的 store 挂到另一台服务器
+    const { base: base2, server: server2 } = await startServer({
+      ...baseDeps(new FakeLlm([{ content: 'x' }])),
+      store,
+      workspaceRoot: '/work/default-root',
+    });
+    servers.push(server2);
+
+    const rooted = (await (
+      await fetch(new URL(`/api/settings?sessionId=${encodeURIComponent('s1')}`, base2))
+    ).json()) as { workspaceDir?: string };
+    expect(rooted.workspaceDir).toBe('/work/session-root');
+
+    // 无 meta 会话（不存在 → 读不到 meta）：回退缺省根
+    const missing = (await (
+      await fetch(new URL(`/api/settings?sessionId=${encodeURIComponent('no-meta-1')}`, base))
+    ).json()) as { workspaceDir?: string };
+    expect(missing.workspaceDir).toBe('/work/default-root');
+  });
+
+  it('f-w3) 非法 sessionId（越界字面量）→ 400 {error}（与其它端点一致过 assertValidSessionId）', async () => {
+    const { base, server } = await startServer({
+      ...baseDeps(new FakeLlm([{ content: 'x' }])),
+      workspaceRoot: '/work/default-root',
+    });
+    servers.push(server);
+    for (const bad of ['../etc', 'a/b', '%2e%2e']) {
+      const res = await fetch(new URL(`/api/settings?sessionId=${encodeURIComponent(bad)}`, base));
+      expect(res.status, bad).toBe(400);
+      expect(((await res.json()) as { error: string }).error).toBeTypeOf('string');
+    }
+  });
+});

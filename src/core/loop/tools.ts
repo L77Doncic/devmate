@@ -38,13 +38,15 @@ export function defineRegistry(tools: readonly Tool[], ctx: ToolExecutionContext
         parameters: tool.parameters ?? {},
       }));
     },
-    async execute(call: ToolCall): Promise<ToolResult> {
+    async execute(call: ToolCall, running?: ToolExecutionContextArg): Promise<ToolResult> {
       const tool = index.get(call.name);
       if (tool === undefined) {
         return unknownToolResult(call.name, [...index.keys()]);
       }
       try {
-        return await tool.execute(call, ctx);
+        // 运行时上下文补丁（P2-3）：run 每次执行现传的 {signal} 覆盖构造期静态上下文——
+        // 常驻 shell 的 waitForCompletion 由此听到中断信号（中断即杀命令树 + partial 回注）。
+        return await tool.execute(call, running === undefined ? ctx : { ...ctx, ...running });
       } catch (err) {
         // 工具侧 throw 也归一为普通失败结果（失败是普通消息）
         return {

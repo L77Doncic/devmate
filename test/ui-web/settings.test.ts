@@ -727,19 +727,43 @@ describe('S 档钳制标记（ADR-0016）：normalize clamped 键 + softLimitHin
     expect(clean.maxOutputTokensClamped).toBe(false);
   });
 
-  it('softLimitHint：窗口值比较发出软提示（不阻止保存——服务端钳制兜底）；窗口未知/值合法 → 空', async () => {
+  it('softLimitHint（P2-6 措辞修正）：>= 窗口触发（等于也提示）；含「该模型上限 N」；窗口未知/值合法 → 空', async () => {
     const { softLimitHint } = await import('../../src/ui/web/settings.js');
-    // 输入 > 窗口 → 红字软提示（含窗口值）
-    expect(softLimitHint('2000000', 1000000, '输入上限')).toContain('超过窗口预算 1000000');
+    // 输入 > 窗口 → 软提示（含「该模型上限」+ 窗口值）
+    expect(softLimitHint('2000000', 1000000, '输入上限')).toContain('该模型上限 1000000');
+    // 恰好 == 窗口 → 也触发（P2-6 实测：1000000 == 窗口时旧 `>` 无提示，只有保存兜底）
+    expect(softLimitHint('1000000', 1000000, '输入上限')).toContain('该模型上限 1000000');
     // 窗口未知（null/缺省）→ 不提示（估算模式）
     expect(softLimitHint('2000000', null, '输入上限')).toBe('');
     expect(softLimitHint('2000000', undefined, '输入上限')).toBe('');
-    // ≤ 窗口 → 不提示
-    expect(softLimitHint('1000000', 1000000, '输入上限')).toBe('');
+    // 小于窗口 → 不提示
+    expect(softLimitHint('8192', 1000000, '输出上限')).toBe('');
     expect(softLimitHint('8192', null, '输出上限')).toBe('');
     // 非法/空值 → 不提示（硬校验另负责）
     expect(softLimitHint('', 1000000, '输出上限')).toBe('');
     expect(softLimitHint('abc', 1000000, '输出上限')).toBe('');
     expect(softLimitHint('0', 1000000, '输出上限')).toBe('');
+  });
+
+  it('modelMarkerHint（P2-5）：含 `[N]m/k` 尾标 → 「将自动移除 UI 标记后缀」；纯净/空 → 空串', async () => {
+    const { modelMarkerHint } = await import('../../src/ui/web/settings.js');
+    expect(modelMarkerHint('deepseek-v4-flash[1m]')).toBe('将自动移除 UI 标记后缀');
+    expect(modelMarkerHint('deepseek-v4-flash[100k]')).toBe('将自动移除 UI 标记后缀');
+    expect(modelMarkerHint('deepseek-v4-flash[1m][1M]')).toBe('将自动移除 UI 标记后缀');
+    expect(modelMarkerHint('deepseek-v4-flash')).toBe('');
+    expect(modelMarkerHint('')).toBe('');
+    expect(modelMarkerHint(null)).toBe('');
+  });
+});
+
+describe('friendlyWorkspacePath（P2-7）：HOME 前缀折叠为 ~', () => {
+  it('HOME 前缀（posix / win 分隔 / 大小写）→ ~/相对；未命中/空 → 原样', async () => {
+    const { friendlyWorkspacePath } = await import('../../src/ui/web/settings.js');
+    expect(friendlyWorkspacePath('/root/.devmate', '/root')).toBe('~/.devmate');
+    expect(friendlyWorkspacePath('/root/NJU/devmate', '/root')).toBe('~/NJU/devmate');
+    expect(friendlyWorkspacePath('C:\\Users\\u\\proj', 'C:\\Users\\u')).toBe('~\\proj');
+    expect(friendlyWorkspacePath('/tmp/x', '/root')).toBe('/tmp/x'); // 未命中 HOME → 原样
+    expect(friendlyWorkspacePath('', '/root')).toBe(''); // 空 → 空串（调用方占位兜底）
+    expect(friendlyWorkspacePath('/root/proj', undefined)).toBe('/root/proj'); // 无 home 信息 → 原样
   });
 });

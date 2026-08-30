@@ -84,6 +84,11 @@ export interface SubagentPool {
   spawn(task: SubagentTask): Promise<SubagentResult>;
   stats(): SubagentStats;
   dispose(): void;
+  /**
+   * 下一个 spawn 的成本估算（USD；P2-8 评审预算门的数据源）：池的 self-similar 假设
+   * 与 costGuardFires 同锚——最近一次实际成本（无历史 = 0——无先例即放行）。
+   */
+  nextCostEstimateUsd(): number;
 }
 
 /**
@@ -302,6 +307,7 @@ export function createSubagentPool(deps: SubagentPoolDeps): SubagentPool {
       const pending = queue.splice(0);
       for (const entry of pending) entry.resolve(rejectResult('disposed'));
     },
+    nextCostEstimateUsd: () => lastCostUsd,
   };
 }
 

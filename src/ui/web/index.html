@@ -720,7 +720,9 @@
               <div class="field-group">
                 <span class="field-label">工作区目录</span>
                 <code class="workspace-display" id="set-workspace">（由启动目录决定）</code>
-                <p class="field-help">仅展示确认；未显式选择时，工作目录由 DevMate 启动位置决定。</p>
+                <p class="field-help">
+                  仅展示确认；未显式选择时，工作目录由 DevMate 启动位置决定。
+                </p>
               </div>
             </div>
             <!-- Subagent 工作流：开关 + 并行数（0-8 步进；0 = 无上限（按需派遣）——
@@ -836,6 +838,7 @@
                   placeholder="deepseek-v4-flash"
                   autocomplete="off"
                 />
+                <p class="field-help warn" id="set-model-hint" hidden></p>
               </div>
               <div class="field-group">
                 <label for="set-max-input-tokens"

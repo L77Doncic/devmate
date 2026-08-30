@@ -38,6 +38,10 @@ import {
   skillInstallErrorText,
   normalizeSkillSource,
   installSkill,
+  skillRemoveConfirmText,
+  skillRemoveErrorText,
+  SKILL_DELETE_API_PREFIX,
+  removeSkill,
 } from '../../src/ui/web/extensions.js';
 
 /**
@@ -553,5 +557,76 @@ describe('normalizeSubagentPref 的下界（SUBAGENT_PARALLEL_MIN=0 = 无上限�
     expect(v.parallel).toBe(0);
     expect(v.parallel).toBeGreaterThanOrEqual(SUBAGENT_PARALLEL_MIN);
     expect(normalizeSubagentPref({ enabled: true, parallel: -5 }).parallel).toBe(0);
+  });
+});
+
+describe('技能卸载（P2-4：removeSkill / 确认与错误文案）', () => {
+  it('skillRemoveConfirmText：名称内联（trim；空名兜底「未知」）', () => {
+    expect(skillRemoveConfirmText('my-skill')).toBe(
+      '确认移除用户技能「my-skill」？其目录将被删除，不可恢复。',
+    );
+    expect(skillRemoveConfirmText('  空名  ')).toContain('「空名」');
+    expect(skillRemoveConfirmText(null)).toContain('「未知」');
+  });
+
+  it('removeSkill 成功：DELETE /api/skills/:id（encodeURIComponent）；回体 id → {ok:true,id}', async () => {
+    const calls: string[] = [];
+    const fetchImpl = asFetch(async (url: string, opts: unknown) => {
+      calls.push(url);
+      expect((opts as { method: string }).method).toBe('DELETE');
+      return okResponse({ ok: true, id: 'my-cool-skill' });
+    });
+    const r = await removeSkill('my-cool-skill', { fetchImpl });
+    expect(r).toEqual({ ok: true, id: 'my-cool-skill' });
+    expect(calls[0]).toBe(`${SKILL_DELETE_API_PREFIX}my-cool-skill`);
+    // 非法字符 id 也安全编码上行
+    await removeSkill('a b/c', { fetchImpl });
+    expect(calls[1]).toBe(`${SKILL_DELETE_API_PREFIX}a%20b%2Fc`);
+  });
+
+  it('removeSkill 失败（bundled 404「内置技能不可移除」/ 网络）→ {ok:false,error} 携带 status+data', async () => {
+    const r1 = await removeSkill('tdd', {
+      fetchImpl: asFetch(async () => errResponse(404, { error: '内置技能不可移除' })),
+    });
+    expect(r1.ok).toBe(false);
+    const err = r1.error as { status: number; data: { error: string } };
+    expect(err.status).toBe(404);
+    expect(err.data.error).toBe('内置技能不可移除');
+    // 网络异常：绝不 throw
+    const r2 = await removeSkill('x', {
+      fetchImpl: asFetch(async () => {
+        throw new TypeError('fetch failed');
+      }),
+    });
+    expect(r2.ok).toBe(false);
+    expect(r2.error).toBeInstanceOf(TypeError);
+    // 空 id：本地拦截（不发请求）
+    const r3 = await removeSkill('', { fetchImpl: asFetch(async () => okResponse({})) });
+    expect(r3.ok).toBe(false);
+  });
+
+  it('skillRemoveErrorText：服务端直读（内置技能不可移除）/ 404 通用 / 其余通用——文案零端点路径', () => {
+    expect(skillRemoveErrorText({ status: 404, data: { error: '内置技能不可移除' } })).toBe(
+      '内置技能不可移除',
+    );
+    expect(skillRemoveErrorText({ status: 404, data: { error: '' } })).toBe(
+      '技能不存在或已被移除（请重新扫描）',
+    );
+    expect(skillRemoveErrorText({ status: 404 })).toBe('技能不存在或已被移除（请重新扫描）');
+    expect(skillRemoveErrorText({ status: 500 })).toBe('移除失败，请稍后重试');
+    expect(skillRemoveErrorText(new TypeError('Failed to fetch'))).toBe('移除失败，请稍后重试');
+    // data.error 为唯一直读源：generic error.message 不冒充服务端文案（走通用/status 阶梯）
+    expect(skillRemoveErrorText({ message: '自定义服务端消息' })).toBe('移除失败，请稍后重试');
+    for (const text of [
+      skillRemoveErrorText({ status: 404, data: { error: '内置技能不可移除' } }),
+      skillRemoveErrorText({ status: 404 }),
+      skillRemoveErrorText({ status: 500 }),
+    ]) {
+      expect(text).not.toMatch(/\/api\//);
+    }
+  });
+
+  it('卸载端点常量 = 契约前缀', () => {
+    expect(SKILL_DELETE_API_PREFIX).toBe('/api/skills/');
   });
 });

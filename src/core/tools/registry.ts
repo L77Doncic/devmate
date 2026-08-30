@@ -20,7 +20,7 @@
  * 自定义 redactor 供测试与配置注入（同一函数作用于 content 与 error.message）。
  */
 import type { ToolCall } from '../../shared/session-types.js';
-import type { ToolDef, ToolRegistry, ToolResult } from '../loop/types.js';
+import type { ToolDef, ToolExecutionContext, ToolRegistry, ToolResult } from '../loop/types.js';
 import { redactSecrets } from './redact.js';
 
 export interface SecuredRegistryOptions {
@@ -38,8 +38,8 @@ export function securedRegistry(
     list(): readonly ToolDef[] {
       return registry.list();
     },
-    async execute(call: ToolCall): Promise<ToolResult> {
-      const result = await registry.execute(call);
+    async execute(call: ToolCall, context?: ToolExecutionContext): Promise<ToolResult> {
+      const result = await registry.execute(call, context);
       const content = redactor(result.content);
       if (result.error === undefined) {
         return { ok: result.ok, content };

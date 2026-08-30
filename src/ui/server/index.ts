@@ -75,7 +75,7 @@ import { randomUUID } from 'node:crypto';
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from 'node:http';
 import type { Socket } from 'node:net';
 import type { Dirent } from 'node:fs';
-import { cp, mkdir, readFile, readdir, realpath, stat, writeFile } from 'node:fs/promises';
+import { cp, mkdir, readFile, readdir, realpath, rm, stat, writeFile } from 'node:fs/promises';
 import { homedir } from 'node:os';
 import { basename, dirname, extname, isAbsolute, join, normalize, resolve, sep } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -90,6 +90,7 @@ import type {
   RunResult,
   RunStats,
   ToolDef,
+  ToolExecutionContext,
   ToolRegistry,
   ToolResult,
 } from '../../core/loop/index.js';
@@ -363,6 +364,18 @@ export interface DevmateServerDeps {
   /** 空闲 shell 释放：服务端每 idleSweepMs 调 disposeIdleShells(Date.now(), activeRunSessions)；
    * 实现按 idleShellTtlMs 判超时且**跳过活跃 run 会话**（TTL 误杀修复——运行中 shell 不回收）。 */
   disposeIdleShells?: (now: number, activeSessionIds?: ReadonlySet<string>) => Promise<void> | void;
+  /**
+   * 终止某会话当前执行中的 run_command（P2-3 停止杀命令树）：POST /api/interrupt
+   * 时由服务端调用——杀进程组 + 该次执行以 interrupted 收尾（partial 输出回注）。
+   * 无活动命令 → false（幂等不误杀）。缺省未注入 = 不杀（回落信号路径）。
+   */
+  killActiveCommand?: (sessionId: string) => boolean;
+  /**
+   * 一次评审的成本估算（USD；P2-8 评审预算门的数据源——哨兵注入前比对
+   * maxReviewCostUsd 缺省 0.02）。真实装配 = 子代理池 self-similar 下一次成本锚；
+   * 缺省未注入 = 预算门关闭（从不因预算跳过）。
+   */
+  reviewCostEstimate?: () => number;
   /** 空闲 shell TTL（ms；缺省 600_000——deps 装配层消费，服务端仅透传形状）。 */
   idleShellTtlMs?: number;
   /** Skills 资产目录（缺省 resolve(process.cwd(),'dist/assets/skills')）；不存在/为空 → GET /api/skills 空列表。 */
@@ -789,8 +802,8 @@ function recordReviewStats(ctx: SessionCtx, call: ToolCall, result: ToolResult):
 function observeRegistry(inner: ToolRegistry, ctx: SessionCtx): ToolRegistry {
   return {
     list: () => inner.list(),
-    async execute(call: ToolCall) {
-      const result = await inner.execute(call);
+    async execute(call: ToolCall, context?: ToolExecutionContext) {
+      const result = await inner.execute(call, context);
       recordReviewStats(ctx, call, result);
       ctx.executed.add(call.id);
       ctx.broker.push({
@@ -1906,6 +1919,11 @@ export function createDevmateServer(deps: DevmateServerDeps): DevmateServer {
       // P2-10 评审静默：池未启用（subagents-disabled）→ 哨兵静默跳过（loop 层裁决）——
       // 不再指示模型触发必然失败的子代理尝试；UI 侧至多一行提示
       subagentAvailable: () => workflowState.subagentsEnabled,
+      // P2-8 评审预算门：deps 注入估算（池 self-similar 下一次成本）→ 哨兵注入前比对
+      // maxReviewCostUsd（缺省 0.02）——超限跳过注入 + 一行系统注记（loop 层裁决）
+      ...(deps.reviewCostEstimate !== undefined
+        ? { reviewCostEstimate: deps.reviewCostEstimate }
+        : {}),
     };
   }
 
@@ -2288,7 +2306,12 @@ export function createDevmateServer(deps: DevmateServerDeps): DevmateServer {
     if (ctx?.active !== true || ctx.controller === null) {
       throw new HttpError(409, 'session is not running');
     }
+    // P2-3 停止杀命令树：run 在排队的命令可能正挂在常驻 shell（sleep-30 等）——
+    // 立即经 killActiveCommand 杀该会话活动命令的整棵进程组（interrupted 收尾 +
+    // 已捕获输出回注）；随后 abort 让 run 循环按 user-interrupted 收敛。
+    // killActiveCommand 无活动命令返回 false（幂等不误杀；信号路径仍兜底）。
     ctx.controller.abort();
+    deps.killActiveCommand?.(sessionId);
     sendJson(res, 200, { ok: true });
   }
 
@@ -2873,6 +2896,36 @@ export function createDevmateServer(deps: DevmateServerDeps): DevmateServer {
     }
   }
 
+  /**
+   * 卸载（P2-4 · UX 终版裁决）：DELETE /api/skills/:id——**仅 user 源**可删：
+   * 删 <userSkillsDir>/<id> 整目录 + 用户索引失效（后续 list/content 即时反映，
+   * 无需重启）+ 开关键清理（skillsSwitches 摘除该 id 并持久化快照）。
+   * bundled → 404「内置技能不可移除」（不删打包资产——构建态只读语义）；
+   * 未知 id → 404（与 toggle 同判型）。删除对 use_skill 生效唯一来源 = 索引失效。
+   */
+  async function handleSkillDelete(res: ServerResponse, rawId: string): Promise<void> {
+    const id = decodeSegment(rawId);
+    const index = await ensureSkillsIndex();
+    const skill = index.find((item) => item.id === id);
+    if (skill === undefined) {
+      throw new HttpError(404, `unknown skill: ${id}`);
+    }
+    if (skill.origin === 'bundled') {
+      throw new HttpError(404, '内置技能不可移除');
+    }
+    try {
+      await rm(join(userSkillsDir, id), { recursive: true, force: true });
+    } catch (err) {
+      throw new HttpError(500, `write failed: ${errorCodeOf(err)}`);
+    }
+    userSkillsCache = null; // 索引失效：list()/content()（含 attach 的工具索引）立即反映
+    // 开关键清理：delete() 摘除记录、快照持久化（switch 未记录过 → 无需落盘扰动）
+    if (skillsSwitches.delete(id) && deps.saveSkillsConfig !== undefined) {
+      await deps.saveSkillsConfig(await skillsSnapshot());
+    }
+    sendJson(res, 200, { ok: true, id });
+  }
+
   // -- 工作流（A2）与 MCP（A3）：均为配置层（子代理/MCP 实际执行属 P2，端点上只有配置） --
   // maxParallel 归一到 0-8（0 = 无上限；单一来源：shared/workflow 的 clampMaxParallel）
   const workflowState = {
@@ -3178,7 +3231,7 @@ export function createDevmateServer(deps: DevmateServerDeps): DevmateServer {
     return providerPresetOfBaseUrl(baseUrl).contextWindowTokens;
   }
 
-  function settingsResponse(): {
+  function settingsResponse(workspaceDir?: string): {
     baseUrl: string;
     model: string;
     apiKey?: string;
@@ -3196,6 +3249,7 @@ export function createDevmateServer(deps: DevmateServerDeps): DevmateServer {
     permissionConfirmedAt?: number;
     methodFirst: boolean;
     reviewMode: boolean;
+    workspaceDir?: string;
   } {
     const response: {
       baseUrl: string;
@@ -3215,6 +3269,7 @@ export function createDevmateServer(deps: DevmateServerDeps): DevmateServer {
       permissionConfirmedAt?: number;
       methodFirst: boolean;
       reviewMode: boolean;
+      workspaceDir?: string;
     } = {
       baseUrl: current.baseUrl,
       model: current.model,
@@ -3251,12 +3306,47 @@ export function createDevmateServer(deps: DevmateServerDeps): DevmateServer {
     if (current.permissionConfirmedAt !== undefined) {
       response.permissionConfirmedAt = current.permissionConfirmedAt;
     }
+    // P2-7 工作区目录：设置页「常规·工作区目录」的显示路径（当前会话/默认根的友好回显；
+    // 未注入根 → 不带键——UI 以「（由启动目录决定）」占位兜底）
+    if (workspaceDir !== undefined) response.workspaceDir = workspaceDir;
     return response;
+  }
+
+  /**
+   * 会话登记的根（GET /api/settings?sessionId= 的数据源）：扫描事件流首个
+   * session-workspace meta（与装配层 workspaceRootOf 同口径——无 meta = 缺省根）；
+   * 会话不存在/读失败同样回退缺省根（不惊扰设置页回显）。
+   */
+  async function registeredWorkspaceRoot(sessionId: string): Promise<string | undefined> {
+    try {
+      for await (const ev of deps.store.events(sessionId)) {
+        const root = sessionWorkspaceOf(ev);
+        if (root !== null) return root;
+      }
+    } catch {
+      // 会话不存在/读取失败 → 回退缺省根（fail-closed 同装配层语义）
+    }
+    return deps.workspaceRoot;
   }
 
   async function handleSettings(req: IncomingMessage, res: ServerResponse): Promise<void> {
     if (req.method === 'GET') {
-      sendJson(res, 200, settingsResponse());
+      // P2-7 工作区目录回显：可选 sessionId 查询参数（设置抽屉打开时当前会话）→
+      // 该会话登记的根（session-workspace meta）；无 meta/未带会话 → 默认根
+      // （deps.workspaceRoot——「由启动目录决定」的实义化：默认即注册表根）。
+      let workspaceDir: string | undefined;
+      const sessionId = new URL(req.url ?? '/', `http://${HOST}`).searchParams.get('sessionId');
+      if (sessionId !== null && sessionId !== '') {
+        try {
+          assertValidSessionId(sessionId);
+        } catch {
+          throw new HttpError(400, 'invalid session id');
+        }
+        workspaceDir = await registeredWorkspaceRoot(sessionId);
+      } else {
+        workspaceDir = deps.workspaceRoot;
+      }
+      sendJson(res, 200, settingsResponse(workspaceDir));
       return;
     }
     const body = await readJson(req);
@@ -3697,6 +3787,10 @@ export function createDevmateServer(deps: DevmateServerDeps): DevmateServer {
     }
     if (method === 'POST' && pathname.startsWith('/api/skills/')) {
       return handleSkillToggle(req, res, pathname.slice('/api/skills/'.length));
+    }
+    // 卸载端点（P2-4 技能卸载）：DELETE /api/skills/:id——仅 user 源可删（bundled 404）
+    if (method === 'DELETE' && pathname.startsWith('/api/skills/')) {
+      return handleSkillDelete(res, pathname.slice('/api/skills/'.length));
     }
     if ((method === 'GET' || method === 'POST') && pathname === '/api/workflow') {
       return handleWorkflow(req, res);

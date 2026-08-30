@@ -55,12 +55,14 @@ import type {
   RunResult,
   RunStatus,
   ToolDef,
+  ToolExecutionContext,
   ToolRegistry,
   ToolResult,
 } from './types.js';
 import {
   DEFAULT_COST_LIMIT_USD,
   DEFAULT_MAX_FORMAT_ERRORS,
+  DEFAULT_MAX_REVIEW_COST_USD,
   DEFAULT_MAX_TOKENS,
   DEFAULT_PRICING,
   DEFAULT_TOOL_TIMEOUT_MS,
@@ -93,6 +95,15 @@ export const REVIEW_SENTINEL_USER_CONTENT =
 export const TRUNCATION_HINT_USER_CONTENT =
   '【输出截断提示】上次回复因输出上限（max_tokens）被截断（finish_reason: length）。' +
   '请用更简洁的方式回答：减少复述与详细展开，直接给出结论与最小必要内容。';
+
+/**
+ * 评审预算超过上限时注入的一行系统注记（P2-8 · UX 终版裁决）：
+ * 措辞契约（测试锚点）：「本轮未派独立评审（评审预算 $<预算> 内：超支风险）」。
+ * 预算格式化固定两位小数（$0.02 / $0.10…）——默认预算缺省 0.02。
+ */
+export function reviewBudgetSkipNote(maxUsd: number): string {
+  return `本轮未派独立评审（评审预算 $${maxUsd.toFixed(2)} 内：超支风险）`;
+}
 
 export async function run(input: RunInput, opts: RunOptions): Promise<RunResult> {
   const pricing = opts.pricing ?? DEFAULT_PRICING;
@@ -602,6 +613,27 @@ async function maybeInjectReviewSentinel(deps: TurnDeps): Promise<boolean> {
     return false;
   }
   if (!substantive || hasReview || flagged) return false;
+  // P2-8 评审预算门：哨兵注入前查池/成本（估算）——一次评审的估算成本 > 预算
+  // （maxReviewCostUsd ?? 0.02 缺省）→ 跳过注入（不置位护栏——预算内容许后仍可再试）
+  // + 一行系统注记（自然结束，不再续跑）。估算故障（抛错）按「无预算信息」处理——
+  // 继续注入（门故障不放大为行为故障）；估算缺省 undefined = 门关闭。
+  if (gate.reviewCostEstimate !== undefined) {
+    let estimate = 0;
+    try {
+      estimate = gate.reviewCostEstimate();
+    } catch {
+      estimate = 0; // 估算故障：按无预算信息（不因护栏故障丢评审）
+    }
+    const budget = gate.maxReviewCostUsd ?? DEFAULT_MAX_REVIEW_COST_USD;
+    if (estimate > budget) {
+      await deps.store.append(deps.sessionId, {
+        kind: 'user',
+        payload: { content: reviewBudgetSkipNote(budget) },
+        meta: { system: true },
+      });
+      return false;
+    }
+  }
   try {
     gate.markFlagged(deps.sessionId);
   } catch {
@@ -719,10 +751,13 @@ async function evaluateCall(call: ToolCall, deps: TurnDeps): Promise<CallOutcome
   }
   // 执行前最后一道中断检查：校验/审批完成但尚未触达工具层即断 → 该调用如实判 skipped
   if (interruptedMaybe(deps.signal)) return { kind: 'skipped', call };
-  // 执行：失败/超时也是普通结果（绝不因工具失败崩进程）
+  // 执行：失败/超时也是普通结果（绝不因工具失败崩进程）。运行时上下文现传
+  // （P2-3：signal 途经 registry 合并到工具——常驻 shell 中断即杀命令树 + partial 回注）
   let result: ToolResult;
+  const toolContext: ToolExecutionContext = { sessionId: deps.sessionId };
+  if (deps.signal !== undefined) toolContext.signal = deps.signal;
   try {
-    result = await withTimeout(deps.tools.execute(call), deps.toolTimeoutMs);
+    result = await withTimeout(deps.tools.execute(call, toolContext), deps.toolTimeoutMs);
   } catch (err) {
     result =
       err instanceof ToolTimeoutError

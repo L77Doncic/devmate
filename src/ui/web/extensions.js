@@ -13,6 +13,10 @@
  *                               write-failed（5xx）；
  *                               错误映射 = skillInstallErrorText（kind 白名单 → 中文 +
  *                               status 阶梯兜底），installSkill 绝不 throw
+ * - DELETE /api/skills/:id    → 卸载（P2-4；仅 user 源可删——bundled 服务端 404
+ *                               「内置技能不可移除」；成功 200 {ok:true, id}）；
+ *                               错误映射 = skillRemoveErrorText（服务端直读 + 404 阶梯），
+ *                               removeSkill 绝不 throw
  * - GET  /api/mcp             → { servers: [{ name, command?, enabled }] }（裸数组亦可；
  *                               status 字段服务端若下发也宽容接受 —— 前端按 enabled 渲染徽章，
  *                               契约不依赖 status）
@@ -275,6 +279,67 @@ export function skillInstallErrorText(error) {
 /** 来源输入归一：trim；空串 = 未填写（按钮禁用 + 提交前再拦一次）。 */
 export function normalizeSkillSource(text) {
   return typeof text === 'string' ? text.trim() : '';
+}
+
+// ---- 技能卸载（P2-4：DELETE /api/skills/:id；仅 user 源可删——bundled 服务端 404 直拒） ----
+
+/** 卸载端点前缀（与 SKILL_INSTALL_API_URL 同纪律：常量单一来源，文案零端点路径）。 */
+export const SKILL_DELETE_API_PREFIX = '/api/skills/';
+
+/** 确认弹窗文案（与删除会话同规：危险色 + 「不可恢复」）。 */
+export function skillRemoveConfirmText(name) {
+  return `确认移除用户技能「${typeof name === 'string' && name.trim() !== '' ? name.trim() : '未知'}」？其目录将被删除，不可恢复。`;
+}
+
+/** 服务端卸载错误直读（返回 string | null；data.error 唯一权威——如「内置技能不可移除」）。 */
+function skillRemoveServerMessage(error) {
+  const data = error && typeof error === 'object' ? (error.data ?? {}) : {};
+  if (
+    typeof data === 'object' &&
+    data !== null &&
+    typeof data.error === 'string' &&
+    data.error !== ''
+  ) {
+    return data.error;
+  }
+  return null;
+}
+
+/**
+ * 卸载错误 → 文案阶梯：服务端直读（bundled 404 「内置技能不可移除」等——单一来源）
+ * → 404 未知/已移除 → 其余通用。绝不 throw；文案零端点路径。
+ * @param {unknown} error
+ * @returns {string}
+ */
+export function skillRemoveErrorText(error) {
+  const server = skillRemoveServerMessage(error);
+  if (server !== null) return server;
+  const status = typeof error?.status === 'number' ? error.status : null;
+  if (status === 404) return '技能不存在或已被移除（请重新扫描）';
+  return '移除失败，请稍后重试';
+}
+
+/**
+ * 卸载技能：DELETE /api/skills/:id。成功 → {ok:true, id}；失败（含 404/网络）→
+ * {ok:false, error}——错误原样带 status/data（skillRemoveErrorText 的输入面）。绝不 throw。
+ * @param {string} id
+ * @param {{fetchImpl?: typeof fetch}} [opts]
+ * @returns {Promise<{ok: boolean, id?: string|null, error?: unknown}>}
+ */
+export async function removeSkill(id, { fetchImpl = globalThis.fetch } = {}) {
+  if (typeof id !== 'string' || id === '') {
+    return { ok: false, error: { message: '技能标识缺失' } };
+  }
+  try {
+    const res = await fetchJson(`${SKILL_DELETE_API_PREFIX}${encodeURIComponent(id)}`, {
+      method: 'DELETE',
+      fetchImpl,
+    });
+    const got = res && typeof res === 'object' && typeof res.id === 'string' ? res.id : null;
+    return { ok: true, id: got };
+  } catch (error) {
+    return { ok: false, error };
+  }
 }
 
 /**

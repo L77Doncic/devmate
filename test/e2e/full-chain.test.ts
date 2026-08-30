@@ -490,6 +490,7 @@ describe('E2E-C：subagent 与技能（假池经 createSessionToolsFactory 注�
         rejected: 0,
       }),
       dispose: () => undefined,
+      nextCostEstimateUsd: () => 0,
     };
   }
 
@@ -756,7 +757,11 @@ describe('E2E-D：全程无泄漏（api key 掩码 · 内存统计字段）', ()
 
     // POST 触碰到新密钥 → 响应即掩码；GET 再读仍掩码；全文无原文
     const SECRET = 'sk-SUPERSECRET-0123456789';
-    const posted = await postJson(base, '/api/settings', { apiKey: SECRET, maxInputTokens: 4096, maxOutputTokens: 2048 });
+    const posted = await postJson(base, '/api/settings', {
+      apiKey: SECRET,
+      maxInputTokens: 4096,
+      maxOutputTokens: 2048,
+    });
     expect(posted.status).toBe(200);
     const postedBody = JSON.stringify(await posted.json());
     expect(postedBody).toContain('sk-S****6789');
@@ -904,7 +909,9 @@ describe('E2E-G：模型名尾标注全链净化（GET/POST 净化名 + 窗口�
 
   beforeEach(async () => {
     dir = await mkdtemp(join(tmpdir(), 'devmate-e2e-g-'));
-    fake = new FakeLlm([{ content: 'ok', usage: { promptTokens: 2, completionTokens: 1, totalTokens: 3 } }]);
+    fake = new FakeLlm([
+      { content: 'ok', usage: { promptTokens: 2, completionTokens: 1, totalTokens: 3 } },
+    ]);
     deps = await assembleDeps({
       workspaceRoot: dir,
       sessionsDir: join(dir, 'sessions'),
@@ -1059,9 +1066,7 @@ describe('E2E-H：附件管线全链（assembleDeps + AttachmentStore + FakeLlm 
     // ③ FakeLlm 收展开 dataURL（真实 resolver 读文件 + wire 放行）
     expect(fake.requests).toHaveLength(1);
     const firstUser = fake.requests[0]!.messages.find((m) => m.role === 'user');
-    expect(
-      (firstUser as unknown as { content: Array<Record<string, unknown>> }).content,
-    ).toEqual([
+    expect((firstUser as unknown as { content: Array<Record<string, unknown>> }).content).toEqual([
       { type: 'text', text: '描述图片' },
       { type: 'image_url', image_url: { url: PNG_DATAURL }, width: 8, height: 8 },
     ]);

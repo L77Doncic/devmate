@@ -58,6 +58,8 @@ import {
   saveReviewMode,
   tokenLimitError,
   softLimitHint,
+  modelMarkerHint,
+  friendlyWorkspacePath,
 } from './settings.js';
 import {
   PERMISSION_VALUES,
@@ -86,6 +88,8 @@ import {
   normalizeParallel,
   parallelLabelText,
   normalizeSkillsList,
+  removeSkill,
+  skillRemoveErrorText,
   normalizeMcpServers,
   splitMcpArgs,
   SKILL_INSTALL_BUSY,
@@ -305,6 +309,8 @@ const ui = {
   sessionsLoaded: false,
   sessionItems: [],
   pendingDelete: null,
+  // P2-4 技能卸载：待确认的技能（id + name；复用删除确认 modal——confirmModalOk 分派）
+  pendingRemove: null,
   confirmOpen: false,
   foldEl: null,
   // S14：多工作区（dsh WorkspaceBrowser / WorkspacePickFlow 语义）——
@@ -486,6 +492,8 @@ const el = {
   drawerScrim: document.getElementById('settings-scrim'),
   setBaseUrl: document.getElementById('set-baseurl'),
   setModel: document.getElementById('set-model'),
+  // P2-5：模型名尾标实时提示（失焦/防抖后行内显示「将自动移除 UI 标记后缀」）
+  setModelHint: document.getElementById('set-model-hint'),
   setKey: document.getElementById('set-key'),
   setMaxInputTokens: document.getElementById('set-max-input-tokens'),
   setMaxOutputTokens: document.getElementById('set-max-output-tokens'),
@@ -747,6 +755,8 @@ function toggleSidebar() {
 
 let sidebarPointerInside = false;
 let sidebarLingerTimer = 0;
+/** P2-5 模型名尾标提示的 input 防抖计时器（300ms；blur 即时清除）。 */
+let modelHintTimer = 0;
 
 function armLinger() {
   if (sidebarLingerTimer !== 0) return;
@@ -1768,16 +1778,54 @@ async function newSession(workspaceRoot = null) {
 function requestDeleteSession(s) {
   if (ui.confirmOpen) return;
   ui.pendingDelete = s;
+  ui.pendingRemove = null; // 打开即清另一路待确认（confirm modal 复用，收口单一）
   ui.confirmOpen = true;
   el.confirmText.textContent = `确认删除会话「${sessionDisplayTitle(s, shortId)}」？不可恢复。`;
+  el.btnConfirmOk.textContent = '确认删除';
   el.confirmScrim.hidden = false;
   el.confirm.hidden = false;
   el.btnConfirmOk.focus();
 }
 
+/** P2-4 技能卸载：requestRemoveSkill → 确认 modal（同删除会话风格：危险色 + 「不可恢复」）→
+ *  confirmRemoveSkill 执行 DELETE。 */
+function requestRemoveSkill(item) {
+  if (ui.confirmOpen) return;
+  ui.pendingDelete = null;
+  ui.pendingRemove = { id: item.id, name: item.name };
+  ui.confirmOpen = true;
+  el.confirmText.textContent = `确认移除用户技能「${item.name}」？其目录将被删除，不可恢复。`;
+  el.btnConfirmOk.textContent = '确认移除';
+  el.confirmScrim.hidden = false;
+  el.confirm.hidden = false;
+  el.btnConfirmOk.focus();
+}
+
+/** 确认 modal 的 OK 分派（删除会话 / 移除技能——复用同一 modal，pending 判别）。 */
+async function confirmModalOk() {
+  if (ui.pendingRemove !== null) await confirmRemoveSkill();
+  else await confirmDeleteSession();
+}
+
+async function confirmRemoveSkill() {
+  const pending = ui.pendingRemove;
+  closeConfirmModal();
+  if (pending === null) return;
+  const result = await removeSkill(pending.id);
+  if (result.ok) {
+    toast(result.id ? `已移除 ${result.id}` : '已移除技能');
+  } else {
+    // 文案单一来源 = extensions.skillRemoveErrorText（服务端直读：bundled → 内置技能不可移除）
+    toast(`移除失败：${skillRemoveErrorText(result.error)}`, 'warn');
+  }
+  void loadSkills();
+}
+
 function closeConfirmModal() {
   ui.confirmOpen = false;
   ui.pendingDelete = null;
+  ui.pendingRemove = null;
+  el.btnConfirmOk.textContent = '确认删除'; // 文案复位（技能移除开口后恢复删除文案）
   el.confirm.hidden = true;
   el.confirmScrim.hidden = true;
 }
@@ -4205,9 +4253,10 @@ async function openSettings() {
   el.drawer.hidden = false;
   el.drawerScrim.hidden = false;
   el.settingsStatus.textContent = '';
-  // 打开时总重读服务端（含掩码态）：「保存后只回掩码」在页面上可见
+  // 打开时总重读服务端（含掩码态）：「保存后只回掩码」在页面上可见；
+  // P2-7 工作区目录：带当前会话（服务端回该会话登记的根——无会话/默认根回退兜底）
   try {
-    const s = await loadSettings();
+    const s = await loadSettings({ sessionId: ui.sessionId ?? undefined });
     ui.settings = { ...ui.settings, ...s };
     ui.settingsReady = true;
     noticeModelAutoCorrection(); // A 档：存量模型名带 UI 尾标 → 净化回显 + 提示一次
@@ -4279,6 +4328,12 @@ function showFieldError(node, message) {
   node.textContent = message;
 }
 
+/** P2-5 模型名尾标实时提示：输入含 `[N]m/k` UI 标记后缀 → 行内「将自动移除 UI 标记后缀」；
+ *  不含/空 → 无提示。失焦与 input 防抖（300ms）都经此——不静默「魔法」，保存前用户即知。 */
+function showModelMarkerHint() {
+  showFieldError(el.setModelHint, modelMarkerHint(el.setModel.value));
+}
+
 async function saveSettingsForm() {
   const baseUrl = el.setBaseUrl.value.trim();
   const model = el.setModel.value.trim();
@@ -4315,17 +4370,18 @@ async function saveSettingsForm() {
     syncModelCombo();
     render(store.snapshot()); // 当前视图重渲染（hero/顶栏/composer/meter 全量收口）
     fillSettingsForm();
-    // S 档钳制提示（ADR-0016）：保存响应 clamped → toast 「已按 <model> 上限钳制为 N」
-    // （回显已套钳后值——保存即生效，不静默）
+    // S 档钳制提示（ADR-0016 · P2-6 措辞修正）：保存响应 clamped → toast
+    // 「已按 <model> 上限钳制为 N」（去掉「（当前值）」冗余——保留「已按 <model>
+    // 上限钳制为 N」单一形状；回显已套钳后值——保存即生效，不静默）
     const clampedNotes = [];
     if (saved.maxOutputTokensClamped === true) {
-      clampedNotes.push(`输出上限钳制为 ${saved.maxOutputTokens}`);
+      clampedNotes.push(`已按 ${saved.model || '模型'} 上限钳制为 ${saved.maxOutputTokens}`);
     }
     if (saved.maxInputTokensClamped === true) {
-      clampedNotes.push(`输入上限钳制为 ${saved.maxInputTokens}`);
+      clampedNotes.push(`已按 ${saved.model || '模型'} 上限钳制为 ${saved.maxInputTokens}`);
     }
     if (clampedNotes.length > 0) {
-      toast(`已按 ${saved.model || '模型'} 上限钳制：${clampedNotes.join('；')}`);
+      toast(clampedNotes.join('；'));
     } else {
       toast('设置已保存');
     }
@@ -4339,6 +4395,8 @@ function fillSettingsForm() {
   el.setBaseUrl.value = ui.settings.baseUrl || DEFAULT_SETTINGS.baseUrl;
   // A 档：模型名回显=净化值（服务端 GET 已净化；normalize 双保险——残留尾标被剥离）
   el.setModel.value = ui.settings.model || DEFAULT_SETTINGS.model;
+  // P2-5 模型名尾标提示：回显恒为净化值 → 清除行内提示
+  showFieldError(el.setModelHint, '');
   // A/B 档：输入/输出上限回显（服务端 GET 恒回显——存量缺失回填缺省；
   // null（数据未到/坏值）→ 空串，必填校验随即红字+禁存，不做静默留空）
   el.setMaxInputTokens.value =
@@ -4346,18 +4404,19 @@ function fillSettingsForm() {
   el.setMaxOutputTokens.value =
     ui.settings.maxOutputTokens !== null ? String(ui.settings.maxOutputTokens) : '';
   syncTokenLimitValidity(); // B 档：必填态随回显即算（红字/禁存随值）
-  // S 档钳制注记（ADR-0016）：GET/POST 回执 *Clamped=true → 提示「已按 <model> 上限钳制为 N」
+  // S 档钳制注记（ADR-0016 · P2-6）：GET/POST 回执 *Clamped=true → 提示
+  // 「已按 <model> 上限钳制为 N」（去掉「（当前值）」冗余——措辞与 toast 一致）
   //（覆盖窗口软提示——保存值即钳后值；用户再编辑则回到软提示/硬校验）
   if (ui.settings.maxOutputTokensClamped === true) {
     showFieldError(
       el.setMaxOutputTokensHint,
-      `已按 ${ui.settings.model || '模型'} 上限钳制为 ${ui.settings.maxOutputTokens}（当前值）`,
+      `已按 ${ui.settings.model || '模型'} 上限钳制为 ${ui.settings.maxOutputTokens}`,
     );
   }
   if (ui.settings.maxInputTokensClamped === true) {
     showFieldError(
       el.setMaxInputTokensHint,
-      `已按 ${ui.settings.model || '模型'} 上限钳制为 ${ui.settings.maxInputTokens}（当前值）`,
+      `已按 ${ui.settings.model || '模型'} 上限钳制为 ${ui.settings.maxInputTokens}`,
     );
   }
   // B 档：缺省回填提示（GET 回体 *Default=true → 「已用默认，请修改保存」——不静默；
@@ -4366,9 +4425,12 @@ function fillSettingsForm() {
     el.settingsStatus.textContent = '输入/输出上限已用默认值，请修改并保存';
     el.settingsStatus.className = 'drawer-status';
   }
-  // 工作区目录：服务端未提供时按「由启动目录决定」占位（显示字段，不可改）——
-  // P2-5 净化：不再出现「服务端未提供」内部语
-  el.setWorkspace.textContent = ui.settings.workspaceDir || '（由启动目录决定）';
+  // P2-7 工作区目录：服务端回显当前会话/默认根的路径（友好化）；不可得 →
+  // 「（由启动目录决定）」占位（显示字段，不可改）。
+  const workspacePath = ui.settings.workspaceDir
+    ? friendlyWorkspacePath(ui.settings.workspaceDir)
+    : '';
+  el.setWorkspace.textContent = workspacePath || '（由启动目录决定）';
   if (ui.settings.keyConfigured) {
     el.keyState.textContent = `已配置 · 掩码 ${ui.settings.apiKeyMasked || '****'}`;
     el.keyState.className = 'field-help key-state';
@@ -4513,6 +4575,16 @@ function renderSkillList(skills) {
       badge.textContent = '用户';
       badge.title = '本机安装的用户技能';
       li.appendChild(badge);
+      // P2-4 技能卸载：user 行「移除」危险按钮（bundled 不显示——服务端 404 双保险；
+      // 点击 → 确认 modal → DELETE /api/skills/:id）
+      const rm = document.createElement('button');
+      rm.type = 'button';
+      rm.className = 'btn btn-sm btn-danger';
+      rm.textContent = '移除';
+      rm.dataset.skillRemove = s.id;
+      rm.dataset.skillName = s.name;
+      rm.setAttribute('aria-label', `移除用户技能：${s.name}`);
+      li.appendChild(rm);
     }
     const sw = document.createElement('label');
     sw.className = 'switch';
@@ -5050,7 +5122,7 @@ function wireEvents() {
   el.btnWsRemoveCancel.addEventListener('click', closeWsRemove);
   el.wsRemoveScrim.addEventListener('click', closeWsRemove);
   el.btnConfirmOk.addEventListener('click', () => {
-    void confirmDeleteSession();
+    void confirmModalOk(); // P2-4：删除会话 / 移除技能 分派
   });
   el.btnConfirmCancel.addEventListener('click', closeConfirmModal);
   el.confirmScrim.addEventListener('click', closeConfirmModal);
@@ -5070,8 +5142,24 @@ function wireEvents() {
     else if (action === 'skill-install') void submitSkillInstall();
     else if (action === 'skill-rescan') rescanSkills();
   });
+  // P2-4 技能卸载：user 行「移除」按钮 → 确认 modal（dataset 直接命中，无 set-action 包装）
+  el.drawer.addEventListener('click', (e) => {
+    const btn = e.target.closest('[data-skill-remove]');
+    if (btn instanceof Element) {
+      requestRemoveSkill({
+        id: btn.dataset.skillRemove,
+        name: btn.dataset.skillName || btn.dataset.skillRemove,
+      });
+    }
+  });
   // 技能安装输入：非空即解锁安装钮（提交前仍有一次空串拦截）
   el.skillInstallSource.addEventListener('input', syncSkillInstallButton);
+  // P2-5 模型名尾标提示：失焦即时 + 输入防抖 300ms（不静默净化「魔法」）
+  el.setModel.addEventListener('blur', showModelMarkerHint);
+  el.setModel.addEventListener('input', () => {
+    window.clearTimeout(modelHintTimer);
+    modelHintTimer = window.setTimeout(showModelMarkerHint, 300);
+  });
   // 模型·思考强度 combo：点击开菜单；模型行（只读）点击 = 直达设置（跳「模型接口」）
   el.modelCombo.addEventListener('click', () => {
     toggleModelMenu();

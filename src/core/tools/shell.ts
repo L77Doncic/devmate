@@ -276,6 +276,12 @@ export interface ShellToolOptions {
 export interface PersistentShell {
   /** run_command 工具（Tool = loop 契约；ctx.sessionId 隔离 shell 实例）。 */
   tool: Tool;
+  /**
+   * 终止某会话**当前执行中**的命令（P2-3 停止杀命令树）：杀整棵进程组
+   * （活动命令 + 常驻 shell）+ 该次执行以 interrupted 收尾（已捕获输出全会回注）。
+   * 无活动命令（队列空闲/命令已收尾）→ false（无副作用——不误杀空闲会话）。
+   */
+  killActiveCommand(sessionId: string): boolean;
   /** 杀掉全部会话的整棵进程树并释放（幂等）。 */
   dispose(): Promise<void>;
 }
@@ -319,6 +325,15 @@ interface ShellSession {
   markerDir: string;
   /** 每会话串行队列（并发度 1，§8D）。 */
   queue: Promise<void>;
+  /**
+   * 活动命令的终止控制器（P2-3 停止杀命令树）：命令执行期非 null——killActiveCommand
+   * `abort()` 即令 waitForCompletion 以 'interrupted' 收尾（已采集输出回注）。临时记录。
+   */
+  currentKill: AbortController | null;
+  /** 活动命令的子进程 pid（killActiveCommand 的记录目标；无活动命令 = null）。临时记录。 */
+  activePid: number | null;
+  /** 外部击杀标志（killActiveCommand 置位；下一次命令开始时清除）。临时记录。 */
+  killed: boolean;
 }
 
 /** 一次执行的采集/状态：完成标记 + 已定稿输出 + 截断信息。 */
@@ -1017,6 +1032,7 @@ async function runAttempt(
     session.spawnError = null;
     session.trackedCwd = opts.workspaceRoot;
     session.anchor = null; // 重开即新规范拼写（由首标记重学）
+    session.killed = false; // 外部击杀标志随本轮复活而重启（临时记录）
     restarted = session.spawnedOnce;
     session.spawnedOnce = true;
     wireChild(session, child);
@@ -1097,7 +1113,26 @@ async function runAttempt(
       );
     }
 
-    const outcome = await waitForCompletion(collector, child, markerPath, token, timeoutMs, signal);
+    // 活动命令记录（P2-3 killActiveCommand 的挂点：activePid + 终止控制器 + killed 标志；
+    // 临时记录——命令收尾即清；killActiveCommand 触发的 interrupted 收尾由本次等待消费）。
+    const commandKill = new AbortController();
+    session.activePid = child.pid ?? null;
+    session.currentKill = commandKill;
+    let outcome: RunOutcome;
+    try {
+      outcome = await waitForCompletion(
+        collector,
+        child,
+        markerPath,
+        token,
+        timeoutMs,
+        signal,
+        commandKill.signal,
+      );
+    } finally {
+      session.activePid = null;
+      session.currentKill = null;
+    }
     child.stdout?.removeListener('data', onOut);
     child.stderr?.removeListener('data', onErr);
     child.removeListener('exit', onExit);
@@ -1172,6 +1207,7 @@ function waitForCompletion(
   markerBase: string,
   timeoutMs: number,
   signal: AbortSignal | undefined,
+  killSignal?: AbortSignal,
 ): Promise<RunOutcome> {
   return new Promise<RunOutcome>((resolve) => {
     let settled = false;
@@ -1187,6 +1223,7 @@ function waitForCompletion(
       if (graceTimer !== null) clearTimeout(graceTimer);
       child.off('exit', onExit); // 每次执行的 exit 探针在定稿时摘除（防累积）
       if (signal !== undefined) signal.removeEventListener('abort', onAbort);
+      if (killSignal !== undefined) killSignal.removeEventListener('abort', onKill);
       const collected = collector.finish(kind !== 'done'); // 超时/中断：不 flush 半行
       const exitCode =
         kind === 'done' && marker !== null
@@ -1214,6 +1251,10 @@ function waitForCompletion(
       }, ms);
     };
     const onAbort = (): void => {
+      if (settled) return;
+      settle('interrupted');
+    };
+    const onKill = (): void => {
       if (settled) return;
       settle('interrupted');
     };
@@ -1248,6 +1289,13 @@ function waitForCompletion(
         return;
       }
       signal.addEventListener('abort', onAbort);
+    }
+    if (killSignal !== undefined) {
+      if (killSignal.aborted) {
+        settle('interrupted');
+        return;
+      }
+      killSignal.addEventListener('abort', onKill);
     }
     // 逃逸舱：已有 exit/已死信号时不出等待（child.once 在 write 前注册过的
     // listener 已带走 exit 事件，这里再查一遍状态兜底，避免停等）
@@ -1362,6 +1410,9 @@ export function createPersistentShell(options: ShellToolOptions): PersistentShel
     anchor: null,
     markerDir: mkdtempSync(join(tmpdir(), 'devmate-shell-')),
     queue: Promise.resolve(undefined),
+    currentKill: null,
+    activePid: null,
+    killed: false,
   });
 
   /** 单条调用超时：模型申请（timeout_ms，已在参数解析层验证 1..硬上限）优先。 */
@@ -1398,6 +1449,25 @@ export function createPersistentShell(options: ShellToolOptions): PersistentShel
     execute,
   };
 
+  /**
+   * 终止活动命令（P2-3）：命中「会话存在 + 命令在执行（currentKill 非空）」才动手——
+   * (1) 记 killed 标志与 activePid（临时记录；下一次命令/重开即清）；
+   * (2) abort 命令级终止控制器：waitForCompletion 以 'interrupted' 收尾
+   * （已捕获输出回注 partial_output——「回注部分输出+interrupted 语义」）；
+   * (3) 杀整棵进程组（活动命令树 + 常驻 bash；killTree——超时同款杀树能力）。
+   * 无活动命令 → false（不误杀：空闲会话的 bash 留待下次命令/超时回收）。
+   */
+  const killActiveCommand = (sessionId: string): boolean => {
+    const session = sessions.get(sessionId);
+    const child = session?.child ?? null;
+    if (session === undefined || child === null || session.currentKill === null) return false;
+    session.killed = true;
+    session.activePid = session.activePid ?? child.pid ?? null;
+    session.currentKill.abort();
+    killTree(child);
+    return true;
+  };
+
   const dispose = async (): Promise<void> => {
     for (const session of sessions.values()) {
       session.dead = true;
@@ -1409,5 +1479,5 @@ export function createPersistentShell(options: ShellToolOptions): PersistentShel
     sessions.clear();
   };
 
-  return { tool, dispose };
+  return { tool, killActiveCommand, dispose };
 }

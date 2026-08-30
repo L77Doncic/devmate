@@ -12,7 +12,12 @@
  * 本模块只 import 读用既有模块：llm（适配/客户端由 boot 组合）、session（SessionStore）、
  * context（project 投影与两级压缩）、retry（boot 接线），不改其源码。
  */
-export { run, REVIEW_SENTINEL_USER_CONTENT, TRUNCATION_HINT_USER_CONTENT } from './agent.js';
+export {
+  run,
+  REVIEW_SENTINEL_USER_CONTENT,
+  TRUNCATION_HINT_USER_CONTENT,
+  reviewBudgetSkipNote,
+} from './agent.js';
 export { wiredLlmAdapter } from './boot.js';
 export type { WiredLlmAdapterOptions } from './boot.js';
 export { defineRegistry } from './tools.js';
@@ -20,6 +25,7 @@ export type { ReinjectionError, SchemaIssue, ToolCallValidation } from './tools.
 export {
   DEFAULT_COST_LIMIT_USD,
   DEFAULT_MAX_FORMAT_ERRORS,
+  DEFAULT_MAX_REVIEW_COST_USD,
   DEFAULT_MAX_TOKENS,
   DEFAULT_PRICING,
   DEFAULT_TOOL_TIMEOUT_MS,

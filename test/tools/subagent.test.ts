@@ -36,6 +36,7 @@ function fakePool(script: SubagentResult): { pool: SubagentPool; spawned: Subage
         return Promise.resolve(script);
       },
       stats: () => stats,
+      nextCostEstimateUsd: () => 0,
       dispose: () => {},
     },
   };
@@ -155,6 +156,7 @@ describe('tools/subagent：spawn_subagent', () => {
         throw new Error('pool exploded');
       },
       stats: () => ({
+        nextCostEstimateUsd: () => 0,
         enabled: true,
         maxParallel: 2,
         active: 0,
@@ -163,6 +165,7 @@ describe('tools/subagent：spawn_subagent', () => {
         rejected: 0,
       }),
       dispose: () => {},
+      nextCostEstimateUsd: () => 0,
     };
     const r = await run(throwing, JSON.stringify({ prompt: 'p' }));
     expect(r).toMatchObject({ ok: false });
