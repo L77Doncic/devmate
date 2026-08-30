@@ -45,12 +45,31 @@ export interface ChatToolCall {
 }
 
 /**
+ * 多模态内容块（user 消息；OpenAI 兼容线，研究 deepseek-vision.md §1）：
+ * text 块（纯文本）与 image_url 块（DeepSeek 图像理解：url 为 data:image/...;base64 内联
+ * 或 http(s) 外链；detail 可选项本实现不发送——缺省等价 original）。图片仅允许出现在
+ * user 消息（供应商文档：system/assistant 携带图片返回 400）。
+ */
+export type ChatContentTextPart = { type: 'text'; text: string };
+export type ChatContentImagePart = {
+  type: 'image_url';
+  image_url: { url: string };
+  /** 原图像素宽（可选；仅供请求侧 token 估算——**不发送**（wire 只序列化 image_url）。 */
+  width?: number;
+  /** 原图像素高（可选；同上）。 */
+  height?: number;
+};
+export type ChatContentPart = ChatContentTextPart | ChatContentImagePart;
+
+/**
  * 消息模型（角色四种，见 §1.2）。assistant 消息的 reasoningContent 在本层
  * 不做策略处置——「推理内容回传策略」属 S2 adapter 的 buildRequest（§3.3）。
+ * user 消息 content 可为纯字符串（经典形态）或内容块数组（多模态；images 由
+ * 投影层拼装，见 core/context/project.ts）。
  */
 export type ChatMessage =
   | { role: 'system'; content: string }
-  | { role: 'user'; content: string }
+  | { role: 'user'; content: string | readonly ChatContentPart[] }
   | {
       role: 'assistant';
       content: string | null;
@@ -84,6 +103,13 @@ export interface ChatRequest {
   streamOptions?: { includeUsage?: boolean };
   /** 思考强度（C 档；缺省未传 = 由 preset 行为决定——不覆盖平台默认）。 */
   reasoningEffort?: ReasoningEffort;
+  /**
+   * 请求侧输入上限（A 档；settings.maxInputTokens）。wire 载体按供应商白名单：
+   * provider.maxInputTokensField 声明（仅 dashscope/Qwen：max_input_tokens，走 extra_body）；
+   * 未声明的供应商在适配层剔除（绝不发送未核实字段），剔除记录进
+   * WireRequest.meta.strippedParams（deepseek-vision.md §8：DeepSeek 官方无该参数）。
+   */
+  maxInputTokens?: number;
 }
 
 /**

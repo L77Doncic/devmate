@@ -71,12 +71,15 @@ import {
 /**
  * 评审哨兵注入的用户消息（R2-S2）：在模型自然结束（无工具调用）时由环境注入，
  * 事件 meta.system=true（UI 显示为系统样式）。
- * 措辞契约（测试锚点）：以「评审哨兵」标记 + 指出动作（spawn_subagent 独立审查）。
+ * 措辞契约（测试锚点）：以「评审哨兵」标记 + 指出动作（spawn_subagent 独立审查）
+ * + B-1 借鉴①的 skill:"code-review" 注入指引（该方法论全文会注入审查子代理）。
+ * 「审查/review 进 prompt」要求保留（hasReviewRun 判定）。
  */
 export const REVIEW_SENTINEL_USER_CONTENT =
   '【评审哨兵】本轮任务产生了实质变更（写入/编辑/命令执行/MCP 调用/子代理）。' +
   '收尾前请先派一次独立审查：调用 spawn_subagent，其 prompt 须含「审查」或 review——' +
-  '以交付物对照任务目标，列出缺陷与放行理由（≤400 字）；对审查结论先修复或说明，再收尾。';
+  '以交付物对照任务目标，列出缺陷与放行理由（≤400 字）；对审查结论先修复或说明，再收尾。' +
+  '建议 spawn_subagent 时带 skill:"code-review"（该方法论全文会注入审查子代理）；';
 
 export async function run(input: RunInput, opts: RunOptions): Promise<RunResult> {
   const pricing = opts.pricing ?? DEFAULT_PRICING;
@@ -106,7 +109,17 @@ export async function run(input: RunInput, opts: RunOptions): Promise<RunResult>
     // 会话引导：新会话 = create + task 落为首个 user 事件；resume = 既有事件流直接继续（不改写）
     if (!(await store.exists(input.sessionId))) {
       await store.create(input.sessionId);
-      await store.append(input.sessionId, { kind: 'user', payload: { content: input.task } });
+      // 多模态（ADR-0015）：images 随 payload.images 落盘（服务端路径早已先落 user 事件——
+      // 本分支只服务直调 run 的形态：subagent/loop 测试）。
+      await store.append(input.sessionId, {
+        kind: 'user',
+        payload: {
+          content: input.task,
+          ...(input.images !== undefined && input.images.length > 0
+            ? { images: input.images }
+            : {}),
+        },
+      });
     }
     // resume 修补：悬空工具调用 → 「中断占位」结果（B 形态，ADR-0004）
     await store.repairOrphaned(input.sessionId);
@@ -140,6 +153,9 @@ export async function run(input: RunInput, opts: RunOptions): Promise<RunResult>
         ...(chatTools.length > 0 ? { tools: chatTools } : {}),
         ...(opts.summarizer !== undefined ? { summarizer: opts.summarizer } : {}),
         ...(opts.systemPrompt !== undefined ? { systemPrefix: opts.systemPrompt } : {}),
+        // 附件 ref 展开（ADR-0015）：服务端注入 resolver（读文件 dataURL 组装）；
+        // 未注入 → ref 事件保守降级（绝不发坏 URL）
+        ...(opts.attachResolver !== undefined ? { resolveImageRef: opts.attachResolver } : {}),
       };
       const projection = await project(events, projectOpts);
       if (
@@ -205,6 +221,7 @@ export async function run(input: RunInput, opts: RunOptions): Promise<RunResult>
         approver: opts.approver,
         toolTimeoutMs,
         ...(opts.maxTokens !== undefined ? { maxTokens: opts.maxTokens } : {}),
+        ...(opts.maxInputTokens !== undefined ? { maxInputTokens: opts.maxInputTokens } : {}),
         ...(opts.reasoning !== undefined ? { reasoning: opts.reasoning } : {}),
         budget: { pricing, costLimit, promptEst, ledger },
         calibrator,
@@ -290,6 +307,8 @@ interface TurnDeps {
   toolTimeoutMs: number;
   /** 请求侧 maxTokens（opts 提供时随请求发送；缺省不发、闸门 A 用模型默认预留估价）。 */
   maxTokens?: number;
+  /** 请求侧输入上限（A 档；仅白名单供应商发送——见 preset.maxInputTokensField）。 */
+  maxInputTokens?: number;
   /** 思考强度（C 档：RunOptions.reasoning 逐字进 ChatRequest.reasoningEffort）。 */
   reasoning?: ReasoningEffort;
   /** 成本护栏状态归并（Data Clumps：pricing/costLimit/promptEst/ledger 成组流转）。 */
@@ -341,6 +360,8 @@ async function runTurn(deps: TurnDeps): Promise<TurnOutcome> {
     messages: deps.messages,
     ...(deps.chatTools.length > 0 ? { tools: deps.chatTools } : {}),
     ...(deps.maxTokens !== undefined ? { maxTokens: deps.maxTokens } : {}),
+    // A 档：请求侧输入上限（adapter 按 preset.maxInputTokensField 白名单取舍）
+    ...(deps.maxInputTokens !== undefined ? { maxInputTokens: deps.maxInputTokens } : {}),
     // C 档思考强度：设置侧 reasoning（缺省 medium）逐字透传——adapter 按家映射
     ...(deps.reasoning !== undefined ? { reasoningEffort: deps.reasoning } : {}),
   };
@@ -590,7 +611,8 @@ async function evaluateCall(call: ToolCall, deps: TurnDeps): Promise<CallOutcome
     const decision = await deps.approver(call);
     if (decision !== 'allow' && decision.deny === true) {
       if (decision.reason !== undefined && decision.reason !== '') {
-        // 带理由拒绝：拒因回注（缺省 user-denied；权限策略直拒 = permission-denied），
+        // 带理由拒绝：拒因回注（缺省 user-denied；permission-denied 兼容保留——权限预设
+        // deny 直拒路径已由服务端删除，不再产生，注入式 approver 显式使用仍按普通回注），
         // 模型继续（ADR-0013 / 权限预设语义定案）
         return {
           kind: 'denied',

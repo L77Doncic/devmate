@@ -30,12 +30,14 @@ import {
 
 /** 估算分解：正文与结构开销独立计量（§1.3 结论：estimator 必须有 overhead(messages) 与 overhead(tools) 两个分量）。 */
 export interface TokenEstimateParts {
-  /** 正文 token（消息内容 + 工具调用名/参数）。 */
+  /** 正文 token（消息内容 + 工具调用名/参数；多模态消息含图像 token —— 见 imageTokens）。 */
   contentTokens: number;
   /** 消息级结构开销（每消息 +3 × N + 回复 priming +3）。 */
   messageOverhead: number;
   /** 工具定义结构开销（function/property/key/enum/收尾）。 */
   toolsOverhead: number;
+  /** 图像 token（ADR-0015：每图按 DeepSeek 缩放/瓦片近似公式；纯文本消息零）。 */
+  imageTokens: number;
 }
 
 export interface TokenEstimate {
@@ -96,12 +98,67 @@ export function estimateTextTokens(text: string, charsPerToken: number): number 
   return tokens;
 }
 
+// ---------------------------------------------------------------------------
+// 图像 token 估算（ADR-0015；近似口径，官方公式未公开——见 deepseek-vision.md §2）
+// ---------------------------------------------------------------------------
+
+/** 图像放大阈值面积（官方原文：「总像素小于约 384×384 的图片会被保持长宽比放大」）。 */
+const IMAGE_UPSCALE_AREA = 384 * 384;
+/** 图像缩小目标面积（官方原文：「缩小后的总像素约相当于 800×800 的图片」）。 */
+const IMAGE_DOWNSALE_AREA = 800 * 800;
+/** 每图 token 硬上限（官方原文：「每张图片消耗的 token 数存在上限（384 个）」）。 */
+export const IMAGE_TOKENS_CAP = 384;
+/** 单瓦片边长（px；本实现选定的近似参数——与 384=4×96 协调）。 */
+const IMAGE_TILE_SIZE = 512;
+/** 单瓦片 token（近似参数；缩放后 800×800 ≈ 2×2 瓦片即达 384 上限）。 */
+const IMAGE_TOKENS_PER_TILE = 96;
+
+/**
+ * 单图 token 估算（纯函数；纯文本消息零）：
+ * 1. 缩放系数 k = sqrt(targetArea/(w×h))——targetArea 按官方两条规则（<384×384 放大 /
+ *    更大缩至 ≈800×800，恒保持长宽比）；
+ * 2. 缩放后尺寸按 512px 瓦片切格（≥1 格），每格 96 token，逐格累加；
+ * 3. min(k×格数, 384) 封顶——官方上限 384。
+ * 尺寸未知（width/height 缺省）→ 按上限档 800×800 估（每图 384，保守）。
+ * 精确性声明：官方只公开缩放规则与 384 上限，「逐尺寸公式」未公开（计算器闭源）——
+ * 本估算为近似值（approximate: true），最终真值以服务端 usage.prompt_tokens 为准。
+ * 参考：OpenAI 常识口径「每图至少 85 token」（detail=low 固定价）——本公式下限
+ * 96/图（1 瓦片）≥ 85，语义更严。
+ */
+export function estimateImageTokens(width?: number, height?: number): number {
+  const w = width !== undefined && Number.isFinite(width) && width >= 1 ? width : 800;
+  const h = height !== undefined && Number.isFinite(height) && height >= 1 ? height : 800;
+  const area = w * h;
+  // 三分支缩放（官方规则的自然读法）：超大（>800×800 面积）缩小至 ~800×800；
+  // 极小（<384×384 面积）放大至 ~384×384；中间尺寸原样（无需缩放——官方规则未涉及）。
+  let k = 1;
+  if (area > IMAGE_DOWNSALE_AREA) k = Math.sqrt(IMAGE_DOWNSALE_AREA / area);
+  else if (area < IMAGE_UPSCALE_AREA) k = Math.sqrt(IMAGE_UPSCALE_AREA / area);
+  const scaledW = Math.max(1, w * k);
+  const scaledH = Math.max(1, h * k);
+  const tiles = Math.ceil(scaledW / IMAGE_TILE_SIZE) * Math.ceil(scaledH / IMAGE_TILE_SIZE);
+  return Math.min(IMAGE_TOKENS_CAP, Math.max(1, tiles) * IMAGE_TOKENS_PER_TILE);
+}
+
 /** 单个角色消息的正文开销角色映射：tool（代码/JSON）K=3，其余 K=4。 */
 function estimateMessageContent(message: ChatMessage): number {
   switch (message.role) {
     case 'system':
-    case 'user':
       return estimateTextTokens(message.content, TEXT_TOKENS_PER_ASCII_PROSE);
+    case 'user': {
+      if (typeof message.content !== 'string') {
+        // 多模态块消息（ADR-0015）：图像分量在 estimateMessageParts 单独计量；
+        // 这里只估 text 块正文（防御双路径——任何入口都不会漏计）。
+        let tokens = 0;
+        for (const part of message.content) {
+          if (part.type === 'text') {
+            tokens += estimateTextTokens(part.text, TEXT_TOKENS_PER_ASCII_PROSE);
+          }
+        }
+        return tokens;
+      }
+      return estimateTextTokens(message.content, TEXT_TOKENS_PER_ASCII_PROSE);
+    }
     case 'assistant': {
       let tokens = estimateTextTokens(message.content ?? '', TEXT_TOKENS_PER_ASCII_PROSE);
       for (const tc of message.toolCalls ?? []) {
@@ -157,17 +214,42 @@ export function estimateTokens(
   tools?: readonly ChatTool[],
 ): TokenEstimate {
   let contentTokens = 0;
+  let imageTokens = 0;
   for (const message of messages) {
-    contentTokens += estimateMessageContent(message);
+    const { content, images } = estimateMessageParts(message);
+    contentTokens += content;
+    imageTokens += images;
   }
   const messageOverhead = messages.length * TOKENS_PER_MESSAGE + REPLY_PRIMING_TOKENS;
   const toolsOverhead = tools !== undefined ? estimateToolsOverhead(tools) : 0;
   return {
-    tokens: contentTokens + messageOverhead + toolsOverhead,
+    tokens: contentTokens + imageTokens + messageOverhead + toolsOverhead,
     approximate: true,
     messageCount: messages.length,
-    parts: { contentTokens, messageOverhead, toolsOverhead },
+    parts: { contentTokens, messageOverhead, toolsOverhead, imageTokens },
   };
+}
+
+/** 单消息的正文/图像分量（estimateTokens 的唯一中间件；供测试与分解锚点）。 */
+function estimateMessageParts(message: ChatMessage): { content: number; images: number } {
+  if (
+    message.role === 'user' &&
+    typeof message.content !== 'string' &&
+    message.content.some((p) => p.type === 'image_url')
+  ) {
+    // 多模态消息：图像分量单独计量（估算/预算审计可分辨）
+    let content = 0;
+    let images = 0;
+    for (const part of message.content) {
+      if (part.type === 'text') {
+        content += estimateTextTokens(part.text, TEXT_TOKENS_PER_ASCII_PROSE);
+      } else {
+        images += estimateImageTokens(part.width, part.height);
+      }
+    }
+    return { content, images };
+  }
+  return { content: estimateMessageContent(message), images: 0 };
 }
 
 // ---------------------------------------------------------------------------

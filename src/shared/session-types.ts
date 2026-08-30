@@ -13,9 +13,45 @@ export const SESSION_SCHEMA_VERSION = 1;
 export const EVENT_KINDS = ['user', 'assistant', 'tool', 'system', 'reasoning', 'event'] as const;
 export type EventKind = (typeof EVENT_KINDS)[number];
 
+/**
+ * 用户消息携带的图片（图像理解，ADR-0015 · dsh 管线落地）——两种形状：
+ * - **ref 形（新协议）**：内容寻址附件引用 `sha256/<sha>.<ext>`（图片字节在服务端
+ *   <sessionsDir>/attachments/，事件只存引用——会话文件 slim 的落盘点；请求时由
+ *   attachmentResolver 展开为 dataURL）；
+ * - **url 形（旧协议，向后兼容）**：dataURL 直存（旧客户端/旧会话；读侧
+ *   resolveImageContent / 投影层按 url 形直通，不做任何存储迁移）。
+ * 不支持外部 URL（服务端校验：仅 data:image/ 与 sha256/ 两种前缀）。
+ */
+export interface UserImageRef {
+  /** 形如 `sha256/<sha>.<ext>`（sha = 字节 sha256 hex；ext ∈ png|jpg|gif|webp）。 */
+  ref: string;
+  width?: number;
+  height?: number;
+}
+
+/** 旧协议形态（dataURL 直存；读侧兼容——绝不 400，按 url 形直通）。 */
+export interface UserImageDataUrl {
+  /** 形如 `data:image/png;base64,<...>`；仅 dataURL。 */
+  url: string;
+  width?: number;
+  height?: number;
+}
+
+export type UserImage = UserImageRef | UserImageDataUrl;
+
+/**
+ * 附件 ref 合法形态（单一权威来源——服务端存储（attachments.ts/会话校验）与
+ * 分享端一致的判定根）：`sha256/<64hex>.<ext>`，ext ∈ png|jpg|gif|webp（DeepSeek
+ * 官方 JPEG/PNG/GIF/WebP 白名单）。路径安全：ref 直接映射 <sha>.<ext>——域外字符
+ * 不可能进入目录拼接。
+ */
+export const ATTACH_REF_RE = /^sha256\/([0-9a-f]{64})\.(png|jpg|gif|webp)$/;
+
 export interface UserPayload {
   content: string;
   name?: string;
+  /** 多模态图片（可选；缺省 = 纯文本消息，协议不变——旧会话事件天然兼容）。 */
+  images?: UserImage[];
 }
 
 export interface ToolCall {

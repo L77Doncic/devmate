@@ -14,10 +14,10 @@
  *   {deny:true} 无理由 → 用户中止本轮（user-interrupted；CONTEXT「危险操作审批」
  *   「无备注则结束本轮」，与「拒绝停止本轮」语义一致）。
  */
-import type { ConversationSummarizer } from '../context/index.js';
+import type { AttachmentResolver, ConversationSummarizer } from '../context/index.js';
 import type { SessionStore } from '../session/index.js';
 import type { ChatRequest, ReasoningEffort, StreamEvent } from '../../shared/llm-types.js';
-import type { ToolCall } from '../../shared/session-types.js';
+import type { ToolCall, UserImage } from '../../shared/session-types.js';
 
 // ---------------------------------------------------------------------------
 // 交互层：run 的输入输出
@@ -27,6 +27,8 @@ export interface RunInput {
   sessionId: string;
   /** 任务描述：只在新会话时落为首个 user 事件；resume 时被忽略（历史不改写）。 */
   task: string;
+  /** 多模态图片（ADR-0015；可选）：随任务落 user 事件 payload.images（与文本同命运）。 */
+  images?: UserImage[];
 }
 
 /**
@@ -133,14 +135,19 @@ export interface ToolRegistry {
 // 审批接缝（ADR-0013）
 // ---------------------------------------------------------------------------
 
-/** 拒绝回注的错误类型（审批链路单一集合：用户弹窗拒绝 / 权限预设策略自动拒绝）。 */
+/**
+ * 拒绝回注的错误类型（审批链路单一集合：用户弹窗拒绝 / 权限预设策略自动拒绝）。
+ * 'permission-denied'：兼容保留——服务端权限预设矩阵的 deny 直拒路径已删除（不再产生），
+ * 但注入式 approver 仍可合法返回该值（loop 契约不变；类型保留防下游破坏）。
+ */
 export type ApprovalDeniedErrorType = 'user-denied' | 'permission-denied';
 
 /**
  * 'allow' 放行；{deny:true, reason} 拒绝并回注；{deny:true}（无理由）→ 用户中止本轮
  * （user-interrupted）。
  * errorType 只在带理由拒绝时生效：'user-denied'（用户弹窗拒绝；缺省）或
- * 'permission-denied'（权限预设矩阵的 deny 直拒——工具结果 error.type 逐字，普通回注）。
+ * 'permission-denied'（兼容保留：原权限预设矩阵 deny 直拒路径——服务端已不再产生该值，
+ * 工具结果 error.type 逐字回注、普通回注不暂停的机制不变）。
  */
 export type ApprovalDecision =
   'allow' | { deny: boolean; reason?: string; errorType?: ApprovalDeniedErrorType };
@@ -257,6 +264,12 @@ export interface RunOptions {
   model: string;
   /** 请求侧输出上限（maxTokens）；缺省不发送（闸门 A 输出侧按模型默认预留 DEFAULT_MAX_TOKENS 估价，§8 A-1）。 */
   maxTokens?: number;
+  /**
+   * 请求侧输入上限（A 档；settings.maxInputTokens 透传）。进入 ChatRequest.maxInputTokens，
+   * 供应商白名单由 preset.maxInputTokensField 声明（仅 dashscope 发送；其余剔除，见
+   * deepseek-vision.md §8）。不参与窗口预算结算——「最小：仅请求字段与文案，不重构预算」。
+   */
+  maxInputTokens?: number;
   /** 成本计价表；缺省=占位价（单价表补齐前，ADR-0003）。 */
   pricing?: Pricing;
   /** 成本上限（USD）；缺省 DEFAULT_COST_LIMIT_USD（ADR-0003：默认唯一开启）。 */
@@ -271,6 +284,12 @@ export interface RunOptions {
   toolTimeoutMs?: number;
   /** 摘要器（透传 S4 project；缺省不摘要）。 */
   summarizer?: ConversationSummarizer;
+  /**
+   * 附件 ref 展开器（ADR-0015；透传 S4 project——再经 resolveImageRef 注入）：
+   * ref → dataURL（服务端读文件 + dataURL 组装）或 null（缺失 → 该图降级文本提示）。
+   * 缺省 = 不展开（ref 事件保守降级——绝不发坏 URL、绝不崩溃）。
+   */
+  attachResolver?: AttachmentResolver;
   /** 上下文窗口 token 预算（透传 S4；未知时不触发阈值压缩）。 */
   windowTokens?: number;
   /** 思考强度（C 档：/api/settings 的 reasoning；逐字进入 ChatRequest.reasoningEffort——adapter 按家映射）。 */

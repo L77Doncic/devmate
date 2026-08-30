@@ -56,8 +56,12 @@ const DEFAULT_PATTERNS: readonly RedactPattern[] = [
     // URL 明文凭据：scheme://user:pass@host（含 mysql:///postgres:// 等任意 scheme）。
     // 整段 user:pass 替换（保守：用户名也可能即 token）；保留 scheme/@host。
     // 字符类以裸 `[` 排除左方括号：脱敏标记以 `[` 开头，自身不被二次命中（幂等）。
+    // 运行长度有界（scheme ≤ 63、user/pass 段各 ≤ 256——真实形态远短于此）：无界贪婪
+    // 接 `://` 在「超长单字符运行」（base64/填充文本——100KB+ 同字符）上每起位全量消耗
+    // 后逐位回退 = O(n²)（实测 100KB 5.7s；存储层脱敏（jsonl-file.ts）把它放大为每次
+    // tool 落盘的常驻成本）。有界后最坏 O(n×63)——线性（「无回溯嵌套」承诺据此成立）。
     type: 'url-credentials',
-    regex: /([a-zA-Z][a-zA-Z0-9+.-]*:\/\/)[^\s/:@[]+:[^\s/@[]+@/g,
+    regex: /([a-zA-Z][a-zA-Z0-9+.-]{0,63}:\/\/)[^\s/:@[]{1,256}:[^\s/@[]{1,256}@/g,
     replace: (_match, groups) => `${groups[0] ?? ''}${redactMarker('url-credentials')}@`,
   },
   { type: 'aws-access-key', regex: /\b(?:AKIA|ASIA)[0-9A-Z]{16}\b/g },

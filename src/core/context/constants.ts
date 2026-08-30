@@ -59,3 +59,12 @@ export const DEFAULT_EXCLUDE_TOOLS = ['write', 'edit', 'apply_patch', 'git_commi
 export const MAX_COMPACTION_ATTEMPTS = 2;
 /** 压缩防抖时间窗口（连续压缩后 5 分钟内又触顶 ⇒ 熔断，§8 A-1）。 */
 export const DEBOUNCE_WINDOW_MS = 5 * 60_000;
+
+/**
+ * 图像展开后单请求 dataURL 字符总量上限（40MiB；ADR-0015 请求维度校验）。
+ * 依据：DeepSeek 请求体上限 48MiB（deepseek-vision.md §3）——内联 base64 dataURL
+ * 的 JSON wire 体积 ≈ 字符数；40MiB 为文本/tools/JSON 开销留 8MiB 头部——20×20MiB
+ * 最坏 400MiB 情形在投影层被本值拦下（超额图降级为文本提示——诚实路径，绝不 400）。
+ * 单一权威来源：project.ts 展开预检与 ui/server/attachments.ts 的限额表共用本值。
+ */
+export const MAX_IMAGE_WIRE_DATAURL_CHARS = 40 * 1024 * 1024;

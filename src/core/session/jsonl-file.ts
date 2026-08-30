@@ -1,16 +1,25 @@
-import { createReadStream, mkdirSync } from 'node:fs';
+import { chmodSync, createReadStream, mkdirSync, readdirSync } from 'node:fs';
 import { access, copyFile, open, rename, rm, type FileHandle } from 'node:fs/promises';
 import { join } from 'node:path';
 import { createInterface } from 'node:readline';
 
 import {
+  ATTACH_REF_RE,
   EVENT_KINDS,
   SESSION_SCHEMA_VERSION,
   type EventKind,
   type SessionEvent,
   type SessionEventInput,
 } from '../../shared/session-types.js';
-import { assertValidSessionId, BaseSessionStore, buildSavedEvent } from './base.js';
+import {
+  assertValidSessionId,
+  BaseSessionStore,
+  buildSavedEvent,
+  type SessionFileHealth,
+} from './base.js';
+// 存储层脱敏（VT-3 修复 b）：kind==='tool' 的 result content 落盘前过同一 redactSecrets——
+// 磁盘永远不出现模式命中的凭据（与 registry 层的回注前脱敏同实现，幂等；存储层是最终口径）
+import { redactSecrets } from '../tools/redact.js';
 import { SessionExistsError, SessionNotFoundError, SessionSeqConflictError } from './errors.js';
 
 export interface JsonlFileAdapterOptions {
@@ -18,6 +27,13 @@ export interface JsonlFileAdapterOptions {
   dir: string;
   /** 容错读的告警通道（坏行/半行被跳过时调用）；缺省走 console.warn。 */
   warn?: (message: string) => void;
+  /**
+   * 存储层脱敏开关（VT-3 修复 b；缺省 true）：
+   * kind==='tool' 的 payload.content 在落盘前过 redactSecrets（掩码即最终口径——append
+   * 返回值、磁盘、resume/回放全部为掩码形式，真实凭据不出现在模型可见上下文两次）。
+   * 只作用于 tool 事件（user/assistant/reasoning/event 不脱敏——刻录面按「工具结果」收敛）。
+   */
+  redactToolContent?: boolean;
 }
 
 /**
@@ -41,19 +57,25 @@ export class JsonlFileAdapter extends BaseSessionStore {
   private readonly nextSeqBySession = new Map<string, number>();
   /** 每会话 append 串行队列（进程内单写者的执行体）：前一个 append 完成才放行下一个。 */
   private readonly appendQueues = new Map<string, Promise<void>>();
+  /** 存储层脱敏开关（VT-3 修复 b；缺省 true——见选项注）。 */
+  private readonly redactToolContent: boolean;
 
   constructor(options: JsonlFileAdapterOptions) {
     super();
     this.dir = options.dir;
     this.warn = options.warn ?? ((message: string) => console.warn(`[session] ${message}`));
-    mkdirSync(this.dir, { recursive: true });
+    this.redactToolContent = options.redactToolContent ?? true;
+    // VT-3 修复 a：会话存储目录 0700、会话文件 0600（新文件按位；存量一次性纠正——
+    // 会话文件可被同机其它用户读出的历史 0644/0755 形态在构造函数里收敛）。
+    mkdirSync(this.dir, { recursive: true, mode: 0o700 });
+    healDirectoryPermissions(this.dir);
   }
 
   async create(id: string): Promise<void> {
     const path = this.fileFor(id);
     let fh: FileHandle;
     try {
-      fh = await open(path, 'wx');
+      fh = await open(path, 'wx', 0o600); // VT-3 修复 a：新会话文件 0600（不随 umask 走 0644）
     } catch (err) {
       if ((err as NodeJS.ErrnoException).code === 'EEXIST') {
         throw new SessionExistsError(id);
@@ -115,9 +137,35 @@ export class JsonlFileAdapter extends BaseSessionStore {
     await normalizeTail(path, this.warn);
     const seq = await this.reserveNextSeq(id, path);
     const saved = buildSavedEvent(input, seq);
+    // 存储层脱敏（VT-3 修复 b；默认为最终口径）：tool 结果 content 落盘前掩码——
+    // append 返回的 saved 即掩码（UI 投影/resume 回放与磁盘同真值，真实凭据不出现两次）。
+    // 只作用于 kind==='tool'；掩码产物是合法文本（`[REDACTED:*]` 无引号/换行），JSON 仍可解析。
+    if (this.redactToolContent) {
+      const wide = saved as unknown as SessionEvent; // 泛型 K 收宽后再判型（与 UI 层同规）
+      if (wide.kind === 'tool') {
+        wide.payload.content = redactSecrets(wide.payload.content);
+      }
+    }
     await writeDurable(path, `${JSON.stringify(saved)}\n`);
     this.nextSeqBySession.set(id, seq + 1);
     return saved;
+  }
+
+  /**
+   * 会话文件行健康统计（VT-8 损坏展示语义；纯读无副作用，失败/不存在 → null）：
+   * totalLines = 文件全部行数（含撕裂尾行）；parseableLines = 可解析为合法事件的行数。
+   * 全损坏（不可解析行 > SESSION_CORRUPTION_RATIO，emit.ts 常量）→ 列表/详情标记「（会话损坏）」。
+   */
+  async fileHealthFor(id: string): Promise<SessionFileHealth | null> {
+    const path = this.fileFor(id);
+    if (!(await existsOnDisk(path))) return null;
+    let totalLines = 0;
+    let parseableLines = 0;
+    for await (const line of readLines(path)) {
+      totalLines += 1;
+      if (parseEventLine(line).ok) parseableLines += 1;
+    }
+    return { totalLines, parseableLines };
   }
 
   events(id: string): AsyncIterable<SessionEvent> {
@@ -303,6 +351,13 @@ async function truncateToLastNewline(fh: FileHandle, size: number): Promise<void
 /**
  * 磁盘最后一个「完整可解析为合法事件」行的 seq（用于派生下一个 seq；坏行/残行从后向前跳过）。
  * 空文件或没有任何可解析事件行时返回 0。调用前提：文件以 '\n' 结尾（normalizeTail 已保证）。
+ *
+ * 无 64KB 窗口截断（VT-1 修复）：反向块扫描**只用于定位行边界**（找 '\n' 的位置、逐行向前跳），
+ * 候选行本身按 [行首, 行尾 '\n'] 全量读取（任意长度）——>64KB 的单事件行（b:1000/b:2800
+ * 复现路径）的 seq 推导与短行一致；绝不用「扫描窗口终点」代替文件行终点，否则长行被
+ * 截断成不完整 JSON → 误判 seq（500 冲突 / 重启后重复 seq 数据丢失）。
+ * 同文件其它逆向扫描（readTailLine / truncateToLastNewline）不受此缺陷影响：它们定位到
+ * 边界后按文件真实终点读取/截断（readTailLine 读 [lineStart, size)；truncate 只到定位的 '\n'）。
  */
 async function lastEventSeqOnDisk(path: string): Promise<number> {
   const fh = await open(path, 'r');
@@ -311,38 +366,50 @@ async function lastEventSeqOnDisk(path: string): Promise<number> {
     if (size <= 1) {
       return 0; // 空文件或只有一个孤 '\n'：没有完整行
     }
-    const WINDOW = 64 * 1024;
-    let end = size - 1; // 考察区间 (右开)：排除文件尾的 '\n'
-    while (true) {
-      const start = Math.max(0, end - WINDOW);
-      const chunk = Buffer.alloc(end - start);
-      await fh.read(chunk, 0, chunk.length, start);
-      const nl = chunk.lastIndexOf(0x0a);
-      if (nl >= 0) {
-        const lineStart = start + nl + 1;
-        const line = Buffer.alloc(end - lineStart);
-        await fh.read(line, 0, line.length, lineStart);
-        const parsed = parseEventLine(line.toString('utf8'));
-        if (parsed.ok) {
-          return parsed.event.seq;
-        }
-        end = lineStart - 1; // 该行不可解析：越过它继续向前找
-        if (end <= 0) {
-          return 0;
-        }
-      } else if (start === 0) {
-        // 已到文件头且该子段无 '\n'：[0, end) 是同一行
-        const line = Buffer.alloc(end);
-        await fh.read(line, 0, end, 0);
+    // 文件尾是 '\n'（契约）：最后一行 = [上一个 '\n' + 1, 文件尾 '\n')。
+    // 候选区段右端（右开）初始 = size（含文件尾 '\n'——它才是末行终止符）；
+    // 坏行被跳过时收缩到该行行首 lineLeft（= 上一行行尾 '\n' 的位置）。
+    let regionEnd = size;
+    for (;;) {
+      const nl = await findLastNewlineBefore(fh, regionEnd);
+      if (nl < 0) {
+        // [0, regionEnd) 内没有任何 '\n'：该区间就是候选内容（无终止符单行）
+        const line = Buffer.alloc(regionEnd);
+        await fh.read(line, 0, regionEnd, 0);
         const parsed = parseEventLine(line.toString('utf8'));
         return parsed.ok ? parsed.event.seq : 0;
-      } else {
-        end = start;
       }
+      // 行右端 = nl 处的 '\n'（终止符）；行左端 = 其上一位 '\n' + 1（无则 0）；
+      // 行内容 [lineLeft, nl) 全量读取（任意长度——无 64KB 截断）。
+      const lineLeft = (await findLastNewlineBefore(fh, nl)) + 1;
+      const line = Buffer.alloc(nl - lineLeft);
+      await fh.read(line, 0, line.length, lineLeft);
+      const parsed = parseEventLine(line.toString('utf8'));
+      if (parsed.ok) {
+        return parsed.event.seq;
+      }
+      regionEnd = lineLeft; // 该行不可解析：越过它继续向前找（lineLeft 位即是上一行的 '\n'）
     }
   } finally {
     await fh.close();
   }
+}
+
+/** 定位 [0, posExclusive) 内最后一个 '\n' 的位置；无 → -1。块反向扫描只找边界，不做行截断。 */
+async function findLastNewlineBefore(fh: FileHandle, posExclusive: number): Promise<number> {
+  const WINDOW = 64 * 1024;
+  let pos = posExclusive;
+  while (pos > 0) {
+    const start = Math.max(0, pos - WINDOW);
+    const chunk = Buffer.alloc(pos - start);
+    await fh.read(chunk, 0, chunk.length, start);
+    const idx = chunk.lastIndexOf(0x0a);
+    if (idx >= 0) {
+      return start + idx;
+    }
+    pos = start;
+  }
+  return -1;
 }
 
 /** 以单次 write 写入并 fsync（写序不变量：落盘后才对调用方返回）。 */
@@ -422,7 +489,10 @@ function parseEventLine(
 /** 按 kind 校验 payload 形状（与 shared/session-types.ts 的声明类型一致）；不符返回原因。 */
 function payloadShapeError(kind: EventKind, payload: Record<string, unknown>): string | null {
   switch (kind) {
-    case 'user':
+    case 'user': {
+      if (typeof payload.content !== 'string') return 'payload.content: expected string';
+      return userImagesError(payload.images);
+    }
     case 'system':
     case 'reasoning':
       return typeof payload.content === 'string' ? null : 'payload.content: expected string';
@@ -459,12 +529,76 @@ function payloadShapeError(kind: EventKind, payload: Record<string, unknown>): s
   }
 }
 
+/**
+ * user 消息 images 校验（ADR-0015 · dsh 管线落地）：缺省/空数组视为无图；
+ * 提供时必须是数组，逐项为**ref 形**（新协议：{ref: sha256/<sha>.<ext>}——slim 存储）
+ * 或**url 形**（旧协议：{url: data:image/... dataURL}——旧事件兼容），width?/height?:
+ * 正整数。返回错误原因；合法 → null。
+ */
+function userImagesError(images: unknown): string | null {
+  if (images === undefined) return null;
+  if (!Array.isArray(images)) return 'payload.images: expected array';
+  if (images.length === 0) return null;
+  for (const img of images) {
+    if (typeof img !== 'object' || img === null) {
+      return 'payload.images: malformed image entry';
+    }
+    const entry = img as Record<string, unknown>;
+    const ok =
+      (typeof entry.ref === 'string' && ATTACH_REF_RE.test(entry.ref)) ||
+      (typeof entry.url === 'string' && entry.url.startsWith('data:image/'));
+    if (!ok) {
+      return 'payload.images: expected sha256/<sha>.<ext> ref or data:image/... dataURL';
+    }
+    for (const dim of ['width', 'height'] as const) {
+      const value = entry[dim];
+      if (
+        value !== undefined &&
+        (typeof value !== 'number' || !Number.isInteger(value) || value < 1)
+      ) {
+        return `payload.images: ${dim} expected positive integer`;
+      }
+    }
+  }
+  return null;
+}
+
 async function existsOnDisk(path: string): Promise<boolean> {
   try {
     await access(path);
     return true;
   } catch {
     return false;
+  }
+}
+
+/**
+ * 会话存储目录/文件权限纠正（VT-3 修复 a；POSIX 语义，Windows chmod 为近似实现——
+ * 与 cli/config.ts 的 saveConfig 0600/0700 同口径）：
+ * - 目录 0700（含历史 0755 存量——会话文件名/存在性不再对同机其它用户可读）；
+ * - 全部存量 `<id>.jsonl` 0600（历史 0644 文件一次性收敛——shell 越界读出的 key
+ *   不再以明文摆在同机可读的会话文件里，存储层还有掩码兜底，见 doAppend）。
+ * 同步执行（构造时一次；文件数受会话上限约束）。任何失败静默（不可强制的平台）。
+ */
+function healDirectoryPermissions(dir: string): void {
+  try {
+    chmodSync(dir, 0o700);
+  } catch {
+    return;
+  }
+  let names: string[];
+  try {
+    names = readdirSync(dir);
+  } catch {
+    return;
+  }
+  for (const name of names) {
+    if (!name.endsWith('.jsonl')) continue;
+    try {
+      chmodSync(join(dir, name), 0o600);
+    } catch {
+      // 中途被删/不可读：跳过不致命
+    }
   }
 }
 

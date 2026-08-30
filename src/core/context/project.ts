@@ -24,6 +24,7 @@ import {
   DEFAULT_CLEAR_AT_LEAST_TOKENS,
   DEFAULT_EXCLUDE_TOOLS,
   KEEP_GROUPS,
+  MAX_IMAGE_WIRE_DATAURL_CHARS,
   MAX_OUTPUT_CHARS,
 } from './constants.js';
 import { estimateTokens } from './estimator.js';
@@ -50,12 +51,25 @@ export interface SummarizeRequest {
 
 export type ConversationSummarizer = (request: SummarizeRequest) => string | Promise<string>;
 
+/**
+ * 附件引用展开器（ADR-0015 请求时展开）：ref → dataURL（服务端 AttachmentStore.resolve：
+ * 读文件 + `data:<mime>;base64,` 组装——DeepSeek wire 协议仍旧 dataURL）；缺失 → null
+ * = 该图降级文本提示（不 400）。零 IO 在本层：resolver 是调用方注入的接缝。
+ */
+export type AttachmentResolver = (ref: string) => Promise<string | null>;
+
 export interface ProjectOptions {
   /**
    * 窗口 token 预算（来自 {provider}/{model} 覆盖或请求参数，例如 max_input_tokens——§1.4）。
    * 缺省 = 窗口未知：不做任何触发阈值计算（截断仍无条件执行；裁剪/摘要按报告口径退避）。
    */
   windowTokens?: number;
+  /**
+   * 附件 ref 展开（ADR-0015）：投影构建前把 user 事件 payload.images 的 ref 形条目展开为
+   * dataURL（旧 url 形直通——兼容）；ref 缺失（resolver null/未注入）→ 该图降级为文本提示。
+   * 展开后请求维度总量 ≤ MAX_IMAGE_WIRE_DATAURL_CHARS（40MiB）——超额图降级（诚实路径）。
+   */
+  resolveImageRef?: AttachmentResolver;
   /** 工具定义（仅用于估算结构开销；不被本模块作为 send 载荷处理）。 */
   tools?: readonly ChatTool[];
   /** 注入的摘要器；未注入且触发摘要时只产摘要请求（stats.summary.prompt），status='no-summarizer'。 */
@@ -135,6 +149,11 @@ export interface SummaryStats {
 export interface ProjectionStats {
   /** 最终投影消息的估算 token 数（近似；L2 启发式 ±5%~±15%，§1.2）。 */
   estimatedTokens: number;
+  /**
+   * 附件 ref 展开期被降级的图片数（ADR-0015：ref 缺失 / 展开后超 40MiB 请求维度——
+   * 该图未发送并以文本提示并入消息；旧 url 形直通不计）。仅最后一次样本有值。
+   */
+  degradedImages?: number;
   truncated: TruncateStats;
   pruned: PruneStats;
   summary: SummaryStats;
@@ -209,9 +228,31 @@ function buildItems(
           prunable: false,
         });
         break;
-      case 'user':
-        items.push({ message: { role: 'user', content: event.payload.content }, prunable: false });
+      case 'user': {
+        // 多模态（ADR-0015）：payload.images 存在 → 内容块数组（text + image_url；
+        // 官方形状 deepseek-vision.md §1；宽高仅在部分级供估算，不进 wire）。
+        // 纯文本（无 images）→ 经典字符串形态不变。
+        const text = event.payload.content;
+        const images = event.payload.images;
+        const message =
+          images === undefined || images.length === 0
+            ? { role: 'user' as const, content: text }
+            : {
+                role: 'user' as const,
+                content: [
+                  ...(text === '' ? [] : [{ type: 'text' as const, text }]),
+                  ...images.map((img) => ({
+                    type: 'image_url' as const,
+                    // materializeImages 保证到这里全部是展开后的 url 形（ref 已还原/降级）
+                    image_url: { url: (img as { url: string }).url },
+                    ...(img.width !== undefined ? { width: img.width } : {}),
+                    ...(img.height !== undefined ? { height: img.height } : {}),
+                  })),
+                ],
+              };
+        items.push({ message, prunable: false });
         break;
+      }
       case 'assistant': {
         if (event.payload.toolCalls.length > 0) {
           currentGroup += 1;
@@ -265,6 +306,102 @@ export function isOverBudget(projection: Projection, budgetTokens?: number): boo
   return projection.stats.estimatedTokens > budgetTokens;
 }
 
+// ---------------------------------------------------------------------------
+// 附件 ref 展开（ADR-0015 请求时展开；纯变换——resolver 接缝注入，本层无 IO）
+// ---------------------------------------------------------------------------
+
+/** ref 缺失时并入消息文本的说明（诚实路径：模型知道「图没进来」——避免凭空想象图内容）。 */
+export function attachmentMissingNote(ref: string): string {
+  return `\n（图像未能处理：附件不存在（${ref}），图片未发送。）`;
+}
+
+/** 展开后超请求维度限额（40MiB）被降级的说明（N 张图未发送）。 */
+export function attachmentOversizeNote(droppedCount: number): string {
+  const mb = Math.round(MAX_IMAGE_WIRE_DATAURL_CHARS / 1024 / 1024);
+  return `\n（图像未能处理：${droppedCount} 张图片超过展开后单请求体积上限（${mb}MiB），未发送。）`;
+}
+
+/** 形如 {ref,...} 的图片条目 → 展开后的 dataURL 条目（{url,...}；投影层直接消费）。 */
+interface ResolvedImageEntry {
+  url: string;
+  width?: number;
+  height?: number;
+}
+
+/**
+ * 展开预检：逐 user 事件把 ref 条目换成 dataURL（缓存按唯一 ref——同图多消息只读一次；
+ * 旧 url 形直通）；ref 缺失（resolver null/未注入）→ 该图降级（消息文本并入说明）；
+ * 展开后全请求 dataURL 字符总量 > MAX_IMAGE_WIRE_DATAURL_CHARS（20×20MiB 最坏 400MiB
+ * 情形）→ 保序前缀保留，超额图降级。文件缺失 → 文本提示，绝不 400、绝不发坏 URL。
+ */
+async function materializeImages(
+  events: readonly SessionEvent[],
+  resolver: AttachmentResolver | undefined,
+): Promise<{ events: SessionEvent[]; degradedImages: number }> {
+  const cache = new Map<string, string | null>();
+  let wireChars = 0;
+  let degradedImages = 0;
+  const out: SessionEvent[] = [];
+  for (const event of events) {
+    if (event.kind !== 'user') {
+      out.push(event);
+      continue;
+    }
+    const images = event.payload.images;
+    if (images === undefined || images.length === 0) {
+      out.push(event);
+      continue;
+    }
+    const kept: ResolvedImageEntry[] = [];
+    const missingRefs: string[] = [];
+    let oversizeCount = 0;
+    let rebuilt = false; // 恒为 true 当事件含 ref（展开后的 url 形必须替换原条目——缺省路径见下）
+    for (const img of images) {
+      let dataUrl: string;
+      if ('ref' in img) {
+        rebuilt = true;
+        // ref 形：resolver 展开（缓存按唯一 ref——同图多消息只读一次）；缺失 → 降级
+        const ref = img.ref;
+        if (!cache.has(ref)) {
+          cache.set(ref, resolver !== undefined ? await resolver(ref) : null);
+        }
+        const resolved = cache.get(ref) ?? null;
+        if (resolved === null) {
+          missingRefs.push(ref);
+          degradedImages += 1;
+          continue;
+        }
+        dataUrl = resolved;
+      } else if ('url' in img) {
+        dataUrl = img.url; // 旧 dataURL 形：直通（兼容旧事件——回放渲染不经网络）
+      } else {
+        continue; // 形状异常（源已被服务端校验——此处防御）→ 跳过
+      }
+      if (wireChars + dataUrl.length > MAX_IMAGE_WIRE_DATAURL_CHARS) {
+        oversizeCount += 1;
+        degradedImages += 1;
+        continue;
+      }
+      wireChars += dataUrl.length;
+      const entry: ResolvedImageEntry = { url: dataUrl };
+      if (img.width !== undefined) entry.width = img.width;
+      if (img.height !== undefined) entry.height = img.height;
+      kept.push(entry);
+    }
+    if (!rebuilt) {
+      out.push(event); // 纯旧 dataURL 事件：原样直通（不含 ref——无需展开）
+      continue;
+    }
+    const notes = missingRefs.map((ref) => attachmentMissingNote(ref));
+    if (oversizeCount > 0) notes.push(attachmentOversizeNote(oversizeCount));
+    out.push({
+      ...event,
+      payload: { ...event.payload, content: event.payload.content + notes.join(''), images: kept },
+    });
+  }
+  return { events: out, degradedImages };
+}
+
 /**
  * 推导投影：固定顺序 截断（无条件）→ 裁剪（clearTrigger 触发或 force）→ 摘要（compactTrigger 触发或 force）。
  * 摘要只在窗口已知时触发（§8A：摘要需要窗口判定）；摘要器缺省时只产请求。
@@ -294,6 +431,11 @@ export async function project(
   const liveEvents = compaction === null ? events : events.slice(compaction.index + 1);
   const callNames = buildCallNameMap(events);
 
+  // 附件 ref 展开（ADR-0015）：live 事件先展开（ref → dataURL；缺失/超限 → 文本提示），
+  // 投影/估算/适配器全部消费展开后的 url 形——DeepSeek wire 协议不变。
+  const materialized = await materializeImages(liveEvents, opts.resolveImageRef);
+  const resolvedEvents = materialized.events;
+
   const prefixMessage: ChatMessage | null =
     systemPrefix !== undefined ? { role: 'system', content: systemPrefix } : null;
   const replayMessage: ChatMessage | null =
@@ -310,7 +452,7 @@ export async function project(
   const estimate = (items: readonly MessageItem[]): number =>
     estimateTokens(buildMessages(items), tools).tokens;
 
-  const built = buildItems(liveEvents, callNames, excludeTools);
+  const built = buildItems(resolvedEvents, callNames, excludeTools);
   const est0 = estimate(built.items);
 
   // 第 1 层：组包期裁剪（clearTrigger 触顶 + 至少清出 clearAtLeastTokens，§2.4 第 1 层 / §8 A-2）
@@ -394,6 +536,7 @@ export async function project(
     warnings,
     stats: {
       estimatedTokens,
+      degradedImages: materialized.degradedImages,
       truncated: { count: built.truncatedCount, maxChars: MAX_OUTPUT_CHARS },
       pruned: {
         count: pruned.prunedCount,

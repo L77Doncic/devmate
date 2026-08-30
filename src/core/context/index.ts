@@ -18,6 +18,7 @@ export {
   ENUM_PROPERTY_ADJUSTMENT,
   KEEP_GROUPS,
   MAX_COMPACTION_ATTEMPTS,
+  MAX_IMAGE_WIRE_DATAURL_CHARS,
   MAX_OUTPUT_CHARS,
   REPLY_PRIMING_TOKENS,
   SUMMARY_FORBID_TOOLS,
@@ -53,8 +54,14 @@ export { buildSummaryPrompt, extractSummaryContent, SUMMARY_SECTION_HEADERS } fr
 export { CompactionDebouncer } from './debounce.js';
 export type { CompactionDebouncerOptions } from './debounce.js';
 
-export { isOverBudget, project } from './project.js';
+export {
+  attachmentMissingNote,
+  attachmentOversizeNote,
+  isOverBudget,
+  project,
+} from './project.js';
 export type {
+  AttachmentResolver,
   CompactionLevel,
   ConversationSummarizer,
   Projection,

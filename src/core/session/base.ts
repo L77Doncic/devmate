@@ -19,8 +19,17 @@ import { missingToolCallIds } from './pairing.js';
  * - `events`：按写入顺序回放；实现必须容忍坏行（跳过 + 告警），不得因单行脏数据崩掉整个读取。
  * - `fork(from, newId)`：复制历史到新会话，原会话不动（会话分叉）。
  * - `repairOrphaned`：为悬空工具调用补「中断占位」结果；返回补齐的调用 ID 列表（幂等）。
+ * - `fileHealthFor`（可选）：底层存储的行健康统计（VT-8 损坏展示语义——列表/详情用
+ *   全损坏会话的标记判定；纯读无副作用）。
  * - resume 语义 = 同一 id 直接继续 append（不要求重置、不要求复制）。
  */
+
+/** 会话文件行健康（总行数 vs 可解析行数；撕裂尾行计入总行数）。 */
+export interface SessionFileHealth {
+  totalLines: number;
+  parseableLines: number;
+}
+
 export interface SessionStore {
   create(id: string): Promise<void>;
   exists(id: string): Promise<boolean>;
@@ -28,6 +37,8 @@ export interface SessionStore {
   events(id: string): AsyncIterable<SessionEvent>;
   fork(fromId: string, newId: string): Promise<void>;
   repairOrphaned(id: string): Promise<string[]>;
+  /** 可选：存储健康统计（JSONL 适配器实现；缺失/不可读 → null）。 */
+  fileHealthFor?(id: string): Promise<SessionFileHealth | null>;
 }
 
 const SESSION_ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._-]*$/;
