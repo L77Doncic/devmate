@@ -103,6 +103,7 @@ import {
 import { classify, type Verdict } from '../../core/tools/classify.js';
 import type { WorkflowConfig } from '../../shared/workflow.js';
 import { clampMaxParallel, DEFAULT_SUBAGENTS_ENABLED } from '../../shared/workflow.js';
+import { friendlyProviderError } from './localize.js';
 import type { SkillsIndex } from '../../core/tools/skill.js';
 import type {
   MethodologyEntry,
@@ -1808,6 +1809,9 @@ export function createDevmateServer(deps: DevmateServerDeps): DevmateServer {
       markFlagged: () => {
         ctx.reviewStats.flagged = true;
       },
+      // P2-10 评审静默：池未启用（subagents-disabled）→ 哨兵静默跳过（loop 层裁决）——
+      // 不再指示模型触发必然失败的子代理尝试；UI 侧至多一行提示
+      subagentAvailable: () => workflowState.subagentsEnabled,
     };
   }
 
@@ -1947,14 +1951,20 @@ export function createDevmateServer(deps: DevmateServerDeps): DevmateServer {
           data: { ...result.usage },
         });
         if (result.error !== undefined) {
-          ctx.broker.push({ event: 'run-error', data: { message: result.error } });
+          // P2-8 报错本地化：供应商裸英文（图片被拒/认证/限流/网络）→ 中文一行 + 指引
+          ctx.broker.push({
+            event: 'run-error',
+            data: { message: friendlyProviderError(result.error) ?? result.error },
+          });
         }
         ctx.broker.push({
           event: 'run-status',
           data: { status: result.status, steps: result.steps, durationMs: result.durationMs },
         });
       } catch (err) {
-        const message = err instanceof Error ? err.message : String(err);
+        const raw = err instanceof Error ? err.message : String(err);
+        // P2-8 报错本地化：供应商裸英文 → 中文一行 + 指引（未命中模式保留原文）
+        const message = friendlyProviderError(raw) ?? raw;
         ctx.broker.push({ event: 'run-error', data: { message } });
         ctx.broker.push({
           event: 'run-status',

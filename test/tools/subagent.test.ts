@@ -131,7 +131,9 @@ describe('tools/subagent：spawn_subagent', () => {
       const { pool } = fakePool(failedScript(detail));
       const r = await run(pool, JSON.stringify({ prompt: 'p' }));
       expect(r).toMatchObject({ ok: false, error: { type: 'subagent-error' } });
-      expect(r.error?.message).toContain(detail === 'disposed' ? 'sub-agent failed' : detail);
+      // P2-9 文案净化：message 从「sub-agent failed: <detail>」改为用户友好中文「子代理调用失败：<detail>」
+      // （数字/详情仍随 message 披露的放宽保留（模块头注）；disposed 属「未知细节」分支）
+      expect(r.error?.message).toContain(detail === 'disposed' ? '子代理调用失败' : detail);
       expect(JSON.parse(r.content).ok).toBe(false);
     }
   });

@@ -25,15 +25,24 @@ import {
   TERMINAL_STATUSES,
   RUN_STAGE_WORDS,
   CONN_VISIBLE,
+  CONN_HINTS,
   TOOL_STATE_LABEL,
   methodologyLine,
   methodologyBadgeText,
   REVIEW_BLOCK_TITLE,
   isReviewSubagent,
   reviewBlockText,
+  friendlySubagentError,
+  friendlyImageError,
+  friendlyProviderError,
+  reviewSkippedHint,
+  REVIEW_SKIPPED_HINT,
   TOAST_COPY_TITLE,
   TOAST_COPIED_TEXT,
   continueVisible,
+  classifyTool,
+  TOOL_VARIANT_TITLES,
+  toolSummaryArgs,
 } from '../../src/ui/web/format.js';
 
 describe('truncate', () => {
@@ -371,7 +380,7 @@ describe('composerStatsLine（composer 输入卡 footer 用量统计行：步骤
           estimated: true,
         },
       ),
-    ).toBe('3 步 | 2.5s | 入 1.2k · 出 340 · 总 1.5k | ≈$0.0012');
+    ).toBe('3 步 | 2.5s | 入 1.2k tokens · 出 340 tokens · 总 1.5k tokens | ≈$0.0012');
   });
   it('estimated=false 不标 ≈；0 值也显示（沿用五项全显）', () => {
     expect(
@@ -385,7 +394,7 @@ describe('composerStatsLine（composer 输入卡 footer 用量统计行：步骤
           estimated: false,
         },
       ),
-    ).toBe('0 步 | 0ms | 入 0 · 出 0 · 总 0 | $0');
+    ).toBe('0 步 | 0ms | 入 0 tokens · 出 0 tokens · 总 0 tokens | $0');
   });
   it('无 runStatus（usage 单独到达）：仍显示 token/成本段（单组无竖杠）', () => {
     expect(
@@ -396,7 +405,7 @@ describe('composerStatsLine（composer 输入卡 footer 用量统计行：步骤
         costUsd: 0.0001,
         estimated: true,
       }),
-    ).toBe('入 100 · 出 50 · 总 150 | ≈$1.0e-04');
+    ).toBe('入 100 tokens · 出 50 tokens · 总 150 tokens | ≈$1.0e-04');
   });
   it('运行中帧（steps/durationMs 缺省）：省略步骤与耗时；成本缺失不输出成本段', () => {
     expect(
@@ -404,7 +413,7 @@ describe('composerStatsLine（composer 输入卡 footer 用量统计行：步骤
         { status: 'running', steps: null, durationMs: null },
         { promptTokens: 1, completionTokens: 2, totalTokens: 3, costUsd: null, estimated: false },
       ),
-    ).toBe('入 1 · 出 2 · 总 3');
+    ).toBe('入 1 tokens · 出 2 tokens · 总 3 tokens');
   });
   it('无值 → 空串（UI 隐藏该行；暂停/不存在时不显示假值）', () => {
     expect(composerStatsLine(null, null)).toBe('');
@@ -604,4 +613,180 @@ describe('toast 点击复制（clickable 选项）—— 文案/提示单一来�
   });
   // 「恢复会话」toast 文案已随恢复静默移除（2026-08-30）——toast clickable 机制仍
   // 在（复制 ID 提示属该机制），其余场景复用；restoredToastText 无调用方即删除。
+});
+
+// ---------------------------------------------------------------------------
+// P2-4：连接态悬停解释（CONN_HINTS = CONN_VISIBLE 同键集的下一动作一句话）
+// ---------------------------------------------------------------------------
+
+describe('CONN_HINTS（连接态悬停解释：键与 CONN_VISIBLE 同集、全非空）', () => {
+  it('同键集（六态；app.js renderHeader 直接索引 CONN_HINTS[connState]）', () => {
+    expect(Object.keys(CONN_HINTS).sort()).toEqual(Object.keys(CONN_VISIBLE).sort());
+  });
+  it('每态非空一句话（「待配置/未连接」第一次见有下一动作可循）', () => {
+    for (const v of Object.values(CONN_HINTS)) {
+      expect(typeof v).toBe('string');
+      expect(v.length).toBeGreaterThan(0);
+    }
+  });
+  it('config 提示指向设置→模型接口；off 提示先选工作区', () => {
+    expect(CONN_HINTS.config).toContain('API Key');
+    expect(CONN_HINTS.off).toContain('选择工作区');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// P2-11：use_skill 卡语义化（变体 skill：标题「加载技能」+ 摘要 = id 一行）
+// ---------------------------------------------------------------------------
+
+describe('use_skill 卡片语义化（classifyTool / 标题 / 参数摘要）', () => {
+  it('use_skill → 变体 skill（不再是 generic）', () => {
+    expect(classifyTool('use_skill')).toBe('skill');
+  });
+  it('变体标题 = 加载技能', () => {
+    expect(TOOL_VARIANT_TITLES.skill).toBe('加载技能');
+  });
+  it('参数摘要 = skill id 一行（不再是原始 JSON {"skill":"tdd"}）', () => {
+    const args = JSON.stringify({ skill: 'tdd' });
+    expect(toolSummaryArgs(args, classifyTool('use_skill'))).toBe('tdd');
+    // 别名形态 id：
+    expect(toolSummaryArgs(JSON.stringify({ id: 'research' }), 'skill')).toBe('research');
+    // 非 JSON：原样压空白（兜底）
+    expect(toolSummaryArgs('skill  tdd', 'skill')).toBe('skill tdd');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// P2-9/P2-10：子代理失败 → 用户友好一行（审查块结论 / 工具卡失败判读共用）
+// ---------------------------------------------------------------------------
+
+describe('friendlySubagentError（子代理失败文案净化：无内部词、保留原义）', () => {
+  it('认证被拒（governor / Authentication Fails）→ 中文一行', () => {
+    const out = friendlySubagentError('sub-agent failed: Authentication Fails (governor)');
+    expect(out).toContain('认证被拒');
+    expect(out).not.toMatch(/governor|Authentication/);
+  });
+  it('subagents-disabled → 未启用指引', () => {
+    const out = friendlySubagentError(
+      'sub-agents are disabled in the workflow settings; enable them first',
+    );
+    expect(out).toContain('未启用');
+  });
+  it('网络不可用 → 网络一行', () => {
+    expect(friendlySubagentError('fetch failed: ECONNREFUSED')).toContain('网络');
+  });
+  it('未知错误 → 压平原文（已是「类型: 消息」形态原样保留，零信息损失）', () => {
+    expect(friendlySubagentError('boom: xyz')).toBe('boom: xyz');
+  });
+  it('审查块失败结论 = 友好一行（不再裸露 JSON/原文）', () => {
+    const call = { name: 'spawn_subagent', arguments: '{"prompt":"请审查提交"}' };
+    const view = reviewBlockText(call, {
+      ok: false,
+      content: '{"ok":false,"error":{"type":"subagent-error","message":"sub-agent failed: Authentication Fails (governor)"}}',
+      error: 'sub-agent failed: Authentication Fails (governor)',
+    });
+    expect(view.subject).not.toBe('');
+    expect(view.verdict).toContain('认证被拒');
+    expect(view.verdict).not.toMatch(/governor/);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// P2-6/P2-8：供应商报错本地化（图片被拒/超限/数量超 + 认证/网络）
+// ---------------------------------------------------------------------------
+
+describe('friendlyImageError（图片被供应商拒收 → 中文 + 指引）', () => {
+  it('不支持图像（走查原文）→ 格式指引', () => {
+    const out = friendlyImageError(
+      '.messages[1].image[0]: You have uploaded an unsupported image. Please make sure your image is valid and has one of the following formats: webp, png, jpeg, and gif.',
+    );
+    expect(out).toContain('png');
+    expect(out).toContain('移除');
+  });
+  it('数量超限 → 分批指引', () => {
+    expect(friendlyImageError('too many images in one step')).toContain('分批');
+  });
+  it('体积/尺寸超限 → 压缩指引', () => {
+    expect(friendlyImageError('total size of images exceeds')).toContain('压缩');
+  });
+  it('未命中 → null（保留原文）', () => {
+    expect(friendlyImageError('some other error')).toBeNull();
+  });
+});
+
+describe('friendlyProviderError（通用供应商/连接错误：未命中 → null）', () => {
+  it('图片被拒带「图片请求被拒」前缀', () => {
+    expect(friendlyProviderError('unsupported image')).toContain('图片请求被拒');
+  });
+  it('认证失败 → API Key 指引', () => {
+    expect(friendlyProviderError('Authentication Fails (governor)')).toContain('API Key');
+  });
+  it('限流 → 稍等指引', () => {
+    expect(friendlyProviderError('rate limit exceeded')).toContain('限流');
+  });
+  it('网络 → 检查网络', () => {
+    expect(friendlyProviderError('ECONNREFUSED')).toContain('网络');
+  });
+  it('未知 → null', () => {
+    expect(friendlyProviderError('odds and ends')).toBeNull();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// P2-10：收尾评审静默（子代理明确未启用时 run 后至多一次一行提示）
+// ---------------------------------------------------------------------------
+
+describe('reviewSkippedHint（评审未派提示裁决）', () => {
+  const items = [
+    { tools: [{ name: 'write_file', state: 'success' }] },
+    { tools: [{ name: 'read_file', state: 'failed' }] },
+  ];
+  it('实质变更 + 评审开启 + 子代理明确未启用 → 提示', () => {
+    expect(
+      reviewSkippedHint({
+        items,
+        runActive: false,
+        reviewMode: true,
+        subagentsEnabled: false,
+      }),
+    ).toBe(REVIEW_SKIPPED_HINT);
+  });
+  it('子代理启用（或未知 true）→ 不提示', () => {
+    expect(
+      reviewSkippedHint({ items, runActive: false, reviewMode: true, subagentsEnabled: true }),
+    ).toBeNull();
+    expect(
+      reviewSkippedHint({ items, runActive: false, reviewMode: true, subagentsEnabled: undefined }),
+    ).toBeNull();
+  });
+  it('评审关闭 → 不提示（无义务）', () => {
+    expect(
+      reviewSkippedHint({ items, runActive: false, reviewMode: false, subagentsEnabled: false }),
+    ).toBeNull();
+  });
+  it('运行中 → 不提示', () => {
+    expect(
+      reviewSkippedHint({ items, runActive: true, reviewMode: true, subagentsEnabled: false }),
+    ).toBeNull();
+  });
+  it('无实质变更（只读/检索）→ 不提示', () => {
+    expect(
+      reviewSkippedHint({
+        items: [{ tools: [{ name: 'read_file' }, { name: 'grep' }] }],
+        runActive: false,
+        reviewMode: true,
+        subagentsEnabled: false,
+      }),
+    ).toBeNull();
+  });
+  it('已有独立审查卡（成功或失败尝试）→ 不提示（覆盖由卡承担）', () => {
+    expect(
+      reviewSkippedHint({
+        items: [{ tools: [{ name: 'spawn_subagent', review: true, state: 'failed' }] }],
+        runActive: false,
+        reviewMode: true,
+        subagentsEnabled: false,
+      }),
+    ).toBeNull();
+  });
 });

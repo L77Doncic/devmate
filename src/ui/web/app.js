@@ -173,6 +173,8 @@ import {
   breadcrumbSegments,
   loadWorkspaceCollapse,
   saveWorkspaceCollapse,
+  loadWorkspaceChoice,
+  saveWorkspaceChoice,
   workspaceErrorInfo,
 } from './workspaces.js';
 import {
@@ -218,6 +220,12 @@ import {
   // B：审查块（spawn_subagent + prompt 含 审查|review）——标题行与两行摘要的单一来源
   REVIEW_BLOCK_TITLE,
   reviewBlockText,
+  // 悬停解释（P2-4）：连接态词表同键集 —— 顶栏 conn pill 的 title 单一来源
+  CONN_HINTS,
+  // 供应商报错本地化（P2-6/P2-8）：裸英文（图片被拒/认证/网络）→ 中文一行
+  friendlyProviderError,
+  // R2-S2 评审静默（P2-10）：未启用子代理时 run 后至多一次提示的裁决与文案
+  reviewSkippedHint,
 } from './format.js';
 
 // ============================================================== 常量
@@ -316,6 +324,7 @@ const ui = {
   // 模型·思考强度 combo（dsh 右下同款）：菜单开合（选项装配 = buildModelMenu）
   modelMenuOpen: false,
   wsPickerOpen: false,
+  wsPickerMode: 'pick', // 'pick'=选择工作区目录（hero）/ 'add'=添加工作区（区头＋/菜单）
   skillInstalling: false, // 技能安装在途（按钮态 + 重入护栏）
   wsPickerState: null, // 目录浏览状态机（workspaces.js 纯逻辑）
   wsPickerBrowseFailed: false,
@@ -328,6 +337,8 @@ const ui = {
   // 'local' = 服务端不可达，降级仅本地，旁注「未同步（仅本地）」。defaults 见 extensions.js）
   subagent: { ...SUBAGENT_DEFAULTS },
   subagentSource: 'local',
+  // P2-10：评审未派提示的一次性护栏（每页面会话至多提示一次）
+  reviewSkippedHinted: false,
   // 工作流同步（防抖 300ms，change 即提交无队列）：pending 合并最近一次字段 patch
   subagentSyncPending: null,
   subagentSyncTimer: 0,
@@ -387,6 +398,7 @@ const el = {
   wsCrumbs: document.getElementById('ws-crumbs'),
   wsDirs: document.getElementById('ws-dirs'),
   wsManualInput: document.getElementById('ws-manual-input'),
+  wsPickerTitle: document.getElementById('ws-picker-title'),
   btnWsPickerClose: document.getElementById('btn-ws-picker-close'),
   btnWsPickerCancel: document.getElementById('btn-ws-picker-cancel'),
   btnWsPickerSelect: document.getElementById('btn-ws-picker-select'),
@@ -1201,6 +1213,14 @@ function buildWsNewMenu() {
     el.wsNewMenu.appendChild(note);
   }
   const items = workspaceMenuOrder(ui.workspaces, ui.wsDefaultRoot);
+  // P2-1 行为说明：菜单 = 选择工作区新建（区头「＋」= 直接在该工作区新建）——
+  // 一眼看懂「＋新建」不是死按钮，也不是「直接开新会话」
+  if (items.length > 0) {
+    const semantic = document.createElement('div');
+    semantic.className = 'wsMenuNote';
+    semantic.textContent = '选择工作区后新建会话（区头「＋」= 在该工作区直接新建）';
+    el.wsNewMenu.appendChild(semantic);
+  }
   for (const root of items) {
     const btn = document.createElement('button');
     btn.type = 'button';
@@ -1261,7 +1281,7 @@ function buildWsNewMenu() {
   addBtn.append(addIcon, addLabel);
   addBtn.addEventListener('click', () => {
     closeWsNewMenu();
-    openWsPicker();
+    openWsPicker('add'); // 菜单「添加工作区…」→ 同名标题的目录弹窗（名称一致）
   });
   el.wsNewMenu.append(sep, addBtn);
 }
@@ -1283,9 +1303,15 @@ function toggleWsNewMenu(force) {
     el.wsNewMenu.style.left = `${pos.left}px`;
     el.wsNewMenu.style.top = `${pos.top}px`;
     ui.wsNewMenuOpen = true;
+    // P2-1 视觉反馈：按钮压态 + aria-expanded（菜单自身若无可选项仍显「添加工作区」，
+    // 按钮不再看起来像死了）
+    el.btnNewSession.classList.add('active');
+    el.btnNewSession.setAttribute('aria-expanded', 'true');
   } else {
     el.wsNewMenu.hidden = true;
     ui.wsNewMenuOpen = false;
+    el.btnNewSession.classList.remove('active');
+    el.btnNewSession.setAttribute('aria-expanded', 'false');
   }
 }
 
@@ -1295,9 +1321,20 @@ function closeWsNewMenu() {
 
 /** ---- 目录选择弹窗（dsh ui-directory-picker-browse 形态） ---- */
 
-async function openWsPicker() {
+/** 目录弹窗两种发端模式的标题/确认钮文案（P2-1 名称一致：菜单「添加工作区…」进入的
+ *  不再叫「选择工作区目录」；hero 首次选工作区仍叫「选择工作区目录」）。 */
+const WS_PICKER_TEXT = Object.freeze({
+  pick: { title: '选择工作区目录', confirm: '选择此文件夹' },
+  add: { title: '添加工作区', confirm: '添加为工作区' },
+});
+
+async function openWsPicker(mode = 'pick') {
   if (ui.wsPickerOpen) return;
   ui.wsPickerOpen = true;
+  ui.wsPickerMode = mode;
+  const texts = WS_PICKER_TEXT[mode] ?? WS_PICKER_TEXT.pick;
+  el.wsPickerTitle.textContent = texts.title;
+  el.btnWsPickerSelect.textContent = texts.confirm;
   // 状态沿用上次浏览落点（错误重试路径）：全新打开 = createBrowseState→home
   if (ui.wsPickerState === null) ui.wsPickerState = createBrowseState('');
   ui.wsPickerBrowseFailed = false;
@@ -1539,7 +1576,8 @@ function closeWsError() {
 function retryWsError() {
   closeWsError();
   closeWsPicker();
-  void openWsPicker(); // 保持上次浏览落点（state 未清 —— 错误后直接在原级重试）
+  // 保持上次浏览落点与发端模式（state 未清 —— 错误后直接在原级重试）
+  void openWsPicker(ui.wsPickerMode);
 }
 
 /** ---- 移除工作区（kebab 菜单 → 确认 modal → DELETE；删除失败 400 回授默认根标记） ---- */
@@ -1625,6 +1663,8 @@ async function restoreSession(id) {
 
   closeStreamForSwitch(); // 1) 先关旧流 broker
   ui.sessionId = id;
+  // P1-2：恢复会话 = 明确选中其工作区 → 持久化（重启不回「先选工作区」锁定态）
+  saveWorkspaceChoice(localStorage, true);
   store.reset();
   store.setSessionId(id);
 
@@ -1684,6 +1724,8 @@ async function restoreSession(id) {
  */
 async function newSession(workspaceRoot = null) {
   ui.wsChosenRound = true;
+  // P1-2：已选工作区持久化 —— 刷新/重启不回锁定态（有已选工作区即解锁）
+  saveWorkspaceChoice(localStorage, true);
   let id = null;
   let created = false;
   try {
@@ -1753,6 +1795,7 @@ async function confirmDeleteSession() {
       closeStreamForSwitch();
       ui.sessionId = null;
       ui.wsChosenRound = true;
+      saveWorkspaceChoice(localStorage, true); // P1-2：选择不因删除撤销 → 持久化
       store.reset();
       store.setSessionId(null);
     }
@@ -2289,7 +2332,9 @@ function ensureToolCardVariant(card, variant) {
   card._args = null;
   card._result = null;
   card._lineEl = null;
-  if (variant === 'generic') {
+  if (variant === 'generic' || variant === 'skill') {
+    // skill（use_skill，P2-11）：卡片标题/摘要语义化（加载技能 + id 一行）；
+    // 展开态才见原始 arguments JSON（惰性同 generic —— 折叠态零正文 DOM）
     const argsLabel = document.createElement('div');
     argsLabel.className = 'tool-args-label';
     argsLabel.textContent = '参数';
@@ -2327,7 +2372,7 @@ function ensureToolCardVariant(card, variant) {
 function flushToolCard(card) {
   const plan = card._plan;
   if (!plan) return;
-  if (card._variant === 'generic') return flushGenericBlocks(card);
+  if (card._variant === 'generic' || card._variant === 'skill') return flushGenericBlocks(card);
   if (card._variant === 'bash' || card._variant === 'read') {
     if (card._lazyBuilt) return;
     card._lazyBuilt = true;
@@ -2638,6 +2683,8 @@ function renderHeader(snap) {
   el.conn.dataset.state = connState === 'config' ? 'warn' : connState;
   // 六态裁决的键恰好是 CONN_VISIBLE 全表键集（off 也在表内）—— 索引必有值，无兜底。
   el.connLabel.textContent = CONN_VISIBLE[connState];
+  // P2-4 状态词解释：每个词带悬停一句话（下一动作提示；CONN_HINTS 与词表同键集）
+  el.conn.title = CONN_HINTS[connState] ?? '连接状态';
 
   // 停止按钮：run 进行中（含工具执行/审批等待）始终可见 —— 由 runActiveFlag 控制
   el.stop.hidden = !snap.runActive;
@@ -3467,6 +3514,8 @@ async function postChat(text, images) {
       },
     });
     ui.sessionId = res?.sessionId ?? ui.sessionId;
+    // P1-2：会话创建/恢复即视为已选工作区 → 持久化（刷新不回锁态）
+    if (ui.sessionId) saveWorkspaceChoice(localStorage, true);
     store.setSessionId(ui.sessionId);
     store.addUser(text, carryImages);
     clearAttachments();
@@ -3480,7 +3529,9 @@ async function postChat(text, images) {
   } catch (err) {
     store.endRun();
     store.endStream();
-    store.addSystem(`消息发送失败：${err instanceof Error ? err.message : String(err)}`);
+    // P2-8 报错本地化：供应商裸英文（图片被拒/认证/限流/网络）→ 中文 + 指引
+    const raw = err instanceof Error ? err.message : String(err);
+    store.addSystem(`消息发送失败：${friendlyProviderError(raw) ?? raw}`);
   }
 }
 
@@ -3533,6 +3584,8 @@ async function ensureStream(sessionId) {
         if (ev?.event === 'run-status' && TERMINAL_STATUSES.includes(ev?.data?.status)) {
           void refreshStats();
           void refreshSessionList(true);
+          // P2-10 评审静默：run 落幕 → 子代理明确未启用且无独立审查时，至多提示一次
+          maybeHintReviewSkipped();
         }
       },
     });
@@ -3544,10 +3597,13 @@ async function ensureStream(sessionId) {
         // 严格先选工作区：流 404 不撤销本轮选择（下一消息经 /api/chat 建新会话）
         ui.sessionId = null;
         ui.wsChosenRound = true;
+        saveWorkspaceChoice(localStorage, true); // P1-2：锁定态解绑后仍保持已选
         store.setSessionId(null);
         store.addSystem('上次会话不存在，将开启新会话', 'info');
       } else {
-        store.addSystem(`连接中断：${err instanceof Error ? err.message : String(err)}`);
+        // P2-8 报错本地化：供应商裸英文 → 中文 + 指引（未命中模式保留原文）
+        const raw = err instanceof Error ? err.message : String(err);
+        store.addSystem(`连接中断：${friendlyProviderError(raw) ?? raw}`);
       }
     }
   } finally {
@@ -3555,6 +3611,27 @@ async function ensureStream(sessionId) {
     // 旧流 finally 不清新流状态；见 streams.js 与 api.test / streams.test 的竞态用例）。
     streamGate.retire(ctrl);
   }
+}
+
+/**
+ * P2-10 收尾评审静默（run 落幕时）：评审开关开着、子代理明确未启用（subagents-disabled
+ * 定论——池即拒）、有实质变更、且该会话从未派出独立审查 → 消息流一行轻提示
+ * 「本次未派独立评审（子代理不可用）」—— 最多一次（ui.reviewSkippedHinted），
+ * 不再让模型两连失败尝试（服务端哨兵在池未启用时静默跳过，见 loop 层）。
+ * 网络挂/认证被拒路径由失败审查卡 + 模型一行说明覆盖（不是「未启用」——不提示）。
+ */
+function maybeHintReviewSkipped() {
+  if (ui.reviewSkippedHinted) return;
+  const snap = store.snapshot();
+  const hint = reviewSkippedHint({
+    items: snap?.items ?? [],
+    runActive: snap?.runActive === true,
+    reviewMode: ui.settings.reviewMode,
+    subagentsEnabled: ui.subagent.enabled,
+  });
+  if (hint === null) return;
+  ui.reviewSkippedHinted = true;
+  store.addSystem(hint, 'info');
 }
 
 /** 停止：只 POST /api/interrupt，不动长活流 —— 终态 run-status 仍经本流到达。 */
@@ -4231,6 +4308,12 @@ async function saveSettingsForm() {
     ui.settings = { ...ui.settings, ...saved };
     el.settingsStatus.textContent = '✓ 已保存';
     el.settingsStatus.className = 'drawer-status';
+    // P1-2：保存成功 → 主界面**原地**刷新锁态与展示（无需 F5）——
+    // 模型组合栏（新名）/顶栏连接态（待配置→未连接）/composer 解锁与 hero 提示
+    // （「填写 API 密钥后即可开始」消失 / hero 是否隐藏）全部随 ui.settings 立即生效。
+    ui.settingsReady = true;
+    syncModelCombo();
+    render(store.snapshot()); // 当前视图重渲染（hero/顶栏/composer/meter 全量收口）
     fillSettingsForm();
     // S 档钳制提示（ADR-0016）：保存响应 clamped → toast 「已按 <model> 上限钳制为 N」
     // （回显已套钳后值——保存即生效，不静默）
@@ -4283,9 +4366,9 @@ function fillSettingsForm() {
     el.settingsStatus.textContent = '输入/输出上限已用默认值，请修改并保存';
     el.settingsStatus.className = 'drawer-status';
   }
-  // 工作区目录：服务端未提供时为占位（显示字段，不可改）
-  el.setWorkspace.textContent =
-    ui.settings.workspaceDir || '（服务端未提供 · 工作目录由 DevMate 启动位置决定）';
+  // 工作区目录：服务端未提供时按「由启动目录决定」占位（显示字段，不可改）——
+  // P2-5 净化：不再出现「服务端未提供」内部语
+  el.setWorkspace.textContent = ui.settings.workspaceDir || '（由启动目录决定）';
   if (ui.settings.keyConfigured) {
     el.keyState.textContent = `已配置 · 掩码 ${ui.settings.apiKeyMasked || '****'}`;
     el.keyState.className = 'field-help key-state';
@@ -4643,8 +4726,9 @@ function workspacePicked() {
 }
 
 /** 输入占位双态（JS 单一来源：锁态「先选择工作区…」，解锁还原缺省文案 —— 与
- *  index.html 的 placeholder 属性同值，首帧先由属性供字，此后以 JS 为准）。 */
-const COMPOSER_PLACEHOLDER_DEFAULT = '描述你想构建什么';
+ *  index.html 的 placeholder 属性同值，首帧先由属性供字，此后以 JS 为准）。
+ *  P2-12 命令发现性：缺省文案带「（输入 / 查看命令）」——斜杠命令有人口了。 */
+const COMPOSER_PLACEHOLDER_DEFAULT = '描述你想构建什么（输入 / 查看命令）';
 const COMPOSER_PLACEHOLDER_LOCKED = '先选择工作区…';
 
 function renderComposer() {
@@ -4908,9 +4992,9 @@ function wireEvents() {
     if (event.target instanceof Element && event.target.closest('#btn-new-session')) return;
     closeWsNewMenu();
   });
-  // 添加工作区（区块头 ＋）：直达目录弹窗
+  // 添加工作区（区块头 ＋）：直达目录弹窗（P2-1：标题与按钮行为一致 = 「添加工作区」）
   el.btnAddWorkspace.addEventListener('click', () => {
-    void openWsPicker();
+    void openWsPicker('add');
   });
   // hero「选择工作区…」：直开目录弹窗；选定后自动建该工作区新会话并进入
   el.heroPickWorkspace?.addEventListener('click', () => {
@@ -5085,15 +5169,19 @@ async function boot() {
   syncMethodFirstToggle();
   // R2-S2：收尾评审开关（启动 GET 回显 —— 设置打开时也随 openSettings 重读）
   syncReviewModeToggle();
+  // P2-10：子代理工作流偏好也在启动时载入（评审静默裁决用；设置页打开时随 openSettings 重读）
+  void loadWorkflowPrefView();
   // 窗口覆盖就绪：上下文环重新取值（首帧可能在 settings 未到前渲染过）
   if (ui.lastSnap) renderMeter();
 
   // 启动不自动恢复上次会话（2026-08-30 决策）：首屏 = 空态 hero「让每个想法动起来」；
   // 历史恢复仅经侧栏点击行（restoreSession，原样）。会话指针不再持久化于 localStorage。
-  // 严格先选工作区（A 档）：启动恒锁态（sessionId 空 + 本轮未选工作区；hero 常显、
-  // composer 禁用）——解锁仅经 工作区选定建会话 / 侧栏会话行恢复（见 A 档契约）。
+  // 严格先选工作区（A 档）：锁态 = 会话指针空 + 本轮未选工作区（hero 常显、composer 禁用）。
+  // P1-2（启动改动）：「已选工作区」持久化于 localStorage（workspaceChoicePersisted）——
+  // 曾选过（新建/默认工作区/目录选定）且未清 → 启动即解锁（不回 hero 锁定态、
+  // composer 可输入「描述你想构建什么」）；下一条消息自动在服务端默认根开新会话。
   ui.sessionId = null;
-  ui.wsChosenRound = false;
+  ui.wsChosenRound = loadWorkspaceChoice(localStorage);
   store.setSessionId(null);
 
   // S14：per-workspace 折叠映射（损坏/缺失 → 全展开；读写容错见 workspaces.js）

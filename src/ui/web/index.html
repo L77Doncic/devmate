@@ -84,7 +84,9 @@
             id="btn-new-session"
             type="button"
             aria-label="新建会话"
-            title="新建会话"
+            title="新建会话（选择工作区；区头「＋」为直接新建）"
+            aria-haspopup="menu"
+            aria-expanded="false"
           >
             <svg class="newSessionIcon" viewBox="0 0 16 16" aria-hidden="true">
               <path
@@ -254,6 +256,7 @@
               <button class="hero-link" id="hero-default-workspace" type="button">
                 使用默认工作区
               </button>
+              <p class="hero-hint">试试 /help 查看命令集</p>
             </div>
           </div>
         </main>
@@ -327,7 +330,7 @@
               class="composer-input"
               id="input"
               rows="1"
-              placeholder="描述你想构建什么"
+              placeholder="描述你想构建什么（输入 / 查看命令）"
               autocomplete="off"
               autocapitalize="off"
               spellcheck="false"
@@ -716,8 +719,8 @@
               </div>
               <div class="field-group">
                 <span class="field-label">工作区目录</span>
-                <code class="workspace-display" id="set-workspace">（服务端未提供）</code>
-                <p class="field-help">仅展示确认；工作目录由 DevMate 启动位置决定。</p>
+                <code class="workspace-display" id="set-workspace">（由启动目录决定）</code>
+                <p class="field-help">仅展示确认；未显式选择时，工作目录由 DevMate 启动位置决定。</p>
               </div>
             </div>
             <!-- Subagent 工作流：开关 + 并行数（0-8 步进；0 = 无上限（按需派遣）——

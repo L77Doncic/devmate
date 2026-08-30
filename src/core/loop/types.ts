@@ -216,6 +216,13 @@ export interface ReviewGate {
   isFlagged(sessionId: string): boolean;
   /** 注入时置位（一次性护栏的写侧；先置位后注入）。 */
   markFlagged(sessionId: string): void;
+  /**
+   * 子代理是否可派发（可选接缝；P2-10 评审静默）：缺省 undefined = 认为可用（旧实现）；
+   * 提供且返回 false（如池未启用 subagents-disabled）→ 哨兵**静默跳过注入**——
+   * 不指示模型去摘必然失败的两连失败尝试；该轮直接自然结束（UI 侧至多提示一行
+   * 「本次未派独立评审（子代理不可用）」，见 app.js maybeHintReviewSkipped）。
+   */
+  subagentAvailable?(): boolean;
 }
 
 // ---------------------------------------------------------------------------

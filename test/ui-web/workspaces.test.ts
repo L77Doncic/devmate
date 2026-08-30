@@ -11,6 +11,8 @@ import {
   WS_SEARCH_NO_MATCH,
   WS_SORT_MODES,
   WS_COLLAPSE_LS_KEY,
+  loadWorkspaceChoice,
+  saveWorkspaceChoice,
   WS_MENU_ITEMS,
   WS_UNGROUPED_LABEL,
   isAbsolutePath,
@@ -508,5 +510,63 @@ describe('filter + sort + group 流水线（renderSessionList 的入参组合）
     );
     expect(none).toHaveLength(1);
     expect(none[0].sessions).toEqual([]);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// P1-2：已选工作区持久化（刷新/重启不回「先选工作区」锁定态）
+// ---------------------------------------------------------------------------
+
+describe('workspace choice 持久化（load/saveWorkspaceChoice）', () => {
+  /** 内存版 storageLike（键值对；typed Record<string,string> 满足 checkJs）。 */
+  function fakeStorage(initial: Record<string, string> = {}): {
+    getItem: (k: string) => string | null;
+    setItem: (k: string, v: string) => void;
+    removeItem: (k: string) => void;
+    _data: Record<string, string>;
+  } {
+    const data: Record<string, string> = { ...initial };
+    return {
+      getItem: (k: string) => (k in data ? data[k] ?? null : null),
+      setItem: (k: string, v: string) => {
+        data[k] = String(v);
+      },
+      removeItem: (k: string) => {
+        delete data[k];
+      },
+      _data: data,
+    };
+  }
+
+  it('保存置「1」→ 读取为 true（解锁）；仅字面量 1 服从', () => {
+    const storage = fakeStorage();
+    expect(loadWorkspaceChoice(storage)).toBe(false);
+    saveWorkspaceChoice(storage, true);
+    expect(loadWorkspaceChoice(storage)).toBe(true);
+    expect(storage._data['devmate.ui.workspaceChoicePersisted']).toBe('1');
+  });
+
+  it('清空（chosen=false）→ 删键 → 读回 false（回到锁态默认）', () => {
+    const storage = fakeStorage({ 'devmate.ui.workspaceChoicePersisted': '1' });
+    expect(loadWorkspaceChoice(storage)).toBe(true);
+    saveWorkspaceChoice(storage, false);
+    expect(loadWorkspaceChoice(storage)).toBe(false);
+  });
+
+  it('坏值/旧记法 → false（锁态是安全默认，不误解锁）', () => {
+    for (const bad of ['true', 'yes', 'true', ' ', '', JSON.stringify(true)]) {
+      const storage = fakeStorage({ 'devmate.ui.workspaceChoicePersisted': bad });
+      expect(loadWorkspaceChoice(storage)).toBe(false);
+    }
+  });
+
+  it('存储异常（getItem/setItem 抛错）→ 容错不 throw', () => {
+    const boom = {
+      getItem: () => { throw new Error('nope'); },
+      setItem: () => { throw new Error('nope'); },
+      removeItem: () => { throw new Error('nope'); },
+    };
+    expect(loadWorkspaceChoice(boom)).toBe(false);
+    expect(() => saveWorkspaceChoice(boom, true)).not.toThrow();
   });
 });

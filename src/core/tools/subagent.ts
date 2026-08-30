@@ -166,10 +166,24 @@ function subagentErrorMessage(code: SubagentToolErrorCode, detail: string | unde
         'sub-agent pool queue is full: the spawn was rejected (wait for capacity ' +
         'or finish without a sub-agent)'
       );
-    case 'subagent-error':
-      return detail !== undefined && detail !== ''
-        ? `sub-agent failed: ${detail}`
-        : 'sub-agent failed (unknown error; retry or finish without a sub-agent)';
+    case 'subagent-error': {
+      const raw = typeof detail === 'string' ? detail.trim() : '';
+      // P2-9/P2-10 文案净化：上游差错原文（“Authentication Fails (governor)”之类）
+      // 不再直接裸露给模型/用户 —— 认证/网络两类按意思映射为中文一行（无内部词、
+      // 无端点路径），并「勿反复重试/直接收尾」收口（评审只尝试一次的护栏——不双失败）。
+      if (/authentication|auth\s*fail|auth error|governor|invalid[ _]api[ _]?key|401/i.test(raw)) {
+        return (
+          '子代理调用失败：认证被拒——检查 API Key 有效性与模型权限，或稍后重试；' +
+          '失败请勿反复尝试，直接收尾并在报告注明一行即可'
+        );
+      }
+      if (/network|econnrefused|fetch failed|timeout|timed ?out|unreachable/i.test(raw)) {
+        return '子代理调用失败：网络不可用——稍后重试，或直接收尾（勿反复尝试）';
+      }
+      return raw !== ''
+        ? `子代理调用失败：${raw}`
+        : '子代理调用失败（未知错误；重试或直接收尾——勿反复尝试）';
+    }
   }
 }
 

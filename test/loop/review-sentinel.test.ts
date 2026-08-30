@@ -282,3 +282,53 @@ describe('loop：评审哨兵语义纯函数（RunStats）', () => {
     expect(hasReviewRun({ counts: {}, subagentPrompts: ['先查资料', '请审查代码'] })).toBe(true);
   });
 });
+
+describe('loop：评审哨兵子代理可用性（P2-10 静默 —— subagents-disabled 时不指示模型尝试）', () => {
+  it('r7) subagentAvailable=false（子代理未启用）→ 哨兵静默跳过：不注入、一步自然结束（不再双失败）', async () => {
+    const store = readyStore();
+    const gate = gateOf({ substantive: true });
+    (gate as ReviewGate & { subagentAvailable?: () => boolean }).subagentAvailable = () => false;
+    const llm = new FakeLlm([{ content: '改完了，收尾' }]);
+
+    const result = await run(
+      { sessionId: 's1', task: '修一个 bug' },
+      baseOpts({
+        store,
+        tools: defineRegistry([echoTool()], { sessionId: 's1' }),
+        llm,
+        review: gate,
+      }),
+    );
+
+    expect(result.status).toBe('completed');
+    expect(result.steps).toBe(1); // 无续跑：未被打扰
+    expect(llm.requests).toHaveLength(1);
+    expect(gate.markCalls).toEqual([]); // 未置位（用户随后启用子代理仍可再试）
+    const events = await collectEvents(store, 's1');
+    expect(kindsOf(events)).toEqual(['user', 'assistant(0tc)', 'event(run_result)']);
+    expect(sentinelEvent(events)).toBeUndefined();
+  });
+
+  it('r8) gate 的 subagentAvailable 抛错 → 按门故障收敛：不干预自然结束', async () => {
+    const store = readyStore();
+    const gate = gateOf({ substantive: true });
+    (gate as ReviewGate & { subagentAvailable?: () => boolean }).subagentAvailable = () => {
+      throw new Error('pool missing');
+    };
+    const llm = new FakeLlm([{ content: '结束' }]);
+
+    const result = await run(
+      { sessionId: 's1', task: '改一个' },
+      baseOpts({
+        store,
+        tools: defineRegistry([echoTool()], { sessionId: 's1' }),
+        llm,
+        review: gate,
+      }),
+    );
+
+    expect(result.status).toBe('completed');
+    expect(result.steps).toBe(1);
+    expect(sentinelEvent(await collectEvents(store, 's1'))).toBeUndefined();
+  });
+});

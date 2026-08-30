@@ -56,6 +56,7 @@ import type { SubagentPool, SubagentResult, SubagentTask } from '../../src/core/
 import type { SkillsIndex } from '../../src/core/tools/skill.js';
 import { createDevmateServer } from '../../src/ui/server/index.js';
 import type { DevmateServerDeps } from '../../src/ui/server/index.js';
+import { LlmError } from '../../src/shared/llm-types.js';
 import { assembleDeps, createSessionToolsFactory } from '../../src/ui/server/deps.js';
 import type { WorkflowConfig } from '../../src/shared/workflow.js';
 import { FakeLlm } from '../loop/support.js';
@@ -1074,5 +1075,61 @@ describe('E2E-H：附件管线全链（assembleDeps + AttachmentStore + FakeLlm 
     const del = await fetch(new URL('/api/sessions/s-attach-e2e', base), { method: 'DELETE' });
     expect(del.status).toBe(200);
     expect(existsSync(join(sessionsDir, 'attachments', `${PNG_SHA}.png`))).toBe(false);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// E2E-I：供应商裸英文报错本地化（P2-6/P2-8 —— run-error → 中文 + 指引）
+// ---------------------------------------------------------------------------
+
+describe('E2E-I：供应商报错本地化（run-error 事件 → 中文一行 + 指引）', () => {
+  let dir: string;
+  let deps: DevmateServerDeps;
+  let handle: TestServerHandle | null = null;
+
+  beforeEach(async () => {
+    dir = await mkdtemp(join(tmpdir(), 'devmate-e2e-i-'));
+    // 模拟走查现场：DeepSeek 网关对图片的 400 原文（walkthrough 「裸英文报错」）
+    deps = await assembleDeps({
+      workspaceRoot: dir,
+      sessionsDir: join(dir, 'sessions'),
+      model: 'deepseek-v4-flash',
+    });
+    deps.llm = new FakeLlm([
+      {
+        error: new LlmError({
+          kind: 'http',
+          status: 400,
+          retryable: false,
+          message:
+            '.messages[1].image[0]: You have uploaded an unsupported image. Please make sure your image is valid and has one of the following formats: webp, png, jpeg, and gif.',
+        }),
+      },
+    ]);
+    deps.createLlm = () => deps.llm!;
+    handle = await startServer(deps);
+  });
+
+  afterEach(async () => {
+    await handle?.server.close();
+    await rm(dir, { recursive: true, force: true });
+  });
+
+  it('I1) 图片被供应商拒收：run-error message = 中文格式指引（不含裸英文/内部词）', async () => {
+    const base = handle!.base;
+    const res = await postJson(base, '/api/chat', { text: '描述这张图' });
+    expect(res.status).toBe(200);
+    const { sessionId } = (await res.json()) as { sessionId: string };
+    const client = await SseClient.connect(base, sessionId);
+    await waitForFrames(client, 3, 10_000);
+    const errorFrame = client.frames.find((f) => f.event === 'run-error');
+    expect(errorFrame).toBeDefined();
+    const message = String(errorFrame!.data.message);
+    expect(message).toContain('图片请求被拒');
+    expect(message).toContain('png');
+    expect(message).not.toMatch(/unsupported image/);
+    expect(client.frames.map((f) => f.event)).toContain('run-status');
+    const terminal = client.frames.find((f) => f.event === 'run-status');
+    expect(terminal!.data).toMatchObject({ status: 'fatal' });
   });
 });

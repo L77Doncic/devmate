@@ -1073,6 +1073,12 @@ pre {
 .newSession:hover {
   background: var(--dsw-alias-button-floating-hover);
 }
+/* 菜单打开态（P2-1 视觉反馈）：按钮压态 —— 与竞态菜单互相印证 */
+.newSession.active {
+  background: var(--dsw-alias-interactive-bg-hover);
+  border-color: var(--accent-border);
+  color: var(--accent);
+}
 .newSessionIcon {
   flex: none;
   width: 14px;
@@ -2778,6 +2784,17 @@ pre {
 .hero-link:focus-visible {
   color: var(--accent);
 }
+/* 命令发现性小字（P2-12）：hero 下一次轻提示「试试 /help 查看命令集」，
+   弱化小字 + 上间隔 —— 不抢主 CTA 视觉 */
+.hero-hint {
+  margin: 10px 0 0;
+  padding: 4px 10px;
+  border: 1px solid var(--dsw-alias-border-l2);
+  border-radius: 999px;
+  color: var(--dsw-alias-label-tertiary);
+  font-size: var(--dsw-font-size-s);
+  line-height: 18px;
+}
 
 /* 「预览版」badge（dsh EmptyHero 徽章；r6 实底小字，非交互） */
 .hero-badge {
@@ -4386,7 +4403,9 @@ pre {
 /* ---------- ＋新建 菜单（dsh WorkspacePickFlow 形态：Menu 表面 —— 工作区列表 +
    分隔 + 底部钉置「添加工作区…」） ---------- */
 .wsMenu {
-  position: absolute;
+  /* P2-1：fixed 定位 —— 逃出 .sidebar/.sidebar-track 的 overflow 剪裁
+     （absolute 会把「＋新建」菜单裁成 0 尺寸/不可见 —— 走查连点 3 次「零反馈」根因） */
+  position: fixed;
   z-index: 46;
   min-width: 200px;
   max-width: 236px;

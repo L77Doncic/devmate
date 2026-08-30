@@ -149,7 +149,9 @@ export async function createJail(options: JailOptions): Promise<Jail> {
   const checkPath = async (p: string, mode: JailMode): Promise<JailDecision> => {
     const lex = normalizePath(p, wsLex, platform);
     if (!lexForms.some((lf) => pathWithin(lex, lf, platform))) {
-      return deny(`按字面越界：${lex} 不落在任何已登记边界内`);
+      // P2-9 文案净化：不再用「按字面越界/已登记边界」内部语 —— 换成用户可懂的
+      // 「路径越界（不在工作区内）」；含原路径，下一动作自明（用工作区内路径）。
+      return deny(`路径越界：${lex} 不在工作区边界内（只允许访问工作区目录下的文件）`);
     }
     const landing = await resolveLanding(lex, fs, impl);
     if (!landing.ok) {

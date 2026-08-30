@@ -405,6 +405,39 @@ export function saveWorkspaceCollapse(storage, collapsed) {
 }
 
 // ---------------------------------------------------------------------------
+// 已选工作区持久化（P1-2：保存设置/刷新/重启不回「先选工作区」锁定态 —— 有已选
+// 工作区即解锁；写读均容错，与 fold 映射同纪律）。
+// ---------------------------------------------------------------------------
+
+/** 持久键（命名与前缀同族：devmate.ui.workspaceChoicePersisted；布尔位）。 */
+const WS_CHOICE_KEY = 'devmate.ui.workspaceChoicePersisted';
+
+/**
+ * 读取「已选过工作区」位：仅字面量 '1' 为真（坏值/缺失 → false = 仍锁态；
+ * 防旧记法/损坏值误解锁）。读取异常 → false（锁态是安全默认）。
+ */
+export function loadWorkspaceChoice(storage) {
+  try {
+    return storage?.getItem?.(WS_CHOICE_KEY) === '1';
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * 写入/清空「已选工作区」位：chosen=true → 置 '1'；false → 删键。
+ * 写入异常静默（锁态回退由下次读取决定，不 throw）。
+ */
+export function saveWorkspaceChoice(storage, chosen) {
+  try {
+    if (chosen) storage?.setItem?.(WS_CHOICE_KEY, '1');
+    else storage?.removeItem?.(WS_CHOICE_KEY);
+  } catch {
+    // 隐私模式/禁用存储：不 throw
+  }
+}
+
+// ---------------------------------------------------------------------------
 // 错误映射（dsh folderError 形态：kind → 中文文案）
 // ---------------------------------------------------------------------------
 

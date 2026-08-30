@@ -133,6 +133,20 @@ export const CONN_VISIBLE = Object.freeze({
 });
 
 /**
+ * 连接态悬停解释（顶栏 conn pill 的 title；与 CONN_VISIBLE 同键集）：
+ * 每个词给「下一动作」一句话 —— 第一次出现「待配置/未连接」不再需要去猜。
+ * 键不镜像 = 漂移（防漂移断言见 format.test.ts）。
+ */
+export const CONN_HINTS = Object.freeze({
+  ok: '已连接：当前会话可正常收发消息',
+  busy: '任务进行中：可点输入区左侧的「停止」中断',
+  warn: '等待审批：请处理输入区上方的批准提示',
+  err: '上次运行出错：看看消息流中的错误说明',
+  config: '待配置：打开设置→模型接口，填写 API Key 并保存后即可开始',
+  off: '未连接：先选择工作区（「选择工作区…」或「使用默认工作区」）',
+});
+
+/**
  * 工具卡状态词（7 态；messages.js 状态机是唯一产出面：running / success / failed /
  * pending / done-waiting-result / denied / interrupted）。app.js 以
  * `TOOL_STATE_LABEL[t.state] ?? statusLabel(t.state)` 兜底读取。
@@ -257,10 +271,11 @@ export function composerStatsLine(runStatus, usage) {
   }
   if (usage) {
     const u = [];
-    if (Number.isFinite(usage.promptTokens)) u.push(`入 ${formatTokens(usage.promptTokens)}`);
+    if (Number.isFinite(usage.promptTokens))
+      u.push(`入 ${formatTokens(usage.promptTokens)} tokens`);
     if (Number.isFinite(usage.completionTokens))
-      u.push(`出 ${formatTokens(usage.completionTokens)}`);
-    if (Number.isFinite(usage.totalTokens)) u.push(`总 ${formatTokens(usage.totalTokens)}`);
+      u.push(`出 ${formatTokens(usage.completionTokens)} tokens`);
+    if (Number.isFinite(usage.totalTokens)) u.push(`总 ${formatTokens(usage.totalTokens)} tokens`);
     if (u.length > 0) groups.push(u);
     if (Number.isFinite(usage.costUsd)) {
       groups.push([`${usage.estimated ? '≈' : ''}${formatCostUsd(usage.costUsd)}`]);
@@ -397,6 +412,8 @@ export function classifyTool(name) {
     case 'glob':
     case 'web_search':
       return 'search';
+    case 'use_skill':
+      return 'skill';
     default:
       return 'generic';
   }
@@ -409,6 +426,7 @@ export const TOOL_VARIANT_TITLES = Object.freeze({
   write: '写入文件',
   edit: '编辑文件',
   search: '检索',
+  skill: '加载技能',
   generic: '工具调用',
 });
 
@@ -453,12 +471,45 @@ export function isReviewSubagent(call) {
  * - verdict：报告内容（content → preview 兜底）首行非空行取前 60 字符；
  * - 无结果（tool 在途/无输出）→ verdict 空串（渲染层落「（审查进行中…）」）。
  */
+/**
+ * 子代理失败 → 用户友好一句话（评审块失败结论 + 工具卡失败判读共用）：
+ * 识别常见池级/传输层差错原文（认证被拒 / 未启用 / 网络不可用），映射为中文一行
+ * （无端点路径、无内部词；保留原义）；未命中 → 原样压平（错误仍是普通消息）。
+ */
+export function friendlySubagentError(raw) {
+  const s = String(raw ?? '').trim();
+  if (!s) return '子代理调用失败（未知错误）';
+  if (/authentication|auth\s*fail|auth error|governor|invalid[ _]api[ _]?key|401/i.test(s)) {
+    return '子代理调用失败：认证被拒——检查 API Key 与模型权限后重试';
+  }
+  if (/subagents-disabled|sub-agents are disabled/i.test(s)) {
+    return '子代理未启用：在设置→常规开启子代理工作流后可派独立评审';
+  }
+  if (/cost-guard|cost guard/i.test(s)) {
+    return '子代理未派出：子代理预算已到上限（稍后释放或调高预算）';
+  }
+  if (/queue-full|queue is full/i.test(s)) {
+    return '子代理未派出：排队已满（稍后重试或直接收尾）';
+  }
+  if (/network|econnrefused|fetch failed|timeout|timed ?out|unreachable|connection/i.test(s)) {
+    return '子代理调用失败：网络不可用（稍后重试或直接收尾）';
+  }
+  return truncate(errorSummary(s, 60), 60);
+}
+
 export function reviewBlockText(call, result) {
   const args = parseToolArguments(call?.arguments);
   const prompt = args && typeof args.prompt === 'string' ? args.prompt : '';
   const title = args && typeof args.title === 'string' ? args.title.trim() : '';
   const subject =
     title !== '' ? truncate(title, 40) : truncate(prompt.replace(/\s+/g, ' ').trim(), 40);
+  // 失败（子代理未派出）：结论 = 用户友好一行（不再裸露原始 JSON/内部错误原文）
+  if (result && typeof result === 'object' && result.ok === false) {
+    return {
+      subject,
+      verdict: friendlySubagentError(result.error ?? result.preview ?? result.content ?? ''),
+    };
+  }
   const full = String(result?.content ?? result?.preview ?? '');
   const firstLine =
     full
@@ -466,6 +517,87 @@ export function reviewBlockText(call, result) {
       .map((s) => s.trim())
       .filter((s) => s !== '')[0] ?? '';
   return { subject, verdict: truncate(firstLine, 60) };
+}
+
+// ---------------------------------------------------------------------------
+// 供应商报错本地化（图片拒绝 / 认证失败 / 网络不可用）：裸英文 API 文本 → 中文指引。
+// 命中返回用户友好一行；未命中返回 null（调用方保留原始文本 —— 零信息损失）。
+// 只做「匹配已知模式 → 中文」，绝不替供应商说没有的话。
+// ---------------------------------------------------------------------------
+
+/** 图片被供应商拒收（非图像 / 超限 / 数量超）：中文 + 下一步指引。 */
+export function friendlyImageError(raw) {
+  const s = String(raw ?? '');
+  if (/unsupported image|invalid image|bad image|not a valid image|image.*format/i.test(s)) {
+    return '图片未被接受：请换用 png / jpg(jpeg) / webp / gif 格式的图片重发（可在附件预览中移除这张后重试）';
+  }
+  // 体积/尺寸超限要在「数量超限」之前判 —— “total size of images exceeds the limit” 含
+  // “images … limit” 字样，会被数量模式优先误吞
+  if (/total size|too large|too many pixels|image.*size|payload.*large|size.*exceeds/i.test(s)) {
+    return '图片体积/尺寸超出供应商上限：请压缩或换小图后重发';
+  }
+  if (/too many images|maximum.*images|too many.*image|image.*too many/i.test(s)) {
+    return '图片数量超出一次发送上限：请分批发送（发送前可在附件预览中先移除几张）';
+  }
+  return null;
+}
+
+/** 通用供应商/连接层报错本地化（未命中 → null：保留原文，不冒充解释）。 */
+export function friendlyProviderError(raw) {
+  const s = String(raw ?? '');
+  const image = friendlyImageError(s);
+  if (image !== null) return `图片请求被拒：${image}`;
+  if (/authentication|auth\s*fail|auth error|governor|invalid[ _]api[ _]?key|401/i.test(s)) {
+    return '认证失败：请检查 API Key（设置→模型接口）是否有效、模型名是否正确';
+  }
+  if (/rate limit|too many requests|429/i.test(s)) {
+    return '请求频繁被限流：稍等片刻再试（服务端自动重试已尽力）';
+  }
+  if (/network|econnrefused|fetch failed|timeout|timed ?out|unreachable/i.test(s)) {
+    return '网络连接失败：检查网络后重试';
+  }
+  return null;
+}
+
+// ---------------------------------------------------------------------------
+// R2-S2 · 收尾评审静默（P1-2 附）：子代理明确未启用时，run 结束后至多提示一次
+// 「本次未派独立评审（子代理不可用）」（一行，不双失败、不每任务重复）。
+// ---------------------------------------------------------------------------
+
+/** 轻提示文案（单一来源；app.js 消费，防漂移断言见 format.test.ts）。 */
+export const REVIEW_SKIPPED_HINT =
+  '本次未派独立评审（子代理不可用）；可在设置→常规开启子代理工作流';
+
+/** 实质变更工具体例（与 core/loop/types 的 SUBSTANTIVE_TOOL_NAMES + mcp_ 前缀同口径）。 */
+const SUBSTANTIVE_TOOL_NAMES = new Set([
+  'write_file',
+  'edit_file',
+  'run_command',
+  'spawn_subagent',
+]);
+
+/**
+ * 评审未派提示裁决（纯函数）：run 已落幕 + 收尾评审开启 + 子代理未启用（明确态）+
+ * 有实质变更 + 尚无独立审查卡 → 返回提示文案；否则 null（不提示——避免每任务轰炸）。
+ * @param {{ items?: unknown[]; runActive?: boolean; reviewMode?: unknown; subagentsEnabled?: unknown }} view
+ */
+export function reviewSkippedHint(view) {
+  const { items = [], runActive = false, reviewMode, subagentsEnabled } = view ?? {};
+  if (runActive) return null;
+  if (subagentsEnabled !== false) return null; // 只在「明确未启用」时提示（网络挂由失败卡+模型一行说明覆盖）
+  if (reviewMode === false) return null; // 评审未开 → 无提示义务
+  let substantive = false;
+  let reviewSeen = false;
+  for (const item of items) {
+    for (const t of item?.tools ?? []) {
+      if (t?.name === undefined) continue;
+      if (t.review === true) reviewSeen = true;
+      if (SUBSTANTIVE_TOOL_NAMES.has(t.name) || String(t.name).startsWith('mcp_'))
+        substantive = true;
+    }
+  }
+  if (!substantive || reviewSeen) return null;
+  return REVIEW_SKIPPED_HINT;
 }
 
 /**
@@ -496,6 +628,9 @@ export function toolSummaryArgs(raw, variant = 'generic', n = 60) {
       return truncate(String(args.path ?? ''), n);
     case 'search':
       return truncate(String(args.pattern ?? ''), n);
+    case 'skill':
+      // 加载技能（use_skill）：摘要 = 技能 id 一行（不再是 `{"skill":"tdd"}` 原始 JSON）
+      return truncate(String(args.skill ?? args.id ?? ''), n);
     default:
       return argSummary(raw, n);
   }

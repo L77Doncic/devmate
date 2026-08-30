@@ -81,7 +81,9 @@ export const REVIEW_SENTINEL_USER_CONTENT =
   '【评审哨兵】本轮任务产生了实质变更（写入/编辑/命令执行/MCP 调用/子代理）。' +
   '收尾前请先派一次独立审查：调用 spawn_subagent，其 prompt 须含「审查」或 review——' +
   '以交付物对照任务目标，列出缺陷与放行理由（≤400 字）；对审查结论先修复或说明，再收尾。' +
-  '建议 spawn_subagent 时带 skill:"code-review"（该方法论全文会注入审查子代理）；';
+  '建议 spawn_subagent 时带 skill:"code-review"（该方法论全文会注入审查子代理）。' +
+  '【只尝试一次】若子代理不可用（未启用/认证被拒/网络不可达），请勿重试——' +
+  '收尾报告注明一行「本次未派独立评审（子代理不可用）」即可。';
 
 /**
  * 输出截断提示（E8 · ADR-0016 L3）：finish_reason='length' 时注入的系统样式 user 消息
@@ -579,6 +581,16 @@ async function runTurn(deps: TurnDeps): Promise<TurnOutcome> {
 async function maybeInjectReviewSentinel(deps: TurnDeps): Promise<boolean> {
   const gate = deps.review;
   if (gate === undefined) return false;
+  // P2-10 评审静默：池未启用（subagents-disabled）时静默跳过 —— 不让模型触发
+  // 必然失败的 spawn 尝试（走查「两连失败」噪音）；UI 侧至多提示一行。故障收敛
+  // 同门（抛错按关闭处理——护栏故障不放大为行为故障）。
+  try {
+    if (gate.subagentAvailable !== undefined && gate.subagentAvailable() === false) {
+      return false;
+    }
+  } catch {
+    return false;
+  }
   let substantive = false;
   let hasReview = false;
   let flagged = false;
