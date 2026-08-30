@@ -15,7 +15,7 @@
  *   是模型首调可能用错 id——错误回注带可用 id 清单（`available_skills`），与未知工具
  *   （E10「附可用名单收敛」）同口径。
  * - 结果契约：存在且 enabled → {ok:true, content: 全文（≥SKILL_CONTENT_LIMIT_CHARS
- *   经生成期截断面板重写：头 2000 + 尾 2000 + elide 标记 + 收窄建议——复用
+ *   经生成期截断面板重写：头半额 + 尾半额 + elide 标记 + 收窄建议——复用
  *   context/truncate，禁止手写头截断）}；不存在 → skill-not-found；disabled →
  *   skill-disabled；两者 content 均为合法 JSON（顶层 ok:false，
  *   error.available_skills = 当前 enabled 清单——错误与内容分离：模型能收窄后再试；
@@ -49,8 +49,14 @@ export interface SkillsIndex {
   setEnabled(id: string, enabled: boolean): Promise<boolean>;
 }
 
-/** 技能全文注入阈值（字符；懒加载语义的正文上限——与子代理报告同阈值 4k，传入截断面板）。 */
-export const SKILL_CONTENT_LIMIT_CHARS = 4000;
+/**
+ * 技能全文注入阈值（字符；懒加载语义的正文上限，传入截断面板——头尾各半额）。
+ * 8k 与子代理注入（loop/subagent 的 capSkill / SKILL_INJECTION_LIMIT_CHARS=8000）同值：
+ * 技能注入（use_skill 正文 + 服务端资产注入 ≤20k）的载荷纪律——内容先经服务端
+ * compose（SKILL.md + 资产）后再在本层按 8k 面板截断，避免「资产加进去又被截」
+ * 的阈值不一致（阈值上调 2026-08-30：正文 + 资产一并纳入注入预算）。
+ */
+export const SKILL_CONTENT_LIMIT_CHARS = 8000;
 
 /** use_skill 工具构造依赖（索引接缝晚绑定：每次执行期读——开关变化即时生效）。 */
 export interface SkillToolOptions {
@@ -91,7 +97,8 @@ export function createSkillTool(options: SkillToolOptions): Tool {
   return {
     name: 'use_skill',
     description:
-      'Load the full text (SKILL.md, bounded at 4000 chars) of a skill by id. ' +
+      'Load the full text of a skill by id (SKILL.md plus its text assets, bounded ' +
+      'at 8000 chars — the same budget as the sub-agent skill injection). ' +
       'The system prompt lists available skills (name + summary); call this tool ' +
       'when you need the full detailed instructions of one of them (lazy-load semantics).',
     parameters: SCHEMA,

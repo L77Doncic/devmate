@@ -588,7 +588,7 @@ describe('subagent：子代理池', () => {
     });
 
     it('超 SKILL_INJECTION_LIMIT_CHARS → capSkill 头截断 + 「…（截断）」标记；恰在界内原样', async () => {
-      const long = 'A'.repeat(SKILL_INJECTION_LIMIT_CHARS + 700); // >6000
+      const long = 'A'.repeat(SKILL_INJECTION_LIMIT_CHARS + 700); // >8000
       const llm = new FakeLlm([{ content: 'ok' }]);
       const pool = makePool(llm);
 
@@ -602,7 +602,7 @@ describe('subagent：子代理池', () => {
       );
       expect(system).not.toContain('A'.repeat(SKILL_INJECTION_LIMIT_CHARS + 1));
 
-      // 边界：恰 6000 → 原样（不截断、无标记）；capSkill 纯函数直测
+      // 边界：恰 8000 → 原样（不截断、无标记）；capSkill 纯函数直测
       const exactly = 'B'.repeat(SKILL_INJECTION_LIMIT_CHARS);
       expect(capSkill(exactly)).toBe(exactly);
       expect(
@@ -611,7 +611,7 @@ describe('subagent：子代理池', () => {
         ),
       ).toBe(true);
 
-      // astral（代理对）码点边界：6000 个 emoji = 12000 UTF-16 单元 → 按码点不截断；
+      // astral（代理对）码点边界：8000 个 emoji = 16000 UTF-16 单元 → 按码点不截断；
       // 超出一个码点 → 头截（无孤立高位代理——不产生 U+FFFD 破烂）
       const emoji = '😀'.repeat(SKILL_INJECTION_LIMIT_CHARS);
       expect(capSkill(emoji)).toBe(emoji);

@@ -5,8 +5,9 @@
  * 优先；缺一不可）——schema 为 string + 运行时校验（不用 enum：可用 id 随 enabled 开关
  * 变化，枚举进 schema = 任何开关变化都要重建工具面；错误回注带 available_skills 清单
  * 收敛，与 E10 同口径）。
- * 成功 → {ok:true, content: 全文（≥4000 字符经 CONTEXT 截断面板重写：头 2000 + 尾 2000
- * + elide 标记 + 收窄建议；<4000 原样）}；不存在 → skill-not-found；
+ * 成功 → {ok:true, content: 全文（≥8000 字符经 CONTEXT 截断面板重写：头 4000 + 尾 4000
+ * + elide 标记 + 收窄建议；<8000 原样——与子代理技能注入 capSkill 同值 8k：「正文+资产」
+ * 总载荷口径）}；不存在 → skill-not-found；
  * disabled → skill-disabled；索引未回填 → skill-index-unavailable；内容恒为普通结果不抛。
  */
 import { describe, expect, it } from 'vitest';
@@ -69,11 +70,11 @@ describe('tools/skill：use_skill', () => {
     expect(r).toEqual({ ok: true, content: body });
   });
 
-  it('全文超阈值：复用截断器（头 2000 + 尾 2000 + elide 标记 + 收窄建议；禁止手写头截断）', async () => {
-    const long = 'x'.repeat(SKILL_CONTENT_LIMIT_CHARS + 123); // 4123
+  it('全文超阈值：复用截断器（头 4000 + 尾 4000 + elide 标记 + 收窄建议；禁止手写头截断）', async () => {
+    const long = 'x'.repeat(SKILL_CONTENT_LIMIT_CHARS + 123); // 8123
     const r = await run(fakeIndex(undefined, { tdd: long }), JSON.stringify({ skill: 'tdd' }));
     expect(r.ok).toBe(true);
-    const half = SKILL_CONTENT_LIMIT_CHARS / 2; // 2000
+    const half = SKILL_CONTENT_LIMIT_CHARS / 2; // 4000
     expect(r.content?.startsWith(OUTPUT_TOO_LONG_ADVICE)).toBe(true);
     expect(
       r.content?.slice(OUTPUT_TOO_LONG_ADVICE.length, OUTPUT_TOO_LONG_ADVICE.length + half),
@@ -87,6 +88,29 @@ describe('tools/skill：use_skill', () => {
     expect(truncateSkillContent('x'.repeat(SKILL_CONTENT_LIMIT_CHARS - 1))).toBe(
       'x'.repeat(SKILL_CONTENT_LIMIT_CHARS - 1),
     );
+  });
+
+  it('8k 截断契约（固定数）：正文+资产 9000 字符 → 面板头 4000 + 尾 4000 + elide 1000（与 capSkill 同值；面板不吞服务端资产节）', async () => {
+    const long = 'y'.repeat(9000);
+    const r = await run(fakeIndex(undefined, { tdd: long }), JSON.stringify({ skill: 'tdd' }));
+    expect(r.ok).toBe(true);
+    const half = 4000; // SKILL_CONTENT_LIMIT_CHARS / 2（8k 契约固定数——与常量脱钩的回归锁定）
+    expect(r.content?.startsWith(OUTPUT_TOO_LONG_ADVICE)).toBe(true);
+    expect(
+      r.content?.slice(OUTPUT_TOO_LONG_ADVICE.length, OUTPUT_TOO_LONG_ADVICE.length + half),
+    ).toBe(long.slice(0, half));
+    expect(r.content).toContain('\n\n--- 1000 characters elided ---\n\n');
+    expect(r.content?.slice(-half)).toBe(long.slice(-half));
+    // 服务端 compose 的节头/注记是普通正文：面板重写后仍保头尾（不作二次丢弃）
+    const composed = '# Body\n\n## <file:a.txt>\nasset-a\n\n有 1 个二进制资产未注入：logo.png';
+    expect(truncateSkillContent(composed)).toBe(composed);
+  });
+
+  it('技能载荷含资产节（服务端 compose 下游消费）：节头与二进制注记经工具原样返回（≤8k 不截）', async () => {
+    const composed =
+      '---\nname: TDD\n---\nRed. Green. Refactor.\n\n## <file:scripts/ref.md>\nreference snippet\n\n## <file:data.json>\n{"a":1}';
+    const r = await run(fakeIndex(undefined, { tdd: composed }), JSON.stringify({ skill: 'tdd' }));
+    expect(r).toEqual({ ok: true, content: composed });
   });
 
   it('id 不存在 → skill-not-found：content 为合法 JSON，available_skills 只列 enabled 清单', async () => {

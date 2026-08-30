@@ -117,14 +117,24 @@ GET `/api/stats → {rssMb,heapMb,sessions,activeShells}`；GET `/api/tools → 
 
 **spawn_subagent 协议（B-1 借鉴①）**：工具参数 `{prompt, skill?}`——`skill` = 技能 id
 （与 use_skill 同 id 语义，见系统提示技能清单节）；给出时该技能全文经 capSkill
-（≤6000 字符 + 「…（截断）」标记）机械注入子代理 system（「## 方法论（注入）」节），
+（≤8000 字符 + 「…（截断）」标记）机械注入子代理 system（「## 方法论（注入）」节），
 客户端渲染零改动（仍是普通工具卡/审查块判定不变：prompt 含 审查|review）；
 未知/关闭/索引未回填 → 零注入（子代理普通模式）。
+**use_skill 回注契约（技能=目录）**：技能全文 = `SKILL.md` + 同目录文本资产（白名单
+`*.md/*.txt/*.json/*.yaml/*.py/*.js/*.sh`，递归、名序，每资产节头 `## <file:相对路径>`），
+服务端注入载荷 ≤20k 字符（超限按排序前缀截断 + 「…（资产截断）」；二进制/未知扩展名
+跳过并带一行「有 N 个二进制资产未注入：…」注记）；工具回注经生成期截断面板重写
+（≥8000 字符：头 4000 + 尾 4000 + elide 标记 + 收窄建议——与 capSkill 同值 8k）。
+客户端零改动：仍是普通 tool-result（含节头的 markdown 正文）。
 
 **设置页扩展区（Skills / MCP / Subagent 工作流；纯逻辑见 `extensions.js`）**：
 
-- GET `/api/skills → {skills:[{id,name,summary,enabled}]}`（缺省/失败 → 「暂无可用技能」
-  降级行，用户可见文案零端点路径）；POST `/api/skills/:id {enabled}`（开关）。
+- GET `/api/skills → {skills:[{id,name,summary,enabled,origin}]}`（缺省/失败 → 「暂无可用技能」
+  降级行，用户可见文案零端点路径）；POST `/api/skills/:id {enabled}`（开关）；
+  POST `/api/skills/install {source}`（本地目录 / raw.githubusercontent.com URL——技能=目录
+  （SKILL.md+文本资产，注入 ≤20k；URL 安装只落单文件 SKILL.md），成功
+  `{ok,id,origin:'user'}`）。全文仍绝不下发：渲染与枚举不受 origin/install 影响
+  （origin 缺省 'bundled'，前端宽容显示「官方」/「已安装」即可）。
 - GET `/api/mcp → {servers:[{name,command?,enabled}]}` —— **契约不依赖 status 字段**：
   前端按 enabled 态渲染徽章（开=「已登记」蓝 / 关=「已停用」中性），服务端若仍下发
   status 前端宽容接受不消费（`normalizeMcpServers` 白名单归一保持不变）；

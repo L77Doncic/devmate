@@ -18,7 +18,7 @@
  *   设计），成本/队列信息绝不随工具内容泄漏给模型。
  * - 参数形状：{prompt} + 可选 {skill}（title 已移除——投机泛化：池只用 prompt，无消费者）。
  *   skill（B-1 借鉴①）：技能 id，给出时该技能全文经 skillContent 解析器机械注入子代理
- *   system（池侧 capSkill ≤6000 字符）；未知/未接线/解析器故障 → 零注入普通模式。
+ *   system（池侧 capSkill ≤8000 字符）；未知/未接线/解析器故障 → 零注入普通模式。
  * - 防线：pool.spawn 契约不 throw（池内收敛），本层仍兜底 try/catch → 'subagent-error'
  *   （防御池实现违规：错误仍是普通消息，绝不外抛）。
  */

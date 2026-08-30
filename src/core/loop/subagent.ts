@@ -118,7 +118,7 @@ export const SUBAGENT_REPORT_LIMIT_CHARS = 4000;
 /** 子代理固定 system prompt（结构化中文报告；输入过长需精简）。 */
 export const SUBAGENT_SYSTEM_PROMPT =
   '你是 DevMate 派出的子代理。独立完成任务，返回结构化中文报告（结论/关键发现/依据）。输入过长需精简。';
-/** 技能注入正文上限（字符；与 use_skill 的 4k 截断同族——注入面的简单头截断）。 */
+/** 技能注入正文上限（字符；与 use_skill 的 8k 截断同值——注入面按「正文+资产」总载荷口径）。 */
 export const SKILL_INJECTION_LIMIT_CHARS = 8000;
 /** capSkill 截断标记（与 reasoning 显示层「…（截断）」同规）。 */
 export const SKILL_INJECTION_TRUNCATED_MARK = '…（截断）';
@@ -126,8 +126,9 @@ export const SKILL_INJECTION_TRUNCATED_MARK = '…（截断）';
 /**
  * 技能注入的正文截断（纯函数）：按**码点**计 ≤ SKILL_INJECTION_LIMIT_CHARS 原样；超出
  * 前截 + 截断标记——码点切片保证 astral 字符（emoji 等代理对）不被切断成孤立高位代理。
- * 与 use_skill 的 4k 截断同族（正文上限纪律），但注入面是 system 提示词而非工具回注——
- * 不做生成期截断面板（头尾保 + 收窄建议在 system 场景无意义；B-1 定案 8000 头截（评审方法论文本容量，CTO 2026-08-30 上调））。
+ * 与 use_skill 的 8k 截断同值（正文上限纪律——两者都是「正文+资产」总载荷口径），但
+ * 注入面是 system 提示词而非工具回注——不做生成期截断面板（头尾保 + 收窄建议在
+ * system 场景无意义；B-1 定案 8000 头截（评审方法论文本容量，CTO 2026-08-30 上调））。
  */
 export function capSkill(content: string): string {
   if (content.length <= SKILL_INJECTION_LIMIT_CHARS) return content;

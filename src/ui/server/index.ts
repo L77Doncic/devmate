@@ -1153,10 +1153,23 @@ async function sessionDetailFrames(
 
 // ---------------------------------------------------------------------------
 // Skills 资产索引（GET /api/skills：deps.skillsDir 的 <id>/SKILL.md frontmatter）
+// + 技能注入全文（content(id)：SKILL.md + 同目录文本资产；bundled/user 两条来源
+// 共用本段实现——索引合并（ensureSkillsIndex）与内容组装单源，见 composeSkillContent）。
 // ---------------------------------------------------------------------------
 
 /** 技能目录的入口文件（frontmatter 携带 name/description；用户技能可带 methodology 块行）。 */
 const SKILL_ENTRY = 'SKILL.md';
+
+/** 注入的文本资产白名单扩展名（SKILL.md 入口文件除外——单列；目录递归收集）。 */
+const SKILL_ASSET_EXTENSIONS = new Set(['.md', '.txt', '.json', '.yaml', '.py', '.js', '.sh']);
+
+/**
+ * 技能注入载荷（SKILL.md + 文本资产）总上限（字符；超限按**排序前缀**截断——资产按
+ * 相对路径名序排于 SKILL.md 之后，截断自然落在资产尾部；末尾附截断注记）。
+ */
+export const SKILL_PAYLOAD_LIMIT_CHARS = 20_000;
+/** 载荷截断注记（超限时附在末尾——与 reasoning 显示层「…（截断）」同规；语义=资产被截断）。 */
+export const SKILL_PAYLOAD_TRUNCATED_MARK = '…（资产截断）';
 
 /** 技能来源（GET /api/skills 的 origin；缺省 bundled）。 */
 export type SkillOrigin = 'bundled' | 'user';
@@ -1229,6 +1242,87 @@ async function scanSkillsIndex(skillsDir: string, origin: SkillOrigin): Promise<
     });
   }
   return skills.sort((a, b) => (a.id < b.id ? -1 : a.id > b.id ? 1 : 0));
+}
+
+/** 递归收集到的文本资产（rel = 相对技能目录的路径；注入节头 `## <file:rel>`）。 */
+interface SkillAsset {
+  rel: string;
+  content: string;
+}
+
+/**
+ * 递归收集技能目录的文本资产（白名单扩展名；入口 SKILL.md 除外；符号链接/特殊文件
+ * 按不可注入跳过——不穿透目录边界）。二进制/未知扩展名与不可注入项的名字汇入
+ * skipped（合成注记一行——让 agent 知道存在但不可用）；子目录/文件读失败静默跳过
+ * （content() 容错契约：单资产失败不影响其余注入）。相对路径统一 posix 分隔符
+ * （win 下 join 出 `\` ——注入节头按 `/` 呈现，与安装/索引口径一致）。
+ */
+async function collectSkillAssets(
+  dir: string,
+  prefix: string,
+  assets: SkillAsset[],
+  skipped: string[],
+): Promise<void> {
+  let entries: Dirent[];
+  try {
+    entries = await readdir(dir, { withFileTypes: true });
+  } catch {
+    return; // 目录不可读：跳过（不崩）
+  }
+  for (const entry of entries) {
+    const rel = prefix === '' ? entry.name : `${prefix}/${entry.name}`;
+    if (entry.isDirectory()) {
+      await collectSkillAssets(join(dir, entry.name), rel, assets, skipped);
+      continue;
+    }
+    if (!entry.isFile()) {
+      skipped.push(rel); // 符号链接/特殊文件：不可注入（避免穿透技能目录边界）
+      continue;
+    }
+    if (entry.name === SKILL_ENTRY) continue; // 入口文件除外（正文在前，单列）
+    if (!SKILL_ASSET_EXTENSIONS.has(extname(entry.name))) {
+      skipped.push(rel);
+      continue;
+    }
+    try {
+      assets.push({ rel, content: await readFile(join(dir, entry.name), 'utf8') });
+    } catch {
+      // 读失败：按不存在处理（不注入不注记）
+    }
+  }
+}
+
+/**
+ * 技能注入全文（content(id) 的组装单源；bundled/user 同一实现——同 API）：
+ * SKILL.md 在前（原样）→ 文本资产按相对路径**名序**逐个追加节头 `## <file:rel>` + 内容
+ * → 二进制/未知扩展名跳过并合成一行注记「有 N 个二进制资产未注入：<names…>」（一行——
+ * 仅作存在性提示，内容永不注入）→ 总载荷 ≤ SKILL_PAYLOAD_LIMIT_CHARS 原样，超出按
+ * 排序前缀截断 + 末尾附截断注记（描述语义：资产被截断）。SKILL.md 缺失/读失败 → null
+ * （与旧 content(id) 同判型——use_skill 按 not-found 收敛）。
+ * 单文件技能（目录仅 SKILL.md）→ 返回 SKILL.md 原样（无资产无注记——行为不变）。
+ */
+export async function composeSkillContent(skillDir: string): Promise<string | null> {
+  let body: string;
+  try {
+    body = await readFile(join(skillDir, SKILL_ENTRY), 'utf8');
+  } catch {
+    return null;
+  }
+  const assets: SkillAsset[] = [];
+  const skipped: string[] = [];
+  await collectSkillAssets(skillDir, '', assets, skipped);
+  assets.sort((a, b) => (a.rel < b.rel ? -1 : a.rel > b.rel ? 1 : 0));
+  skipped.sort();
+  for (const asset of assets) {
+    body += `\n\n## <file:${asset.rel}>\n${asset.content}`;
+  }
+  if (skipped.length > 0) {
+    body += `\n\n有 ${skipped.length} 个二进制资产未注入：${skipped.join(', ')}`;
+  }
+  if (body.length > SKILL_PAYLOAD_LIMIT_CHARS) {
+    body = body.slice(0, SKILL_PAYLOAD_LIMIT_CHARS) + SKILL_PAYLOAD_TRUNCATED_MARK;
+  }
+  return body;
 }
 
 /** 缺省 skills 资产目录（dev 模式服务端在 dist 上跑——统一 dist 路径，静态 dev 可选）。 */
@@ -2808,15 +2902,13 @@ export function createDevmateServer(deps: DevmateServerDeps): DevmateServer {
       async content(id) {
         // 内容优先级 user > bundled（同名 id 用户覆盖——用户目录存在即读用户文件；
         // 仅 bundled 命中才读资产，被用户覆盖的 bundled 内容不再可达）。
+        // 载荷组装（SKILL.md + 同目录文本资产 ≤20k）在 composeSkillContent 单源实现——
+        // bundled 与 user 两来源同一 API，节头/排序/截断口径一致。
         const user = await ensureUserSkillsIndex();
         const userHit = user.some((skill) => skill.id === id);
         const bundled = await ensureBundledSkillsIndex();
         if (!userHit && !bundled.some((skill) => skill.id === id)) return null;
-        try {
-          return await readFile(join(userHit ? userSkillsDir : skillsDir, id, SKILL_ENTRY), 'utf8');
-        } catch {
-          return null; // 读不到（文件缺失/内容不可读）→ null（工具按 not-found 收敛）
-        }
+        return composeSkillContent(join(userHit ? userSkillsDir : skillsDir, id));
       },
       async setEnabled(id, enabled) {
         const index = await ensureSkillsIndex();
