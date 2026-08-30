@@ -16,13 +16,16 @@
  *   'cost-guard' / 'queue-full' 的 message 刻意不含任何数字（预算额度/队列深度
  *   属服务端 stats 与事件通道的职责——统计只做展示，按「报告状态」而非「报告预算」
  *   设计），成本/队列信息绝不随工具内容泄漏给模型。
- * - 参数形状：只 {prompt}（title 已移除——投机泛化：池只用 prompt，无消费者）。
+ * - 参数形状：{prompt} + 可选 {skill}（title 已移除——投机泛化：池只用 prompt，无消费者）。
+ *   skill（B-1 借鉴①）：技能 id，给出时该技能全文经 skillContent 解析器机械注入子代理
+ *   system（池侧 capSkill ≤6000 字符）；未知/未接线/解析器故障 → 零注入普通模式。
  * - 防线：pool.spawn 契约不 throw（池内收敛），本层仍兜底 try/catch → 'subagent-error'
  *   （防御池实现违规：错误仍是普通消息，绝不外抛）。
  */
 import type { ToolCall } from '../../shared/session-types.js';
 import { errorContentJson } from '../loop/tools.js';
 import type { JsonSchema, Tool, ToolResult } from '../loop/types.js';
+import { SKILL_INJECTION_LIMIT_CHARS } from '../loop/subagent.js';
 import type { SubagentPool, SubagentResult, SubagentTask } from '../loop/subagent.js';
 
 /** 本工具的错误判型（4 类；池侧其余错误收敛到 subagent-error）。 */
@@ -32,6 +35,12 @@ export type SubagentToolErrorCode =
 /** spawn_subagent 工具构造依赖（池单例注入；池级开关/护栏/队列都在池内）。 */
 export interface SubagentToolOptions {
   pool: SubagentPool;
+  /**
+   * 技能全文解析器（id → SKILL.md 全文；B-1 借鉴①接线）。缺省/返回 null/
+   * 抛错 → 跳过注入（子代理普通模式，绝不硬失败）——未知 id / 索引未回填 /
+   * 索引故障按「零注入」收敛（与失败是普通消息同口径）。
+   */
+  skillContent?: (id: string) => Promise<string | null>;
 }
 
 const SCHEMA: JsonSchema = {
@@ -42,6 +51,16 @@ const SCHEMA: JsonSchema = {
       description:
         'The independent subtask the sub-agent should complete. The sub-agent has no tools ' +
         'and no session memory (a single read-only step); keep the input self-contained.',
+    },
+    skill: {
+      type: 'string',
+      description:
+        'Optional skill id (see the available skills section of the system prompt) whose ' +
+        `text is injected into the sub-agent system prompt (bounded at ${SKILL_INJECTION_LIMIT_CHARS} ` +
+        'code points; the bound follows the module constant) — the sub-agent then acts under ' +
+        'the same methodology as the main agent, e.g. skill:"code-review" for the final ' +
+        'independent review. Unknown/unavailable/disabled ids are skipped silently ' +
+        '(the sub-agent runs in plain mode).',
     },
   },
   required: ['prompt'],
@@ -63,11 +82,14 @@ export function createSubagentTool(options: SubagentToolOptions): Tool {
 async function executeSubagent(call: ToolCall, options: SubagentToolOptions): Promise<ToolResult> {
   // 主循环已做 schema 校验（loop/tools.ts）；此处仍是防线（与 fs.ts parseArgs 同口径）。
   let prompt = '';
+  let skillId = '';
   try {
     const parsed: unknown = JSON.parse(call.arguments);
     if (typeof parsed === 'object' && parsed !== null && !Array.isArray(parsed)) {
       const rawPrompt = (parsed as Record<string, unknown>).prompt;
       if (typeof rawPrompt === 'string') prompt = rawPrompt;
+      const rawSkill = (parsed as Record<string, unknown>).skill;
+      if (typeof rawSkill === 'string') skillId = rawSkill;
     }
   } catch {
     // fallthrough → 报错
@@ -80,8 +102,19 @@ async function executeSubagent(call: ToolCall, options: SubagentToolOptions): Pr
     );
   }
 
-  // 任务形状只 {prompt}：池级信号量/FIFO/护栏不消费 title，其余键一律宽进
-  const task: SubagentTask = { prompt };
+  // 任务形状 {prompt} + 可选 {skillId, skillContent}（B-1 借鉴① skill 注入）：
+  // 池级信号量/FIFO/护栏不消费 skill，其余键一律宽进。
+  // skill 给出 → 经 skillContent 解析器取全文；null/未接线/抛错 → 跳过注入（不硬失败）。
+  const task: SubagentTask = { prompt, ...(skillId !== '' ? { skillId } : {}) };
+  if (skillId !== '' && options.skillContent !== undefined) {
+    let content: string | null = null;
+    try {
+      content = await options.skillContent(skillId);
+    } catch {
+      content = null; // 索引故障按零注入收敛（失败是普通消息；不放大为工具失败）
+    }
+    if (content !== null && content !== '') task.skillContent = content;
+  }
 
   let result: SubagentResult;
   try {

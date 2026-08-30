@@ -2,13 +2,23 @@
  * # loop/subagent：子代理池（Workflow 功能点②；池级接缝）
  *
  * 每个子代理 = 一次独立 chat 调用（无工具、无会话文件——纯内存消息数组 + 流终止）：
- * [system: 固定角色, user: prompt] → 流式读取 text → 报告截断 4000 字符回注
+ * [system: 固定角色(+技能方法论注入节), user: prompt] → 流式读取 text →
+ * 报告截断 4000 字符回注
  * （截断复用 context/truncate 的生成期截断面板——头 2000 + 尾 2000 + elide 标记 +
  * 收窄建议；禁止手写头截断）。
- * 任务形状：只带 prompt（title 已移除——投机泛化：池只用 prompt，无展示/追踪消费者）。
+ * 技能注入（B-1 借鉴①——Claude Code subagent skills 全量注入语义）：task 带
+ * skillId/skillContent（可选）时，execute 把技能全文经 capSkill 机械拼进 system
+ * （「## 方法论（注入）」节；capSkill 按码点 ≤8000 字符，超出头截 + 「…（截断）」标记，
+ * 截断时仍注入头截版——不是零注入），审查/执行子代理与主代理同方法论；
+ * 内容随 task 走（池不反向依赖技能索引），缺省/空白/空串 → 零注入普通模式。
+ * 任务形状：prompt + 可选 {skillId, skillContent}（title 已移除——投机泛化）。
  * 池级职责（CTO 定型）：
  * - 开关：enabled=false → spawn 立即 {ok:false, error:'subagents-disabled'}（不排队不调用）；
- * - 信号量 FIFO：超过 maxParallel 排队；活跃完成释放；队列上限（缺省 64，超出 'queue-full'）；
+ * - 信号量 FIFO：maxParallel>0 时超过上限排队，活跃完成释放；maxParallel===0 = **无上限**——
+ *   池不设并发限制（无信号量）：所有任务一经提交立即进入执行，FIFO 队列仍保证提交序，
+ *   实际并发受系统资源自然限制（LLM 调用本身异步，重叠度由运行时调度决定）；语义归一
+ *   （负/非整/>8）属 shared/workflow 的 clampMaxParallel——池直接消费 config 已归一值；
+ * - 队列上限（缺省 512——防误刷兜底，超出 'queue-full'）；
  * - 成本护栏：每次 spawn/出队前预判「累计已花费 + 最近一次实际成本」是否超出
  *   池级上限（缺省 $1.00，超出 'cost-guard'）——自相似负载假设：下一次成本以最近一次
  *   实际成本为基准（无历史则 0），保守拦下会让预算穿底的后续请求（请求前预判，
@@ -37,6 +47,10 @@ export type { WorkflowConfig } from '../../shared/workflow.js';
 export interface SubagentTask {
   /** 独立子任务指令（模型侧提示词；池只消费它）。 */
   prompt: string;
+  /** 技能 id（spawn_subagent 的 skill 参数；信息性——无 skillContent 时不注入）。 */
+  skillId?: string;
+  /** 技能全文（经机械注入组装；execute 时以 capSkill 注入 system 方法论节）。 */
+  skillContent?: string;
 }
 
 /** 一次子代理的归一结果：失败也是普通值（error 为机器码/传输层消息），绝不 throw。 */
@@ -97,13 +111,30 @@ export interface SubagentPoolDeps {
 
 /** 池级总成本上限默认（USD/池生命周期）。 */
 export const DEFAULT_SUBAGENT_COST_LIMIT_USD = 1.0;
-/** 队列上限默认（超出 spawn 拒绝 'queue-full'）。 */
-export const DEFAULT_SUBAGENT_QUEUE_LIMIT = 64;
+/** 队列上限默认（超出 spawn 拒绝 'queue-full'；64 → 512：subagent 无上限后防误刷兜底）。 */
+export const DEFAULT_SUBAGENT_QUEUE_LIMIT = 512;
 /** 报告截断阈值（字符；传入 context/truncate 的截断面板——头尾各 2000）。 */
 export const SUBAGENT_REPORT_LIMIT_CHARS = 4000;
 /** 子代理固定 system prompt（结构化中文报告；输入过长需精简）。 */
 export const SUBAGENT_SYSTEM_PROMPT =
   '你是 DevMate 派出的子代理。独立完成任务，返回结构化中文报告（结论/关键发现/依据）。输入过长需精简。';
+/** 技能注入正文上限（字符；与 use_skill 的 4k 截断同族——注入面的简单头截断）。 */
+export const SKILL_INJECTION_LIMIT_CHARS = 8000;
+/** capSkill 截断标记（与 reasoning 显示层「…（截断）」同规）。 */
+export const SKILL_INJECTION_TRUNCATED_MARK = '…（截断）';
+
+/**
+ * 技能注入的正文截断（纯函数）：按**码点**计 ≤ SKILL_INJECTION_LIMIT_CHARS 原样；超出
+ * 前截 + 截断标记——码点切片保证 astral 字符（emoji 等代理对）不被切断成孤立高位代理。
+ * 与 use_skill 的 4k 截断同族（正文上限纪律），但注入面是 system 提示词而非工具回注——
+ * 不做生成期截断面板（头尾保 + 收窄建议在 system 场景无意义；B-1 定案 8000 头截（评审方法论文本容量，CTO 2026-08-30 上调））。
+ */
+export function capSkill(content: string): string {
+  if (content.length <= SKILL_INJECTION_LIMIT_CHARS) return content;
+  const points = Array.from(content);
+  if (points.length <= SKILL_INJECTION_LIMIT_CHARS) return content;
+  return points.slice(0, SKILL_INJECTION_LIMIT_CHARS).join('') + SKILL_INJECTION_TRUNCATED_MARK;
+}
 
 // ---------------------------------------------------------------------------
 // 池实现
@@ -151,10 +182,13 @@ export function createSubagentPool(deps: SubagentPoolDeps): SubagentPool {
     return ledgerCostUsd + lastCostUsd > costLimitUsd;
   }
 
-  /** 信号量泵：队列非空且有槽位时出队执行（FIFO；出队仍过一次护栏预判）。 */
+  /** 信号量泵：队列非空且有槽位时出队执行（FIFO；出队仍过一次护栏预判）。
+   *  maxParallel===0（无上限）= 无信号量：capacity = ∞——pump 一次把队列全部出队执行，
+   *  所有任务立即进入执行（并发受系统资源自然限制）；1-8 为显式并发上限。 */
   function pump(): void {
     if (disposed) return;
-    const capacity = Math.max(1, deps.config().maxParallel);
+    const maxParallel = deps.config().maxParallel;
+    const capacity = maxParallel === 0 ? Number.POSITIVE_INFINITY : Math.max(1, maxParallel);
     while (queue.length > 0 && active < capacity) {
       const entry = queue.shift() as QueueEntry; // 队首（length 已判非空）
       if (costGuardFires()) {
@@ -181,8 +215,15 @@ export function createSubagentPool(deps: SubagentPoolDeps): SubagentPool {
   /** 单次子代理执行：一次独立 chat 调用（无工具、无会话文件）。 */
   async function execute(entry: QueueEntry): Promise<void> {
     const startedAt = now();
+    // 技能注入（B-1 借鉴：Claude Code subagent skills——全文机械注入，非仅描述）；
+    // skillContent 伴随任务走（池不反向依赖技能索引）；缺省/空串/纯空白 → 零注入（普通模式）
+    const skillContent = entry.task.skillContent;
+    const system =
+      skillContent !== undefined && skillContent.trim() !== ''
+        ? SUBAGENT_SYSTEM_PROMPT + '\n\n## 方法论（注入）\n' + capSkill(skillContent)
+        : SUBAGENT_SYSTEM_PROMPT;
     const messages: ChatMessage[] = [
-      { role: 'system', content: SUBAGENT_SYSTEM_PROMPT },
+      { role: 'system', content: system },
       { role: 'user', content: entry.task.prompt },
     ];
     const request: ChatRequest = { model: deps.model, messages };
