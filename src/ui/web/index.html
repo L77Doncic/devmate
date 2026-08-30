@@ -107,8 +107,27 @@
               <div class="sectionHeader wide" id="ws-header">
                 <span class="sectionLabel" id="ws-section-label">对话</span>
                 <div class="headerActions" id="ws-header-actions">
-                  <!-- 添加工作区（dsh IconProjectAddOutline16 28px 圆钮）：直达目录弹窗；
-                       图标由 app.js 按 data-icon-glyph 从 icons.js 装配（单一 d 串来源） -->
+                  <!-- dsh WorkspaceBrowser 区头三图标：搜索（过滤会话行）+ 排序（时间/名称
+                       轮换）+ 添加工作区（目录弹窗）；图标由 app.js 按 data-icon-glyph
+                       从 icons.js 装配（单一 d 串来源） -->
+                  <button
+                    class="iconButton"
+                    id="btn-ws-search"
+                    type="button"
+                    aria-label="搜索会话"
+                    title="搜索会话"
+                  >
+                    <svg data-icon-glyph="search" viewBox="0 0 16 16" aria-hidden="true"></svg>
+                  </button>
+                  <button
+                    class="iconButton"
+                    id="btn-ws-sort"
+                    type="button"
+                    aria-label="排序：按时间"
+                    title="排序：按时间（点击切换为按名称）"
+                  >
+                    <svg data-icon-glyph="sort" viewBox="0 0 16 16" aria-hidden="true"></svg>
+                  </button>
                   <button
                     class="iconButton"
                     id="btn-add-workspace"
@@ -120,20 +139,38 @@
                   </button>
                 </div>
               </div>
+              <!-- 搜索过滤条（dsh WorkspaceBrowser 区头 search 展开态：32px 行，
+                   输入即过滤会话行（纯客户端）；Esc/再次点击收起并清除） -->
+              <div class="ws-search-field" id="ws-search-field" hidden>
+                <input
+                  class="ws-search-input"
+                  id="ws-search-input"
+                  type="search"
+                  placeholder="过滤会话（标题或编号）"
+                  autocomplete="off"
+                  autocapitalize="off"
+                  spellcheck="false"
+                  aria-label="过滤会话"
+                />
+              </div>
               <div class="list" id="side-list">
                 <!-- 工作区组（全部由 app.js 装配：注册根 → 组头 + 会话行；未注册/
                      未知根会话 = 尾组「未知项目」）。#ws-groups 恒为骨架/降级/重渲染
-                     的收口容器（侧栏本体永不因此隐藏） -->
+                     的收口容器（侧栏本体永不因此隐藏）。
+                     —— 空态/降级说明行**必居 #ws-groups 之外**：renderSessionList
+                     对其 replaceChildren 收口，若空态在其中会被拆卸为游离节点
+                     （「暂无会话」/「无匹配会话」永不显示—— 旧实现的隐性缺陷，
+                     本轮随搜索空态一并根除）。 -->
                 <div id="ws-groups">
                   <ul class="rowList" id="side-session-list" aria-hidden="true">
                     <li class="side-skeleton" aria-hidden="true"></li>
                     <li class="side-skeleton" aria-hidden="true"></li>
                     <li class="side-skeleton" aria-hidden="true"></li>
                   </ul>
-                  <div class="empty" id="sessions-empty" hidden>暂无会话，点新建开始</div>
-                  <div class="empty" id="sessions-unavailable" hidden>
-                    会话列表暂不可用。稍后重试或检查服务状态。
-                  </div>
+                </div>
+                <div class="empty" id="sessions-empty" hidden>暂无会话，点新建开始</div>
+                <div class="empty" id="sessions-unavailable" hidden>
+                  会话列表暂不可用。稍后重试或检查服务状态。
                 </div>
               </div>
               <span class="fade"></span>
@@ -197,71 +234,34 @@
 
         <!-- ============ 消息流 ============ -->
         <main class="messages" id="messages" aria-label="对话消息">
-          <!-- 空态引导（仅未发过消息时显示） -->
+          <!-- 空态引导（仅未发过消息时显示；dsh EmptyHero：品牌 mark 与标题同行、
+               26/32 wt500 +「预览版」badge；三步卡已移除 —— 配置指引收敛为
+               composer 上方一行小字，见 #composer-hint 动态切换）。
+               hero 先选工作区（dsh 语义）：主 CTA「选择工作区…」直开目录弹窗，
+               选定后自动建该工作区新会话并进入；次钮「使用默认工作区」= 确认默认根
+               （启动目录）→ 建默认根会话解锁；副行文案见下。 -->
           <div class="empty" id="empty">
             <div class="empty-hero">
-              <svg class="empty-logo" viewBox="0 0 32 32" aria-hidden="true">
-                <rect width="32" height="32" rx="8" fill="var(--accent-dim)" />
-                <path d="M9 9h14v3H9zm0 6h14v3H9zm0 5.5h9v3H9z" fill="var(--accent)" />
-              </svg>
-              <!-- 空态语言（dsh EmptyHero 对齐）：品牌 mark + 标语 + 「预览版」badge；
-                   三步引导保留为 DevMate 本地差异化（见 README-UI 差异记录） -->
-              <h1>DevMate<span class="hero-badge">预览版</span></h1>
-              <p class="empty-sub">
-                一个认真讨论后在你机器上执行命令的编程智能体。<br />它做的每一步都看得到、都拦得住、都可追溯。
-              </p>
-              <!-- dsh 空态「添加/选择工作区」快捷入口（dsh EmptyHero 语义：
-                   空白的会话 → 建议先选工作区；按钮 = 打开目录选择弹窗）
-                   —— 主区三步卡格式为 DevMate 本地保留差异（见 README-UI） -->
-              <button
-                class="btn btn-outline hero-add-workspace"
-                id="btn-empty-add-workspace"
-                type="button"
-              >
-                <!-- 图标由 app.js 按 data-icon-glyph 从 icons.js 装配（单一 d 串来源） -->
-                <svg data-icon-glyph="folderClosed" viewBox="0 0 16 16" aria-hidden="true"></svg>
-                <span>选择工作区…</span>
+              <div class="hero-row">
+                <svg class="empty-logo" viewBox="0 0 32 32" aria-hidden="true">
+                  <rect width="32" height="32" rx="8" fill="var(--accent-dim)" />
+                  <path d="M9 9h14v3H9zm0 6h14v3H9zm0 5.5h9v3H9z" fill="var(--accent)" />
+                </svg>
+                <h1>让每个想法动起来<span class="hero-badge">预览版</span></h1>
+              </div>
+              <p class="hero-sub">先选工作区，再开始与 DevMate 协作</p>
+              <button class="hero-cta" id="hero-pick-workspace" type="button">选择工作区…</button>
+              <button class="hero-link" id="hero-default-workspace" type="button">
+                使用默认工作区
               </button>
             </div>
-            <ol class="steps">
-              <li class="step" id="step-1">
-                <span class="step-no">1</span>
-                <div class="step-body">
-                  <h2>配置你的 API Key</h2>
-                  <p>
-                    打开左侧栏底部「设置」，填 DeepSeek 的密钥（默认 base_url
-                    已就绪）。只保存在你自己的机器上。
-                  </p>
-                </div>
-                <button class="btn btn-primary" id="btn-empty-open-settings" type="button">
-                  去设置
-                </button>
-              </li>
-              <li class="step" id="step-2">
-                <span class="step-no">2</span>
-                <div class="step-body">
-                  <h2>描述你想做什么</h2>
-                  <p>
-                    下面输入框直接打字。例如：「把我的代码改成零依赖」或「帮我看一下这个报错」。Enter
-                    发送、Shift+Enter 换行。
-                  </p>
-                </div>
-              </li>
-              <li class="step" id="step-3">
-                <span class="step-no">3</span>
-                <div class="step-body">
-                  <h2>看它边做边汇报</h2>
-                  <p>
-                    每条回复、每个工具调用都以卡片呈现在这里；需要批准的操作会以内嵌审批卡等你确认。
-                  </p>
-                </div>
-              </li>
-            </ol>
           </div>
         </main>
 
-        <!-- ============ 输入区（含停靠式运行状态条：状态属于输入框上下文） ============ -->
-        <footer class="composer" id="composer">
+        <!-- ============ 输入区（含停靠式运行状态条：状态属于输入框上下文） ============
+             #composer 带 aria-disabled + .composer-locked（严格先选工作区：无会话且
+             本轮未选工作区 → 区域禁用，app.js renderComposer 切换） -->
+        <footer class="composer" id="composer" aria-disabled="false">
           <!-- 运行状态条（run-status / run-error；dsh「目标/状态属于输入框上下文」哲学）：
                运行中 = 细横条（色点脉冲 + 闪烁阶段词 + 实时耗时）；终态 = 单行小字。 -->
           <div class="run-strip" id="run-strip" hidden role="status" aria-live="polite"></div>
@@ -295,29 +295,39 @@
               </div>
             </section>
           </div>
-          <!-- 输入卡上方提示条（dsh InputBar .notice：整卡宽 r8 淡填充小字） -->
-          <p class="composer-hint" id="composer-hint">
-            发送后 DevMate 会自动开始工作；调试中可随时点「停止」。输入 / 可打开命令。
+          <!-- 输入卡上方提示条（dsh InputBar .notice：整卡宽 r8 淡填充小字；
+               配置指引轻量条款（替代三步卡）：仅空态+密钥未配置时显示（app.js 切换） -->
+          <p class="composer-hint" id="composer-hint" hidden>
+            填写 API 密钥后即可开始（设置→模型接口）
           </p>
-          <!-- 思考强度分段 pill（composer 输入卡上方右侧；点击即 POST /api/settings
-               {reasoning}，防抖 300ms，失败回滚 toast；选项由 app.js 从 settings.js
-               REASONING_VALUES/LABELS 装配 —— 单一来源防漂移） -->
-          <div class="reasoning-row" id="reasoning-row">
-            <span class="reasoning-label">思考强度</span>
-            <div
-              class="reasoning-seg"
-              id="reasoning-seg"
-              role="radiogroup"
-              aria-label="思考强度"
-            ></div>
+          <!-- 拖放遮罩（dsh DropOverlay 简化单态：document 级 Files 拖入时出现；
+               松开打开 intake（与附件钮同一预检管线）；锁态降级为「不可接受」文案） -->
+          <div class="drop-overlay" id="drop-overlay" hidden role="status" aria-live="polite">
+            <span class="drop-overlay-text" id="drop-overlay-text"></span>
+          </div>
+          <!-- 图片 lightbox（dsh ImageLightbox 简化：全屏原图浮层 + 关闭钮；Esc/遮罩/按钮关闭） -->
+          <div class="image-lightbox" id="image-lightbox" hidden role="dialog" aria-modal="true">
+            <img class="image-lightbox-img" id="image-lightbox-img" alt="" />
+            <button
+              type="button"
+              class="image-lightbox-close"
+              id="image-lightbox-close"
+              title="关闭预览"
+              aria-label="关闭预览"
+            >
+              ×
+            </button>
           </div>
           <!-- dsh InputBar 输入卡：r22 胶囊（textarea + 底部控制行，控制行右置发送钮） -->
           <div class="composer-box">
+            <!-- 附件预览条（ADR-0015）：图片小卡（缩略图 + 下划线尺寸/移除钮）；
+                 无附件时整条隐藏（app.js renderComposer 切换）。位于输入区上方。 -->
+            <div class="attach-strip" id="attach-strip" hidden></div>
             <textarea
               class="composer-input"
               id="input"
               rows="1"
-              placeholder="告诉 DevMate 你想做什么……（Enter 发送，Shift+Enter 换行，/ 打开命令）"
+              placeholder="描述你想构建什么"
               autocomplete="off"
               autocapitalize="off"
               spellcheck="false"
@@ -329,6 +339,17 @@
                    当前档标签 + chevron；点击展开三选菜单 —— dsh Menu 表面；菜单 DOM 在
                    .composer-box 内锚定）。右侧 = 停止 + 发送（双 34px 圆钮）。 -->
               <div class="composer-tools">
+                <!-- 附件钮（ADR-0015 · dsh 管线：图像加号；左置——原「+」位。点击打开
+                     文件选择（image/*；≤20MiB；dsh 三数：单图 20MiB/20 张/会话累计
+                     200MiB——累计由服务端记账，超限 toast）。上传 → ref → 随消息发送。 -->
+                <button
+                  type="button"
+                  class="attach-btn"
+                  id="btn-attach"
+                  title="添加图片（≤20MB，最多 20 张）"
+                  aria-label="添加图片"
+                ></button>
+                <input type="file" id="attach-input" accept="image/*" multiple hidden />
                 <button
                   type="button"
                   class="perm-chip"
@@ -346,7 +367,9 @@
               </div>
               <!-- dsh InputBar .primary 发送钮：34px 圆形蓝钮 + 白色箭头（figma
                    IconButton 34:10465）—— 纯图标，文字语义放 title；
-                   其左侧为停止钮（runActive 时可见）：同为 34px 圆形（danger 红）。 -->
+                   其左侧为停止钮（runActive 时可见）：同为 34px 圆形（danger 红）。
+                   模型·思考强度 combo（dsh 右下同款：「DeepSeek-V4-Flash · 中 ▾」；
+                   点击展开两段：模型名（跳设置）+ 强度四档）邻接发送钮。 -->
               <div class="composer-actions">
                 <button
                   class="btn-stop-circ"
@@ -358,6 +381,21 @@
                 >
                   <svg viewBox="0 0 16 16" aria-hidden="true">
                     <rect x="3.5" y="3.5" width="9" height="9" rx="1.5" fill="currentColor" />
+                  </svg>
+                </button>
+                <button
+                  type="button"
+                  class="model-combo"
+                  id="model-combo"
+                  aria-haspopup="menu"
+                  aria-expanded="false"
+                  title="模型与思考强度"
+                >
+                  <span class="mc-model" id="mc-model">deepseek-v4-flash</span>
+                  <span class="mc-dot" aria-hidden="true">·</span>
+                  <span class="mc-reasoning" id="mc-reasoning">中</span>
+                  <svg class="mc-chevron" viewBox="0 0 14 14" aria-hidden="true">
+                    <path fill="currentColor" d="M5.4 3.3l5 4.7-5 4.7z" />
                   </svg>
                 </button>
                 <button
@@ -384,6 +422,23 @@
             <!-- 访问模式菜单（dsh Menu 表面：浮层、r8、阴影；锚于 chip；行 = glyph +
                  档标签 + 描述，当前档高亮；选 full-access 无确认记录时先过风险确认门） -->
             <div class="perm-menu" id="perm-menu" hidden role="menu" aria-label="访问模式"></div>
+            <!-- 模型·思考强度菜单（dsh 右下 combo 同款表面：两段 —— 模型名（只读，
+                 点击跳设置）+ 强度四档单选；锚于 combo；定位 = menu.js menuPosition） -->
+            <div class="model-menu" id="model-menu" hidden role="menu" aria-label="模型与思考强度">
+              <button
+                class="model-menu-item mm-model-row"
+                id="mm-model"
+                type="button"
+                role="menuitem"
+              >
+                <span class="mm-label">模型</span>
+                <span class="mm-value mono" id="mm-model-value"></span>
+                <span class="mm-go">去设置</span>
+              </button>
+              <div class="model-menu-sep" aria-hidden="true"></div>
+              <div class="model-menu-sec">思考强度</div>
+              <div class="model-menu-opts" id="model-menu-opts" role="radiogroup"></div>
+            </div>
             <!-- 命令下拉（输入区首个字符 / 触发、防抖 150ms；纯逻辑 = commands.js，
                  DOM 装配 = app.js；dsh Menu 表面：浮层、r8、阴影；锚于输入卡上缘） -->
             <div class="cmd-menu" id="cmd-menu" hidden role="listbox" aria-label="命令菜单"></div>
@@ -665,8 +720,10 @@
                 <p class="field-help">仅展示确认；工作目录由 DevMate 启动位置决定。</p>
               </div>
             </div>
-            <!-- Subagent 工作流：开关 + 并行数（1-4 步进，禁 0；与 /api/workflow 同步，
-                 服务端不可达时降级 localStorage，旁注由 JS 填充「未同步（仅本地）」） -->
+            <!-- Subagent 工作流：开关 + 并行数（0-8 步进；0 = 无上限（按需派遣）——
+                 与 /api/workflow 同步，服务端不可达时降级 localStorage，旁注由 JS
+                 填充「未同步（仅本地）」；0 档的「无上限」标签/风险说明小字由 JS 经
+                 parallelLabelText 填充（index.html 不重复写该文案）） -->
             <div class="settings-card">
               <div class="settings-card-head end">
                 <span class="settings-card-title">Subagent 工作流</span>
@@ -686,15 +743,17 @@
                   class="input input-num"
                   id="set-subagent-parallel"
                   type="number"
-                  min="1"
-                  max="4"
+                  min="0"
+                  max="8"
                   step="1"
                   value="2"
                   data-subagent-field="parallel"
                 />
                 <p class="field-help">
-                  启用后 DevMate 可将独立子任务（子代理）并行执行；范围为 1-4，不接受 0。
+                  启用后 DevMate 可将独立子任务（子代理）并行执行：1-8 为显式并行数； 0 =
+                  无上限（按需派遣），并行子任务数按主 agent 判断需要任意派遣。
                 </p>
+                <p class="field-help dim" id="set-subagent-parallel-label" hidden></p>
                 <p class="field-help dim" id="set-subagent-note" hidden></p>
               </div>
             </div>
@@ -774,6 +833,38 @@
                   placeholder="deepseek-v4-flash"
                   autocomplete="off"
                 />
+              </div>
+              <div class="field-group">
+                <label for="set-max-input-tokens">输入上限（token）</label>
+                <input
+                  class="input input-num"
+                  id="set-max-input-tokens"
+                  type="number"
+                  min="1"
+                  step="1"
+                  placeholder="留空=厂商默认"
+                  autocomplete="off"
+                />
+                <p class="field-help">
+                  请求侧单请求输入上限（max_input_tokens）。仅 DashScope/Qwen
+                  等白名单供应商支持发送； 其余供应商（含
+                  DeepSeek）档位由模型固有上下文决定（不发送该字段）。
+                </p>
+              </div>
+              <div class="field-group">
+                <label for="set-max-output-tokens">输出上限（token）</label>
+                <input
+                  class="input input-num"
+                  id="set-max-output-tokens"
+                  type="number"
+                  min="1"
+                  step="1"
+                  placeholder="留空=厂商默认"
+                  autocomplete="off"
+                />
+                <p class="field-help">
+                  请求侧单请求输出上限（max_tokens）；留空按模型厂商默认（预算估价按 8192 预留）。
+                </p>
               </div>
               <div class="field-group">
                 <label for="set-key">API Key</label>

@@ -160,6 +160,19 @@ export function statusTone(status) {
   return RUN_STATUS_SEMANTICS[String(status ?? '')]?.tone ?? 'unknown';
 }
 
+/**
+ * run-strip「继续」钮可见性（唯一裁决；app.js 只消费）：
+ * 仅终态 user-interrupted（用户主动中断，历史 + interrupted 占位可安全续跑）显示；
+ * cost-guard/max-steps/wall-time 等其它终态不提供（各为独立停机原因，语义不同）。
+ * 无会话（sessionId 缺失）/ 运行中 / 有错误（run-error 横条场景）一律隐藏。
+ */
+export function continueVisible(runStatus, view = {}) {
+  if (view.runActive) return false;
+  if (view.lastError) return false;
+  if (!view.hasSession) return false;
+  return runStatus?.status === 'user-interrupted';
+}
+
 /** run-status 完整的摘要行，如 `已完成 · 3 步 · 2.1s`。 */
 export function runStatusLine(rs) {
   if (!rs?.status) return '';
@@ -319,6 +332,15 @@ export function ranForCaption(ms) {
 export const CLIPBOARD_FEEDBACK_MS = 1000;
 
 /**
+ * toast 点击复制（clickable 选项）的悬停提示：点击 toast → 复制 data-copy
+ * 完整值 → 闪现 TOAST_COPIED_TEXT。文案单一来源（app.js 消费，防漂移断言见
+ * test/ui-web/format.test.ts）。
+ */
+export const TOAST_COPY_TITLE = '点击复制完整会话 ID';
+/** toast 点击复制成功后的闪现文案（与 icon-actions 对勾反馈同词）。 */
+export const TOAST_COPIED_TEXT = '已复制';
+
+/**
  * 复制载荷：消息行复制目标 = 正文纯文本（user/assistant 均抄正文，
  * 不抄工具卡/元信息 —— dsh MessageIconActions 复制语义）。
  */
@@ -400,6 +422,50 @@ export function parseToolArguments(raw) {
   } catch {
     return null;
   }
+}
+
+// ---------------------------------------------------------------------------
+// 审查块（B：spawn_subagent 且 arguments.prompt 含 审查|review → 独立审查块）
+// 纯逻辑边界：只裁决「是不是审查子代理」与「审查块两行摘要文字」；
+// 状态机侧标记（messages.js review 标志）与 DOM 形状（app.js .review-block）不在此处。
+// ---------------------------------------------------------------------------
+
+/** 审查块标题（「独立审查」；app.js 行的唯一来源，防镜像漂移）。 */
+export const REVIEW_BLOCK_TITLE = '独立审查';
+
+/**
+ * 审查子代理判定（判据 = arguments.prompt 含 审查|review，大小写不敏感）：
+ * name 恒为 spawn_subagent（协议工具名）；arguments 非 JSON / 无 prompt / 命中用户
+ * 文本里的「审查」字样均按此裁决（误判面 = 真审查任务；宽匹配是产品语义——审查
+ * 用户看到的即是审查块，宁可多包一次不可漏包）。
+ */
+export function isReviewSubagent(call) {
+  if (!call || typeof call !== 'object') return false;
+  if (String(call.name ?? '') !== 'spawn_subagent') return false;
+  const args = parseToolArguments(call.arguments);
+  const prompt = args && typeof args.prompt === 'string' ? args.prompt : '';
+  return /审查|review/i.test(prompt);
+}
+
+/**
+ * 审查块两行摘要（标题行「独立审查」之外的副题与结论首行）：
+ * - subject：args.title（若有）否则 prompt 首行压平取前 40 字符；
+ * - verdict：报告内容（content → preview 兜底）首行非空行取前 60 字符；
+ * - 无结果（tool 在途/无输出）→ verdict 空串（渲染层落「（审查进行中…）」）。
+ */
+export function reviewBlockText(call, result) {
+  const args = parseToolArguments(call?.arguments);
+  const prompt = args && typeof args.prompt === 'string' ? args.prompt : '';
+  const title = args && typeof args.title === 'string' ? args.title.trim() : '';
+  const subject =
+    title !== '' ? truncate(title, 40) : truncate(prompt.replace(/\s+/g, ' ').trim(), 40);
+  const full = String(result?.content ?? result?.preview ?? '');
+  const firstLine =
+    full
+      .split(/\r?\n/)
+      .map((s) => s.trim())
+      .filter((s) => s !== '')[0] ?? '';
+  return { subject, verdict: truncate(firstLine, 60) };
 }
 
 /**

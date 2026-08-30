@@ -31,6 +31,9 @@ export const WS_DEGRADED_NOTE = '工作区列表暂不可用。添加/移除功�
 /** 侧栏空态（dsh empty.none 语义：pad 16/12、13px、tertiary）。 */
 export const WS_EMPTY_NOTE = '暂无会话：点「新建」或「添加工作区」开始。';
 
+/** 搜索过滤到零结果的空态（与「无会话」区分：不冒充空表）。 */
+export const WS_SEARCH_NO_MATCH = '无匹配会话';
+
 /** 目录选择弹窗标题（dsh ui-directory-picker-browse 形态）。 */
 export const WS_PICKER_TITLE = '选择工作区目录';
 
@@ -143,6 +146,55 @@ export function pickDefaultRoot(roots) {
 }
 
 // ---------------------------------------------------------------------------
+// 会话行 搜索过滤 / 排序轮换（dsh WorkspaceBrowser 区头 search/sort 的纯逻辑；
+// 只做「列表 → 列表」，DOM 装配与 open 态在 app.js —— 纯函数可单测）
+// ---------------------------------------------------------------------------
+
+/** 排序模式（点击轮换序）：recent = 最近（updatedAt 新→旧，缺省）/ name = 标题。 */
+export const WS_SORT_MODES = Object.freeze(['recent', 'name']);
+
+/** 轮换裁决（dsh sort 图标点击）：recent → name → recent（未知值按 recent 起轮）。 */
+export function nextWsSortMode(current) {
+  return current === 'name' ? 'recent' : 'name';
+}
+
+/**
+ * 会话列表按模式排序（输入不修改；返回新数组）：
+ * - recent：updatedAt 新→旧，无时间戳排后（原相对序，与 sessions.js sortSessionList 同语义）；
+ * - name：标题升序（localeCompare，无标题排前）；同标题比 updatedAt 新→旧（稳定）；
+ * - 未知模式按 recent 兜底（闭集：不抛、不裸露未知串，渲染层永不落到空排序）。
+ */
+export function sortWorkspaceSessions(list, mode) {
+  const arr = Array.isArray(list) ? [...list] : [];
+  if (mode === 'name') {
+    return arr.sort((a, b) => {
+      const cmp = String(a?.title ?? '').localeCompare(String(b?.title ?? ''), 'zh');
+      if (cmp !== 0) return cmp;
+      return (b?.updatedAt ?? -Infinity) - (a?.updatedAt ?? -Infinity);
+    });
+  }
+  return arr.sort((a, b) => {
+    return (b?.updatedAt ?? -Infinity) - (a?.updatedAt ?? -Infinity);
+  });
+}
+
+/**
+ * 会话行过滤（纯客户端）：query 空白 → 原列表副本（无查询 = 不过滤）；
+ * 命中 = 标题或 sessionId 包含 query（大小写不敏感）。空查询/空列表均防御。
+ */
+export function filterSessionList(list, query) {
+  const q = String(query ?? '')
+    .trim()
+    .toLowerCase();
+  const src = Array.isArray(list) ? list : [];
+  if (q === '') return [...src];
+  return src.filter((s) => {
+    const hay = `${String(s?.title ?? '')} ${String(s?.sessionId ?? '')}`.toLowerCase();
+    return hay.includes(q);
+  });
+}
+
+// ---------------------------------------------------------------------------
 // 组模型：注册表 → per-group sessions 树
 // ---------------------------------------------------------------------------
 
@@ -153,7 +205,7 @@ export function pickDefaultRoot(roots) {
  * - workspaceRoot 不在注册表（含 null/未注册根）→ 恒为尾组「未知项目」
  *   （registered:false，无 kebab —— 不可移除未注册「组」）；
  * - 未知组无会话 → 省略（空注册根组保留：组头常驻，空组体）。
- * 输入为 sorted（updatedAt 新→旧，调用方 sortSessionList），组内序随输入。
+ * 输入为已排序列表（调用方 sortWorkspaceSessions —— 时间或名称模式），组内序随输入。
  */
 export function groupSessionsByRegisteredWorkspaces(sorted, roots) {
   const rootList = Array.isArray(roots) ? roots : [];

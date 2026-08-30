@@ -5,9 +5,11 @@
  * window?: number, permission?, permissionConfirmedAt?, methodFirst?}（apiKey **掩码**，
  * 服务端永不回明文；reasoning = off/low/medium/high 缺省 medium；window = 上下文窗口覆盖，
  * 未配置 → 缺省不带键 = 估算模式；permission = read-only/workspace-write/full-access 缺省
- * workspace-write —— 枚举/标签/风险门的单一权威源 = permissions.js；permissionConfirmedAt
- * = full-access 风险确认记录（epoch ms），无记录不带键；methodFirst = R2-S1 方法论前置门
- * 开关，缺省 true（布尔；旧服务端无该键 → 前端归一为缺省 true））；
+ * workspace-write —— 枚举/标签/风险门的单一权威源 = permissions.js；矩阵契约（本波更新）：
+ * read-only = 写入与危险命令逐项确认（ask）/ workspace-write = 工作区命令直接执行零弹窗
+ * （含破坏性命令 —— 请在信任的工作区内使用）/ full-access = 全部放行不再问询；
+ * permissionConfirmedAt = full-access 风险确认记录（epoch ms），无记录不带键；
+ * methodFirst = R2-S1 方法论前置门开关，缺省 true（布尔；旧服务端无该键 → 前端归一为缺省 true））；
  * POST /api/settings {baseUrl, model, apiKey?, reasoning?, windowTokens?, permission?,
  * methodFirst?} → 同形状（同样只回掩码；reasoning/windowTokens/permission/methodFirst
  * 为补丁字段，未触碰保持现值）。
@@ -80,6 +82,17 @@ export function normalizeReviewMode(value) {
 /** 上下文窗口覆盖归一：正整数 number 原样；其它（null/非数字/非整数/≤0/字符串）→ null
  *  （null = 未配置：展示层落「—」+ 估算模式 tooltip，不冒充数值）。 */
 export function normalizeWindow(value) {
+  if (typeof value !== 'number' || !Number.isInteger(value) || value < 1) return null;
+  return value;
+}
+
+/**
+ * 请求侧输入/输出上限归一（A 档，同 normalizeWindow 纪律）：正整数 number 原样；
+ * 其它 → null（null = 未设置：输入框留空——「留空=厂商默认」，不冒充数值）。
+ * 理论边界语义（MAX 值域）不做本地钳制——服务端只要求严格正整数；超巨型值由
+ * 请求侧供应商 400（max_tokens 超模型上限等）天然兜底，本地不猜厂商上限。
+ */
+export function normalizeTokenLimit(value) {
   if (typeof value !== 'number' || !Number.isInteger(value) || value < 1) return null;
   return value;
 }
@@ -169,6 +182,9 @@ function normalize(json) {
     // （服务端 GET 回 `window` 键；容错 accept `windowTokens` —— 双名兜底）。
     reasoning: normalizeReasoning(j.reasoning),
     windowTokens: normalizeWindow(j.window ?? j.windowTokens),
+    // A 档：请求侧输入/输出上限（服务端只回「已设置」值——未设不带键 → null = 输入框留空）
+    maxInputTokens: normalizeTokenLimit(j.maxInputTokens),
+    maxOutputTokens: normalizeTokenLimit(j.maxOutputTokens),
     // 权限预设（缺省 workspace-write；枚举/标签权威 = permissions.js）与风险确认记录
     // （无记录 → null —— 前端只在 full-access 且已确认时跳过风险门）
     permission: normalizePermission(j.permission),
@@ -189,15 +205,27 @@ export async function loadSettings({ fetchImpl = globalThis.fetch } = {}) {
 
 /**
  * POST /api/settings。apiKey 传入且非空才上行；响应掩码即返回值。
+ * A 档：maxInputTokens/maxOutputTokens 只在非空（正整数）时上行——空白输入不携带
+ * （服务端补丁语义「未触碰保持现值」+ GET 只回显已设值 ⇒ 已设域无法经 API 撤销，
+ * 与 windowTokens 同口径；清除可手改 ~/.devmate/config.json——ADR-0015 记录）。
+ * @param {{ baseUrl: string; model: string; apiKey?: string;
+ *   maxInputTokens?: number | null; maxOutputTokens?: number | null }} input
+ * @param {{ fetchImpl?: typeof globalThis.fetch }} [opts]
  */
 export async function saveSettings(
-  { baseUrl, model, apiKey },
+  { baseUrl, model, apiKey, maxInputTokens, maxOutputTokens },
   { fetchImpl = globalThis.fetch } = {},
 ) {
   const body = {
     baseUrl: String(baseUrl ?? '').trim() || DEFAULT_SETTINGS.baseUrl,
     model: String(model ?? '').trim() || DEFAULT_SETTINGS.model,
   };
+  if (maxInputTokens !== undefined && maxInputTokens !== null) {
+    body.maxInputTokens = maxInputTokens;
+  }
+  if (maxOutputTokens !== undefined && maxOutputTokens !== null) {
+    body.maxOutputTokens = maxOutputTokens;
+  }
   const key = String(apiKey ?? '').trim();
   if (key) body.apiKey = key;
   const res = await fetchImpl('/api/settings', {

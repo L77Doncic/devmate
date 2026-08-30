@@ -24,23 +24,27 @@ export const PERMISSION_LABELS = Object.freeze({
   'full-access': '全部访问',
 });
 
-/** 各档 menu 行描述（dsh PermissionSelect：选项行=glyph+名称+描述）。 */
+/** 各档 menu 行描述（dsh PermissionSelect：选项行=glyph+名称+描述；矩阵契约：
+ *  read-only = 写与危险 ask / workspace-write = 全命令执行零弹窗 / full-access = 全放行）。
+ * 风险声明：workspace-write = 命令直接执行（含破坏性命令），请在信任的工作区内使用。 */
 export const PERMISSION_DESCRIPTIONS = Object.freeze({
-  'read-only': '仅允许读取与只读命令；写操作与危险命令逐一问询',
-  'workspace-write': '工作区写入直接执行；危险命令（rm -rf 等）自动拒绝',
-  'full-access': '命令直接执行（含删除/破坏性操作），不再问询',
+  'read-only': '仅允许读取与只读命令；写入与危险命令逐项确认',
+  'workspace-write': '命令直接执行（含破坏性命令），请在信任的工作区内使用',
+  'full-access': '全部放行：任何命令直接执行（含删除/破坏性操作），不再问询',
 });
 
-/** 各档盾形 glyph 种类（chip 与 menu 行共用；DOM 画法在 app.js —— 本模块只裁决种类）。 */
+/** 各档盾形 glyph 种类（chip 与 menu 行共用；DOM 画法在 app.js —— 本模块只裁决种类）。
+ *  workspace-write = 锁形 padlock（dsh PermissionSelect 工作区写入档同款图标语义）。 */
 export const PERMISSION_GLYPHS = Object.freeze({
   'read-only': 'check',
-  'workspace-write': 'pencil',
+  'workspace-write': 'lock',
   'full-access': 'alert',
 });
 
 /** 风险确认门文案（Ctrl 面板复用删除确认视觉；逐字断言见 permissions.test.ts）。 */
 export const RISK_CONFIRM_TITLE = '启用全部访问';
-export const RISK_CONFIRM_TEXT = '全部访问：不再问询，命令直接执行（含删除/破坏性操作）。确认？';
+export const RISK_CONFIRM_TEXT =
+  '全部放行：任何命令直接执行（含删除/破坏性操作），不再问询。确认？';
 
 /**
  * 档位归一：枚举值原样返回；非法/缺失 → PERMISSION_DEFAULT（闭集，不抛）。
@@ -72,7 +76,7 @@ export function permissionDescription(value) {
 /**
  * 档位 glyph 种类（归一语义；chip 图标与 menu 行图标同源）。
  * @param {unknown} value
- * @returns {'check'|'pencil'|'alert'}
+ * @returns {'check'|'lock'|'alert'}
  */
 export function permissionGlyph(value) {
   return PERMISSION_GLYPHS[normalizePermission(value)];

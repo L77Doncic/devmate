@@ -16,9 +16,9 @@
  * - 会话列表 GET /api/sessions；恢复 = GET /api/sessions/:id（协议形状 events ≤500）
  *   → **单流协调时序（与代码顺序一致）**：1) 关旧流 broker（abort）→ 2) store.reset +
  *     回放历史 → 3) 旧 run 视状态 POST /api/interrupt（backswitch，best-effort）
- *     → 4) UI 收口（选中态/列表/统计/「已恢复」toast）→ 5) ensureStream(新会话)。
+ *     → 4) UI 收口（选中态/列表/统计）→ 5) ensureStream(新会话)。
  *     UI 收口必须先于 ensureStream：流长活（run 结束不关、心跳保活，仅切会话/出错才闭），
- *     await 在其后排序即把提示与刷新推迟到流关闭 —— 恢复/新建提示永不显示。
+ *     await 在其后排序即把刷新推迟到流关闭 —— 恢复/新建的 UI 收口永不发生。
  * - 会话按**工作区**分组（dsh WorkspaceBrowser）：组 = 注册根（ProjectRowItem 组头
  *   34px：folder↔hover chevron + basename/meta + kebab/＋）+ SessionNodeItem 32px 行；
  *   未注册根/无根会话 = 尾组「未知项目」（无操作菜单）；归组纯逻辑 = workspaces.js
@@ -52,6 +52,7 @@ import {
   REASONING_DEFAULT,
   METHODFIRST_DEFAULT,
   normalizeMethodFirst,
+  normalizeReasoning,
   REVIEWMODE_DEFAULT,
   normalizeReviewMode,
   saveReviewMode,
@@ -81,6 +82,7 @@ import {
   saveSubagentPref,
   syncWorkflowPref,
   normalizeParallel,
+  parallelLabelText,
   normalizeSkillsList,
   normalizeMcpServers,
   splitMcpArgs,
@@ -95,6 +97,17 @@ import {
   installSkill,
 } from './extensions.js';
 import { iconSvg } from './icons.js'; // 线描图标单一来源（d 串 + createElementNS，永不 innerHTML）
+import {
+  ATTACH_LIMITS,
+  attachmentErrorFor,
+  attachmentsFull,
+  normalizeAttachment,
+  attachmentRefValid,
+  resolveImageContent,
+  imageFitSingle,
+  IMAGE_TILE_DIMENSION,
+  DROP_OVERLAY_TEXT,
+} from './attachments.js'; // 附件（图像多模态 ADR-0015 · dsh 管线）纯逻辑：上限/校验/形状/展开/几何
 import { loadThemeKey, saveThemeKey, applyTheme } from './theme.js';
 import {
   loadSidebarState,
@@ -103,9 +116,10 @@ import {
   SIDEBAR_WIDTH,
   BUILD_VERSION,
 } from './sidebar.js';
-import { SESSION_MENU_ITEMS, menuItemById, menuPosition } from './menu.js';
+import { SESSION_MENU_ITEMS, menuItemById, menuPosition, ROW_MENU_KEBAB_TITLE } from './menu.js';
 import {
   COMMANDS,
+  CONTINUE_PROMPT,
   commandFor,
   commandArgValid,
   matchCommands,
@@ -133,6 +147,7 @@ import {
 import {
   WS_DEGRADED_NOTE,
   WS_EMPTY_NOTE,
+  WS_SEARCH_NO_MATCH,
   WS_MENU_ITEMS,
   isAbsolutePath,
   normalizeWorkspaceRoots,
@@ -141,6 +156,9 @@ import {
   workspacePathMeta,
   workspaceMenuOrder,
   pickDefaultRoot,
+  filterSessionList,
+  nextWsSortMode,
+  sortWorkspaceSessions,
   groupSessionsByRegisteredWorkspaces,
   workspaceOfSession,
   createBrowseState,
@@ -158,6 +176,7 @@ import {
 import {
   statusLabel,
   statusTone,
+  continueVisible,
   runStatusLine,
   formatArguments,
   toolSummaryLine,
@@ -179,6 +198,8 @@ import {
   formatMessageClock,
   ranForCaption,
   CLIPBOARD_FEEDBACK_MS,
+  TOAST_COPY_TITLE,
+  TOAST_COPIED_TEXT,
   messageCopyText,
   thinkSummary,
   thinkBodyText,
@@ -192,11 +213,13 @@ import {
   BLOCK_MAX_CHARS,
   // R2-S1：方法线小牌文本（run-strip「方法线 tdd」；提取纯逻辑 = messages.js 侧）
   methodologyBadgeText,
+  // B：审查块（spawn_subagent + prompt 含 审查|review）——标题行与两行摘要的单一来源
+  REVIEW_BLOCK_TITLE,
+  reviewBlockText,
 } from './format.js';
 
 // ============================================================== 常量
 
-const LS_SESSION = 'devmate.ui.sessionId';
 // 侧栏折叠持久化键与读写纪律在 sidebar.js（键 = devdev.sidebarCollapsed；
 // 仅字面量 'true' 服从，损坏/未定义 → 展开 —— 读取风险修复）。
 // 侧栏仅「对话」区（会话按 workspaceRoot 分组）；工具/MCP/插件侧栏区已删
@@ -231,7 +254,13 @@ const ui = {
     methodFirst: METHODFIRST_DEFAULT,
     // R2-S2：收尾评审哨兵开关（缺省 true；GET /api/settings 权威回显，见设置页常规区）
     reviewMode: REVIEWMODE_DEFAULT,
+    // A 档：请求侧输入/输出上限（null = 未设置（留空=厂商默认）；服务端只回已设值）
+    maxInputTokens: null,
+    maxOutputTokens: null,
   },
+  // 附件（ADR-0015）：composer 待发送图像（{url,width,height,name} 于 pick 时归一；
+  // 发送成功即清空；失败保留供重试）。
+  attachments: [],
   sessionId: null,
   // 内嵌审批卡：currentApproval = 当前呈现项（快照 approvals[0] 的视图模型）；
   // deciding = 应答已点、POST 在途（双纽防双发，dsh「应答后 disabled」同语义）
@@ -244,6 +273,7 @@ const ui = {
   riskConfirmOpen: false,
   riskConfirmTarget: null,
   toastTimer: 0,
+  toastCopyTimer: 0,
   rafPending: false,
   dirtyItems: new Set(),
   rendered: new Map(), // store item id → DOM node
@@ -270,6 +300,13 @@ const ui = {
   wsDefaultRoot: null,
   wsCollapsed: {},
   wsNewMenuOpen: false,
+  // 区头搜索/排序（纯逻辑 = workspaces.js filterSessionList / nextWsSortMode /
+  // sortWorkspaceSessions；均为内存态，不落盘 —— 断开会话即回缺省）
+  wsSearchOpen: false,
+  wsSearchQuery: '',
+  wsSortMode: 'recent',
+  // 模型·思考强度 combo（dsh 右下同款）：菜单开合（选项装配 = buildModelMenu）
+  modelMenuOpen: false,
   wsPickerOpen: false,
   skillInstalling: false, // 技能安装在途（按钮态 + 重入护栏）
   wsPickerState: null, // 目录浏览状态机（workspaces.js 纯逻辑）
@@ -298,6 +335,15 @@ const ui = {
   reviewModeSyncTimer: 0,
   // 「/」命令下拉（commands.js 纯逻辑；DOM 装配与键盘走这里）
   cmdMenuOpen: false,
+  // hero「选择工作区…」推进目录弹窗的 commit 模式（选定后自动建会话 — 仅 hero 发端；
+  // 侧栏「添加工作区」不变，仍只注册不建会话）
+  wsPickerCommitCreatesSession: false,
+  // 严格先选工作区（A 档）：本轮（页面装载以来）是否已明确选择目标工作区——
+  // 点击 ＋新建/组头＋/英雄「使用默认工作区」/hero 目录选定 → newSession 置位；
+  // 会话行恢复（sessionId 非空）隐含选择。解锁条件：sessionId 存在 或 本标记。
+  // 生命周期 = 本轮：刷新重置（boot 置 false），删除当前会话/流 404 后维持
+  // （选择不被撤销——下一条消息仍可经 /api/chat 建新会话）。
+  wsChosenRound: false,
   cmdHighlight: 0, // 下拉当前高亮项（键盘循环用）
   cmdTimer: 0, // 防抖 150ms 句柄
   groupSeq: 0, // 分组组头 body-id 序号（唯一）
@@ -324,6 +370,10 @@ const el = {
   // S14 多工作区：＋新建菜单 / 添加工作区 / 目录弹窗 / 错误对话框 / 移除确认
   wsNewMenu: document.getElementById('ws-new-menu'),
   btnAddWorkspace: document.getElementById('btn-add-workspace'),
+  btnWsSearch: document.getElementById('btn-ws-search'),
+  btnWsSort: document.getElementById('btn-ws-sort'),
+  wsSearchField: document.getElementById('ws-search-field'),
+  wsSearchInput: document.getElementById('ws-search-input'),
   wsPicker: document.getElementById('ws-picker'),
   wsPickerScrim: document.getElementById('ws-picker-scrim'),
   wsCrumbs: document.getElementById('ws-crumbs'),
@@ -342,7 +392,6 @@ const el = {
   wsRemoveText: document.getElementById('ws-remove-text'),
   btnWsRemoveOk: document.getElementById('btn-ws-remove-ok'),
   btnWsRemoveCancel: document.getElementById('btn-ws-remove-cancel'),
-  btnEmptyAddWorkspace: document.getElementById('btn-empty-add-workspace'),
   statsLine: document.getElementById('stats-line'),
   confirm: document.getElementById('confirm'),
   confirmScrim: document.getElementById('confirm-scrim'),
@@ -351,13 +400,26 @@ const el = {
   btnConfirmCancel: document.getElementById('btn-confirm-cancel'),
   messages: document.getElementById('messages'),
   empty: document.getElementById('empty'),
+  heroPickWorkspace: document.getElementById('hero-pick-workspace'),
+  heroDefaultWorkspace: document.getElementById('hero-default-workspace'),
   input: document.getElementById('input'),
   send: document.getElementById('btn-send'),
   stop: document.getElementById('btn-stop'),
+  // 附件（ADR-0015：图像加号钮 + 隐藏文件选择 + 预览条）
+  btnAttach: document.getElementById('btn-attach'),
+  attachInput: document.getElementById('attach-input'),
+  attachStrip: document.getElementById('attach-strip'),
+  dropOverlay: document.getElementById('drop-overlay'),
+  dropOverlayText: document.getElementById('drop-overlay-text'),
+  imageLightbox: document.getElementById('image-lightbox'),
+  imageLightboxImg: document.getElementById('image-lightbox-img'),
+  imageLightboxClose: document.getElementById('image-lightbox-close'),
   conn: document.getElementById('conn'),
   connLabel: document.getElementById('conn-label'),
+  composer: document.getElementById('composer'),
   composerStats: document.getElementById('composer-stats'),
   composerStatsText: document.getElementById('composer-stats-text'),
+  composerHint: document.getElementById('composer-hint'),
   runStrip: document.getElementById('run-strip'),
   sessionTitle: document.getElementById('session-title'),
   sessionId: document.getElementById('session-id'),
@@ -373,6 +435,14 @@ const el = {
   permGlyph: document.getElementById('perm-glyph'),
   permLabel: document.getElementById('perm-label'),
   permMenu: document.getElementById('perm-menu'),
+  // 模型·思考强度 combo + 菜单（dsh 右下同款：模型名（跳设置）+ 强度四档）
+  modelCombo: document.getElementById('model-combo'),
+  mcModel: document.getElementById('mc-model'),
+  mcReasoning: document.getElementById('mc-reasoning'),
+  modelMenu: document.getElementById('model-menu'),
+  mmModel: document.getElementById('mm-model'),
+  mmModelValue: document.getElementById('mm-model-value'),
+  modelMenuOpts: document.getElementById('model-menu-opts'),
   // 全部访问风险确认门（复用删除确认 modal 视觉）
   riskConfirm: document.getElementById('risk-confirm'),
   riskScrim: document.getElementById('risk-scrim'),
@@ -386,8 +456,6 @@ const el = {
   cmdPanelTitle: document.getElementById('cmd-panel-title'),
   cmdPanelBody: document.getElementById('cmd-panel-body'),
   cmdPanelClose: document.getElementById('cmd-panel-close'),
-  // 思考强度分段 pill（选项由 app.js 从 settings.js 常量装配）
-  reasoningSeg: document.getElementById('reasoning-seg'),
   // 上下文窗口占用环
   meterRow: document.getElementById('meter-row'),
   meter: document.getElementById('meter'),
@@ -399,15 +467,18 @@ const el = {
   setBaseUrl: document.getElementById('set-baseurl'),
   setModel: document.getElementById('set-model'),
   setKey: document.getElementById('set-key'),
+  setMaxInputTokens: document.getElementById('set-max-input-tokens'),
+  setMaxOutputTokens: document.getElementById('set-max-output-tokens'),
   setWorkspace: document.getElementById('set-workspace'),
   keyState: document.getElementById('key-state'),
   settingsStatus: document.getElementById('settings-status'),
   btnSettingsCancel: document.getElementById('btn-settings-cancel'),
-  step1: document.getElementById('step-1'),
   themeInputs: [...document.querySelectorAll('input[name="theme"]')],
   // 设置页扩展区（Skills / MCP / Subagent）—— 动态行全部走 data-* 事件委托
   setSubagentEnabled: document.getElementById('set-subagent-enabled'),
   setSubagentParallel: document.getElementById('set-subagent-parallel'),
+  // 0 档（无上限）标签/风险说明小字（仅 parallel===0 时挂显，文案经 parallelLabelText）
+  setSubagentParallelLabel: document.getElementById('set-subagent-parallel-label'),
   setSubagentNote: document.getElementById('set-subagent-note'),
   // R2-S1 方法论先行开关（常规区卡片；change 委托 data-methodfirst-field）
   setMethodfirstEnabled: document.getElementById('set-methodfirst-enabled'),
@@ -434,7 +505,14 @@ const el = {
 
 // fetchJson / HttpError / isStatus / backswitch 均在 api.js（纯逻辑，可注入 fetchImpl 单测）。
 
-function toast(text, tone = '') {
+/**
+ * toast(text, tone?, options?)
+ * - options.clickable = { copy }: 点击 toast → 复制 copy 值 → 闪现「已复制」——
+ *   复用本组件不改结构（title/data-copy/class/tabindex 均为运行时赋态，见
+ *   wireToastCopy；文案单源 = format.js TOAST_COPY_TITLE / TOAST_COPIED_TEXT）。
+ *   恢复会话 toast 即 clickable（点击复制完整会话 ID）。
+ */
+function toast(text, tone = '', options = null) {
   el.toast.textContent = text;
   el.toast.className = 'toast' + (tone ? ` ${tone}` : '');
   el.toast.hidden = false;
@@ -442,6 +520,48 @@ function toast(text, tone = '') {
   ui.toastTimer = window.setTimeout(() => {
     el.toast.hidden = true;
   }, 2400);
+  const copy = options?.clickable?.copy ?? '';
+  if (copy) {
+    el.toast.title = TOAST_COPY_TITLE;
+    el.toast.dataset.copy = String(copy);
+    el.toast.classList.add('clickable');
+    el.toast.tabIndex = 0;
+  } else {
+    // className 上方已重建（无 clickable）——这里只清交互态属性
+    el.toast.removeAttribute('title');
+    el.toast.removeAttribute('data-copy');
+    el.toast.removeAttribute('tabindex');
+  }
+}
+
+/**
+ * toast 点击复制（clickable，wireEvents 时挂一次）：点击 → copyText(data-copy)
+ * → 文本闪现「已复制」CLIPBOARD_FEEDBACK_MS 后复原（隐藏/新 toast 自然覆盖）。
+ * 键盘同语义（Enter/Space；tabIndex 0 的可交互面）。
+ */
+function wireToastCopy() {
+  el.toast.addEventListener('click', () => {
+    const copy = el.toast.dataset.copy ?? '';
+    if (!copy) return;
+    const original = el.toast.textContent;
+    void copyText(copy).then((ok) => {
+      if (!ok) {
+        toast('复制失败', 'warn');
+        return;
+      }
+      el.toast.textContent = TOAST_COPIED_TEXT;
+      window.clearTimeout(ui.toastCopyTimer);
+      ui.toastCopyTimer = window.setTimeout(() => {
+        if (el.toast.textContent === TOAST_COPIED_TEXT) el.toast.textContent = original;
+      }, CLIPBOARD_FEEDBACK_MS);
+    });
+  });
+  el.toast.addEventListener('keydown', (event) => {
+    if (event.key !== 'Enter' && event.key !== ' ') return;
+    if (!(el.toast.dataset.copy ?? '')) return;
+    event.preventDefault();
+    el.toast.click();
+  });
 }
 
 // ============================================================== 主题（S13-A）
@@ -791,11 +911,51 @@ function effectiveWorkspaceRoots() {
 function renderSessionList(list) {
   const sorted = sortSessionList(list);
   ui.sessionItems = sorted;
-  const groups = groupSessionsByRegisteredWorkspaces(sorted, effectiveWorkspaceRoots());
+  // 区头搜索/排序（纯客户端；纯逻辑 = workspaces.js）：过滤查询 → 排序模式 →
+  // 注册表分组（组序仍随 roots 注册序；组内行序随排序模式）。搜索激活时隐藏无
+  // 匹配会话的空组头（否则过滤后仍列满空组头 —— 无匹配说明无从显现）。
+  const filtered = sortWorkspaceSessions(
+    filterSessionList(sorted, ui.wsSearchQuery),
+    ui.wsSortMode,
+  );
+  const groups = groupSessionsByRegisteredWorkspaces(filtered, effectiveWorkspaceRoots()).filter(
+    (g) => ui.wsSearchQuery === '' || g.sessions.length > 0,
+  );
   el.wsGroups.replaceChildren();
-  el.sessionsEmpty.textContent = WS_EMPTY_NOTE;
+  // 空态双语：无会话 = 现有引导；有会话但被搜索过滤到零 = 「无匹配」说明（不冒充空表）
+  el.sessionsEmpty.textContent = ui.wsSearchQuery ? WS_SEARCH_NO_MATCH : WS_EMPTY_NOTE;
   el.sessionsEmpty.hidden = groups.length > 0;
   for (const group of groups) el.wsGroups.appendChild(buildWorkspaceGroup(group));
+}
+
+/** 区头搜索开合 + 过滤（纯客户端；dsh WorkspaceBrowser search 同语义：输入即过滤行）。 */
+function toggleWsSearch(open) {
+  const next = open !== undefined ? open : !ui.wsSearchOpen;
+  ui.wsSearchOpen = next;
+  el.wsSearchField.hidden = !next;
+  if (!next) {
+    ui.wsSearchQuery = '';
+    el.wsSearchInput.value = '';
+    if (ui.sessionsLoaded) renderSessionList(ui.sessionItems);
+  } else {
+    el.wsSearchInput.focus();
+  }
+}
+
+/** 排序轮换（dsh sort 图标点击：时间 ↔ 名称；title 同步当前模式）。 */
+function cycleWsSort() {
+  ui.wsSortMode = nextWsSortMode(ui.wsSortMode);
+  syncWsSortButton();
+  if (ui.sessionsLoaded) renderSessionList(ui.sessionItems);
+}
+
+function syncWsSortButton() {
+  const byName = ui.wsSortMode === 'name';
+  el.btnWsSort.setAttribute('aria-label', byName ? '排序：按名称' : '排序：按时间');
+  el.btnWsSort.title = byName
+    ? '排序：按名称（点击切换为按时间）'
+    : '排序：按时间（点击切换为按名称）';
+  el.btnWsSort.classList.toggle('active', byName);
 }
 
 /** 当前会话所属工作区根（菜单「勾选当前」用；null = 无/未注册）。 */
@@ -984,7 +1144,8 @@ function buildSessionItem(s) {
   kebab.type = 'button';
   kebab.className = 'rowIconButton';
   kebab.dataset.kebab = '';
-  kebab.setAttribute('aria-label', `会话操作：${titleText}`);
+  kebab.setAttribute('aria-label', ROW_MENU_KEBAB_TITLE);
+  kebab.title = ROW_MENU_KEBAB_TITLE;
   kebab.appendChild(iconSvg('kebab', { size: 16 }));
   actions.appendChild(kebab);
   li.append(slot, title, time, actions);
@@ -1138,6 +1299,8 @@ function closeWsPicker() {
   if (!ui.wsPickerOpen) return;
   ui.wsPickerOpen = false;
   ui.wsPickerBrowseFailed = false;
+  // 未选即关：hero 发端的「选定建会话」模式随本次关闭作废（弹窗关闭未选 → 仍空态）
+  ui.wsPickerCommitCreatesSession = false;
   el.wsPicker.hidden = true;
   el.wsPickerScrim.hidden = true;
 }
@@ -1314,8 +1477,11 @@ function renderWsPicker() {
   el.btnWsPickerSelect.disabled = !browseCanCommit(state);
 }
 
-/** 「选择此文件夹」：选中目录 → POST 注册；错误 → dsh folderError 对话框（重试重开）。 */
+/** 「选择此文件夹」：选中目录 → POST 注册；错误 → dsh folderError 对话框（重试重开）。
+ *  hero 发端（wsPickerCommitCreatesSession）选定后自动加建该工作区新会话并进入。 */
 async function wsPickerCommit() {
+  const createSession = ui.wsPickerCommitCreatesSession;
+  ui.wsPickerCommitCreatesSession = false;
   const path = ui.wsPickerState?.selected;
   if (typeof path !== 'string' || path === '') return;
   el.btnWsPickerSelect.disabled = true;
@@ -1325,10 +1491,18 @@ async function wsPickerCommit() {
     closeWsPicker();
     ui.wsPickerState = null; // 下次打开回 homedir
     await refreshWorkspaces();
+    if (createSession) void newSession(path);
   } catch (err) {
     el.btnWsPickerSelect.disabled = false;
     await openWsError(workspaceErrorInfo(err).text);
   }
+}
+
+/** hero「选择工作区…」：直开目录弹窗——选定后自动在该工作区新建会话并进入
+ *  （首次 = 默认根组语义：注册工作区后以该根为组，会话落组；未选关闭 → 仍空态）。 */
+function openHeroWorkspacePicker() {
+  ui.wsPickerCommitCreatesSession = true;
+  void openWsPicker();
 }
 
 /** 错误对话框（dsh folderError：标题 + 文案 + 取消/重试 —— 重试重开目录弹窗）。 */
@@ -1420,11 +1594,11 @@ function closeStreamForSwitch() {
  * 恢复会话（点击列表项）——单流协调时序（任务书；**代码执行顺序**如下）：
  * 1) 关旧流 broker → 2) store.reset + GET /api/sessions/:id 回放（协议形状事件 → dispatch）
  * 3) 旧 run 视状态 POST /api/interrupt（best-effort，见 api.js backswitch）
- * → 4) UI 收口（选中态/列表/统计/「已恢复」toast）→ 5) ensureStream(新会话)。
+ * → 4) UI 收口（选中态/列表/统计；恢复成功不弹 toast —— 列表选中态即反馈）→ 5) ensureStream(新会话)。
  * 注：interrupt 在回放后发出（代码序如此）——回放不阻塞、中断不阻塞（best-effort）。
  * 期间 UI 不锁（历史拉取失败降级为系统提示 + 空视图，照常开流）。
  * 4 必须先于 5：流长活（run 结束不关、心跳保活，仅切会话/出错才闭），ensureStream 的
- * await 在流关闭前不返回 —— toast 与列表刷新排在之后即永远不发出。
+ * await 在流关闭前不返回 —— UI 收口排在之后即永远不发出。
  */
 async function restoreSession(id) {
   if (!id) return;
@@ -1437,7 +1611,6 @@ async function restoreSession(id) {
 
   closeStreamForSwitch(); // 1) 先关旧流 broker
   ui.sessionId = id;
-  localStorage.setItem(LS_SESSION, id);
   store.reset();
   store.setSessionId(id);
 
@@ -1475,12 +1648,13 @@ async function restoreSession(id) {
   // 3) 旧 run 视状态中断（不阻塞切换；旧会话继续跑的 shell 由服务端 close 兜底）
   await backswitch(previousSessionId, previousRunActive);
 
-  // 4) UI 收口先行：toast 与列表/统计刷新不得排在长活流 await 之后 —— 流长活
-  //    （run 结束不关，仅切会话/出错才闭），await 返回即流关闭，提示将永不显示。
+  // 4) UI 收口先行：列表/统计刷新不得排在长活流 await 之后 —— 流长活
+  //    （run 结束不关，仅切会话/出错才闭），await 返回即流关闭，刷新将永不发生。
+  //    恢复成功不弹 toast（静默恢复：列表选中态 + 消息区换载即为反馈；toast
+  //    clickable 复制机制保留，其它场景仍可复用 —— format.js 已无恢复文案）。
   refreshSessionSelection();
   void refreshSessionList(true);
   void refreshStats();
-  toast(`已恢复会话 #${shortId(id)}`);
 
   // 5) 换绑新流（连接在后台保持；其上的 UI 收口不得再依赖本 await 的顺序）
   await ensureStream(id);
@@ -1490,8 +1664,12 @@ async function restoreSession(id) {
  * ＋新建：POST /api/sessions（未实现时回退「首条消息创建」）。
  * @param {string|null} workspaceRoot 目标工作区根（来自 ＋新建菜单/组头 ＋；
  *   null = 服务端默认根）。未注册 → 400 workspace-not-registered（容错映射 + 重读注册表）。
+ *  严格先选工作区（A 档）：**任何** newSession 调用 = 明确选择了目标工作区
+ *  （菜单/组头/英雄目录选定 = 该工作区；英雄默认/品牌钮/「/new」= 默认根）→ 置位
+ *  wsChosenRound 解锁（服务端未实现预建端点时 sessionId 暂空也不回锁）。
  */
 async function newSession(workspaceRoot = null) {
+  ui.wsChosenRound = true;
   let id = null;
   let created = false;
   try {
@@ -1515,8 +1693,6 @@ async function newSession(workspaceRoot = null) {
 
   closeStreamForSwitch();
   ui.sessionId = id;
-  if (id) localStorage.setItem(LS_SESSION, id);
-  else localStorage.removeItem(LS_SESSION);
   store.reset();
   store.setSessionId(id);
   replayGuard.clear(); // 新会话无 GET 回放覆盖序 —— 守卫拆除（重放窗即时序本体）
@@ -1557,10 +1733,12 @@ async function confirmDeleteSession() {
   try {
     await fetchJson(`/api/sessions/${encodeURIComponent(s.sessionId)}`, { method: 'DELETE' });
     if (s.sessionId === ui.sessionId) {
-      // 删除的是当前会话：脱离流 + 全新视图（下一条消息建新会话）
+      // 删除的是当前会话：脱离流 + 全新视图（下一条消息建新会话）。
+      // 严格先选工作区：选择不因删除撤销 —— 维持本轮已选（下一条消息仍可
+      // 经 /api/chat 建新会话，不强制回到 hero 重选）。
       closeStreamForSwitch();
       ui.sessionId = null;
-      localStorage.removeItem(LS_SESSION);
+      ui.wsChosenRound = true;
       store.reset();
       store.setSessionId(null);
     }
@@ -1841,6 +2019,46 @@ function createItemEl(item) {
   if (kind === 'user') {
     const bubble = document.createElement('div');
     bubble.className = 'bubble';
+    // 图片卡（ADR-0015；dsh 同款几何）：单图 = long-edge 240px + 比例钳制 [0.25,4]
+    // + object-fit:cover 裁剪锚（imageFitSingle 纯函数）；多图 = 64px 方 tile；
+    // 单击 → lightbox 原图。仅渲染 dataURL（协议镜像图片卡的唯一载体）；
+    // createElement 装配（img.src = dataURL —— 本地文件内容，非注入面）。
+    // 图片卡（ADR-0015；dsh 同款几何）：单图 = long-edge 240px + 比例钳制 [0.25,4]
+    // + object-fit:cover 裁剪锚（imageFitSingle 纯函数）；多图 = 64px 方 tile；
+    // 单击 → lightbox 原图。ref 形（slim 事件）经 /api/attachments/<ref> 同源读回、
+    // 旧 dataURL 形直渲（resolveImageContent 兼容两种——协议不回退）。
+    const images = resolveImageContent(item.images);
+    const single = images.length === 1;
+    for (const image of images) {
+      const card = document.createElement('span');
+      card.className = 'user-image-card' + (single ? '' : ' tile');
+      const button = document.createElement('button');
+      button.type = 'button';
+      button.className = 'user-image-btn';
+      button.title = '查看原图';
+      button.setAttribute('aria-label', '查看原图');
+      const inner = document.createElement('img');
+      inner.className = 'user-image';
+      inner.alt = '用户发送的图片';
+      inner.src = image.src;
+      if (single) {
+        const fit = imageFitSingle(
+          image.width !== undefined && image.height !== undefined
+            ? { width: image.width, height: image.height }
+            : undefined,
+        );
+        button.style.width = `${fit.width}px`;
+        button.style.height = `${fit.height}px`;
+        inner.style.objectPosition = fit.objectPosition;
+      } else {
+        button.style.width = `${IMAGE_TILE_DIMENSION}px`;
+        button.style.height = `${IMAGE_TILE_DIMENSION}px`;
+      }
+      button.addEventListener('click', () => openLightbox(image.src, '用户发送的图片'));
+      button.appendChild(inner);
+      card.appendChild(button);
+      bubble.appendChild(card);
+    }
     const text = document.createElement('span');
     text.className = 'bubble-text';
     text.textContent = item.text; // 纯文本（CSS pre-wrap 保留换行）
@@ -2008,7 +2226,9 @@ function renderItems(snap) {
       if (node) el.messages.appendChild(node);
     }
   }
-  el.empty.hidden = snap.items.length > 0;
+  // hero 隐藏条件（严格先选工作区联动）：有消息 / 已解锁（sessionId 非空或本轮已选
+  // 工作区）→ 隐藏；锁态（无会话且未选）→ 常显 —— 「先选工作区」是唯一路径
+  el.empty.hidden = snap.items.length > 0 || workspacePicked();
   renderFoldNote(snap);
 }
 
@@ -2252,6 +2472,99 @@ function updateToolCard(card, t) {
   if (card._open) flushToolCard(card);
 }
 
+// ---- 独立审查块（B：spawn_subagent 且 arguments.prompt 含 审查|review） ----
+// 与服务端协议零改动：client 判定（isReviewSubagent，format.js）→ 消息状态机
+// 给工具卡打 review 标志（messages.js）→ 渲染层走专属卡（本节目）。
+// 与工具卡同网格（同 tool-slot 容器）但区分色（accent-border 描边 + 淡蓝底），
+// 标题行结构与正文惰性（首次展开才落全文）沿用工具卡纪律。
+
+function buildReviewBlock() {
+  const card = document.createElement('div');
+  card.className = 'review-block';
+  const head = document.createElement('button');
+  head.type = 'button';
+  head.className = 'review-head';
+  head.setAttribute('aria-expanded', 'false');
+  const leading = document.createElement('span');
+  leading.className = 'review-leading';
+  leading.setAttribute('aria-hidden', 'true');
+  const shield = iconSvg('shieldCheck', { size: 16 });
+  if (shield) leading.appendChild(shield);
+  const title = document.createElement('span');
+  title.className = 'review-title';
+  title.textContent = REVIEW_BLOCK_TITLE;
+  const subject = document.createElement('span');
+  subject.className = 'review-subject';
+  const verdict = document.createElement('span');
+  verdict.className = 'review-verdict';
+  const spacer = document.createElement('span');
+  spacer.className = 'tool-spacer';
+  const chev = document.createElementNS('http://www.w3.org/2000/svg', 'svg');
+  chev.setAttribute('viewBox', '0 0 16 16');
+  chev.setAttribute('class', 'tool-chevron');
+  chev.setAttribute('aria-hidden', 'true');
+  const path = document.createElementNS('http://www.w3.org/2000/svg', 'path');
+  path.setAttribute('d', 'M4 6l4 4 4-4');
+  path.setAttribute('fill', 'none');
+  path.setAttribute('stroke', 'currentColor');
+  path.setAttribute('stroke-width', '1.6');
+  chev.appendChild(path);
+  head.append(leading, title, subject, verdict, spacer, chev);
+  const body = document.createElement('div');
+  body.className = 'review-body';
+  const content = document.createElement('pre');
+  content.className = 'review-content';
+  body.appendChild(content);
+  head.addEventListener('click', () => {
+    const open = !card._open;
+    card._open = open;
+    head.setAttribute('aria-expanded', String(open));
+    body.classList.toggle('open', open);
+    if (open) flushReviewContent(card);
+  });
+  card.append(head, body);
+  card._head = head;
+  card._subject = subject;
+  card._verdict = verdict;
+  card._content = content;
+  card._open = false;
+  card._plan = null;
+  return card;
+}
+
+/** 审查块正文（全文惰性：折叠态零正文 DOM；上限 BLOCK_MAX_CHARS + 截断注记）。 */
+function reviewBodyText(result) {
+  const full = result?.content || result?.preview || '';
+  if (!full) {
+    if (result && result.ok === false && result.error) return `出错：${result.error}`;
+    return result ? '（审查完成，无输出）' : '';
+  }
+  return buildReadBlock(full, BLOCK_MAX_CHARS).text;
+}
+
+function flushReviewContent(card) {
+  if (!card._plan) return;
+  if (card._lazyBuilt) return;
+  card._lazyBuilt = true;
+  card._content.textContent = reviewBodyText(card._plan.result);
+  card._content.classList.toggle(
+    'err',
+    Boolean(card._plan.result && card._plan.result.ok === false),
+  );
+}
+
+/** 审查块增量（两行摘要 = reviewBlockText 单一来源；主标题恒「独立审查」）。 */
+function updateReviewBlock(card, t) {
+  const view = reviewBlockText({ name: t.name, arguments: t.arguments }, t.result);
+  card._subject.textContent = view.subject;
+  card._subject.title = view.subject;
+  card._verdict.textContent = t.result ? view.verdict : '（审查进行中…）';
+  card._verdict.classList.toggle('err', Boolean(t.result && t.result.ok === false));
+  card._head.title = `${TOOL_STATE_LABEL[t.state] ?? statusLabel(t.state)} · spawn_subagent`;
+  card._plan = { result: t.result };
+  if (card._open) flushReviewContent(card);
+}
+
 /** 工具卡增量同步（keyed by tool id）。 */
 function updateTools(node, tools) {
   if (!node._toolEls) node._toolEls = new Map();
@@ -2266,12 +2579,22 @@ function updateTools(node, tools) {
     seen.add(t.id);
     let card = node._toolEls.get(t.id);
     if (!card) {
-      card = buildToolCard();
+      // 审查块（B）：review 标志由状态机打（messages.js）—— 专属卡不混入工具卡
+      card = t.review === true ? buildReviewBlock() : buildToolCard();
       node._toolEls.set(t.id, card);
       slot.appendChild(card);
     }
     // 签名含折叠态可扫视部分（状态/名称/变体/参数变体摘要/结果摘要首行）；
     // 不含块全量 — 块内容只在展开时写入，不参与「要不要重渲染」判定
+    if (t.review === true) {
+      const view = reviewBlockText({ name: t.name, arguments: t.arguments }, t.result);
+      const sig = `${t.state}|review|${view.subject}|${view.verdict}`;
+      if (card._sig !== sig) {
+        card._sig = sig;
+        updateReviewBlock(card, t);
+      }
+      continue;
+    }
     const variant = classifyTool(t.name);
     const sig = `${t.state}|${t.name}|${variant}|${toolSummaryArgs(t.arguments, variant)}|${toolSummaryLine(t.result)}`;
     if (card._sig !== sig) {
@@ -2358,8 +2681,20 @@ function ensureStripParts() {
   label.className = 'rs-label';
   const meta = document.createElement('span');
   meta.className = 'rs-meta';
-  el.runStrip.replaceChildren(badge, dot, label, meta);
-  el.runStrip._parts = { badge, dot, label, meta };
+  // 「继续」小钮（primary-outline 12px）：仅在终态 user-interrupted 显示（裁决见
+  // format.js continueVisible；点击 = 向当前会话发送 CONTINUE_PROMPT，同 /continue）
+  const continueBtn = document.createElement('button');
+  continueBtn.type = 'button';
+  continueBtn.className = 'rs-continue';
+  continueBtn.hidden = true;
+  continueBtn.textContent = '继续';
+  continueBtn.title = '继续刚才未完成的任务';
+  continueBtn.setAttribute('aria-label', '继续刚才未完成的任务');
+  continueBtn.addEventListener('click', () => {
+    void sendContinue();
+  });
+  el.runStrip.replaceChildren(badge, dot, label, meta, continueBtn);
+  el.runStrip._parts = { badge, dot, label, meta, continue: continueBtn };
 }
 
 /** 方法线小牌（R2-S1）：有 methodLine → 显示「方法线 <id>」（mono chip）；无则隐藏。
@@ -2394,6 +2729,13 @@ function setStrip(mode, { tone, text, meta = '', err = false }) {
 function renderStrip(snap) {
   ensureStripParts();
   setMethodBadge(snap.methodLine);
+  // 「继续」钮可见性（仅终态 user-interrupted + 有会话；裁决单一源 = continueVisible，
+  // run-strip 每条渲染路径统一刷新 —— 可见时点击经 sendContinue 走正常 chat 续跑）
+  el.runStrip._parts.continue.hidden = !continueVisible(snap.runStatus, {
+    runActive: snap.runActive,
+    lastError: snap.lastError,
+    hasSession: ui.sessionId !== null,
+  });
   const live = snap.runActive;
 
   if (live && snap.lastError) {
@@ -2490,7 +2832,7 @@ async function decideBannerApproval(approve) {
 // ============================================================== PermissionSelect 访问模式 chip
 
 /** 档位 glyph（16 视口、currentColor；chip 与 menu 行共用同一几何 —— dsh
- *  PermissionSelect：check 只读 / pencil 写 / 感叹号 full access）。 */
+ *  PermissionSelect：check 只读 / lock 锁形（工作区写入）/ 感叹号 full access）。 */
 function permGlyphSvg(kind) {
   const svg = document.createElementNS('http://www.w3.org/2000/svg', 'svg');
   svg.setAttribute('viewBox', '0 0 16 16');
@@ -2504,8 +2846,9 @@ function permGlyphSvg(kind) {
   if (kind === 'check') {
     path.setAttribute('d', 'M3.2 8.6l3.1 3L12.8 4.9');
     svg.appendChild(path);
-  } else if (kind === 'pencil') {
-    path.setAttribute('d', 'M3.5 12.5l.6-2.7 7.4-7.4 2.1 2.1-7.4 7.4-2.7.6z');
+  } else if (kind === 'lock') {
+    // padlock（dsh 工作区写入档同款图标语义：锁体 + 锁梁 + 锁孔）
+    path.setAttribute('d', 'M5.2 6.9V4.9a2.8 2.8 0 0 1 5.6 0v2M3.6 6.9h8.8v5.4H3.6zM8 9.2v1');
     svg.appendChild(path);
   } else {
     // alert（full access）：感叹号
@@ -2781,6 +3124,284 @@ async function revertReviewMode() {
   }
 }
 
+// ============================================================== 附件（图像多模态，ADR-0015）
+
+/**
+ * 文件选择收口（btn-attach → 隐藏 input.click() → change）——dsh intake 同管线：
+ * - 逐文件预检（类型 image/* + ≤20MiB；超限 toast 并跳过该文件——不整体作废）；
+ * - 满 20 张后拒绝追加（toast；dsh 每批 20）；
+ * - FileReader 读 dataURL → Image 探测自然宽高 → **POST /api/attachments 上传**
+ *   （服务端 sha256 内容寻址落盘 → 返回 ref）→ ui.attachments 存
+ *   {ref,width,height,previewUrl(内存只用于预览——不进事件/会话),name}。
+ * 上传失败（超限/服务端异常）→ 该文件丢弃 + toast（不整体作废；fail-closed：
+ * 拿不到 ref 绝不带图发送）。
+ */
+async function pickAttachment(files) {
+  const list = Array.from(files ?? []);
+  const added = [];
+  for (const file of list) {
+    if (ui.attachments.length + added.length >= ATTACH_LIMITS.maxCount) {
+      toast(`最多 ${ATTACH_LIMITS.maxCount} 张图片`, 'warn');
+      break;
+    }
+    const err = attachmentErrorFor(file);
+    if (err === 'too-large') {
+      toast(`图片超过 ${Math.round(ATTACH_LIMITS.maxImageBytes / 1024 / 1024)}MB，已忽略`, 'warn');
+      continue;
+    }
+    if (err === 'not-image') {
+      toast('仅支持图片文件（image/*），已忽略', 'warn');
+      continue;
+    }
+    const probe = await readImageFile(file);
+    if (probe === null) {
+      toast('图片读取失败，已忽略', 'warn');
+      continue;
+    }
+    const uploaded = await uploadAttachment(probe);
+    if (uploaded === null) {
+      toast('图片上传失败（服务端未接收），已忽略', 'warn');
+      continue;
+    }
+    added.push({
+      ref: uploaded.ref,
+      width: uploaded.width,
+      height: uploaded.height,
+      previewUrl: probe.url, // 仅预览（内存）；发送/事件只用 ref。slim 关键：dataURL 不进协议
+      name: file.name,
+    });
+  }
+  if (added.length === 0) return;
+  ui.attachments = [...ui.attachments, ...added];
+  renderComposer(); // 预览条 + 发送钮可用性（图片可无文本发送）
+}
+
+/** FileReader + Image 尺寸探测 → {url,width,height,name}（null = 读取失败/非法）。 */
+function readImageFile(file) {
+  return new Promise((resolve) => {
+    const reader = new FileReader();
+    reader.onerror = () => resolve(null);
+    reader.onload = () => {
+      const url = typeof reader.result === 'string' ? reader.result : null;
+      if (url === null || url.length > ATTACH_LIMITS.maxDataUrlChars) {
+        resolve(null);
+        return;
+      }
+      const probe = new Image();
+      probe.onload = () => {
+        resolve({ url, width: probe.naturalWidth, height: probe.naturalHeight, name: file.name });
+      };
+      probe.onerror = () => resolve({ url, name: file.name }); // 尺寸探测失败：仅保留 URL
+      probe.src = url;
+    };
+    reader.readAsDataURL(file);
+  });
+}
+
+/**
+ * 附件上传面（POST /api/attachments：dataURL → sha256 ref；宽高由客户端测量传入——
+ * 服务端校验正整数——token 估算面）。失败 → null（413 超限/400 形状/网络——fatal 不重试）。
+ */
+async function uploadAttachment(probe) {
+  try {
+    const res = await fetchJson('/api/attachments', {
+      method: 'POST',
+      body: {
+        sessionId: ensureSessionId(),
+        dataUrl: probe.url,
+        ...(probe.width !== undefined ? { width: probe.width } : {}),
+        ...(probe.height !== undefined ? { height: probe.height } : {}),
+      },
+    });
+    if (res && typeof res.ref === 'string' && attachmentRefValid(res.ref)) {
+      return { ref: res.ref, width: res.width, height: res.height };
+    }
+  } catch {
+    // 落空 → 调用方 toast
+  }
+  return null;
+}
+
+/**
+ * 会话指针确保（ADR-0015）：附件上传（单会话累计 200MiB 的记账键）先于首条消息——
+ * 无指针时客户端生成 `s-<uuid>`（服务端接受调用方 id：首条 POST /api/chat 用它建会话）。
+ */
+function ensureSessionId() {
+  if (!ui.sessionId) {
+    ui.sessionId = `s-${crypto.randomUUID()}`;
+    store.setSessionId(ui.sessionId);
+  }
+  return ui.sessionId;
+}
+
+/** 移除一张附件（预 Small卡 × 钮）。 */
+function removeAttachment(index) {
+  if (index < 0 || index >= ui.attachments.length) return;
+  ui.attachments = ui.attachments.filter((_, i) => i !== index);
+  renderComposer();
+}
+
+/**
+ * 预览条渲染（dsh AttachmentRail 简化：单图 = 长边 240（imageFitSingle 几何）、
+ * 多图 = 64px 方 tile——与消息卡同几何；hover 揭示 × 移除钮；单击 → lightbox）；
+ * 缩略图源 = 内存 previewUrl（上传时已读的 dataURL——不出协议）。
+ */
+function renderAttachmentStrip() {
+  const strip = el.attachStrip;
+  strip.replaceChildren();
+  if (ui.attachments.length === 0) {
+    strip.hidden = true;
+    return;
+  }
+  strip.hidden = false;
+  const single = ui.attachments.length === 1;
+  ui.attachments.forEach((att, index) => {
+    const card = document.createElement('span');
+    card.className = 'attach-card' + (single ? '' : ' tile');
+    const thumb = document.createElement('img');
+    thumb.className = 'attach-thumb';
+    thumb.alt = att.name || '待发送图片';
+    thumb.src = att.previewUrl;
+    if (single) {
+      const fit = imageFitSingle(
+        att.width !== undefined && att.height !== undefined
+          ? { width: att.width, height: att.height }
+          : undefined,
+      );
+      card.style.width = `${fit.width}px`;
+      card.style.height = `${fit.height}px`;
+      thumb.style.objectPosition = fit.objectPosition;
+    } else {
+      card.style.width = `${IMAGE_TILE_DIMENSION}px`;
+      card.style.height = `${IMAGE_TILE_DIMENSION}px`;
+    }
+    // dsh：单击开原图（ImageLightbox）
+    thumb.addEventListener('click', () => openLightbox(att.previewUrl, att.name || '待发送图片'));
+    const remove = document.createElement('button');
+    remove.type = 'button';
+    remove.className = 'attach-remove';
+    remove.setAttribute('aria-label', '移除图片');
+    remove.title = '移除图片';
+    remove.textContent = '×';
+    remove.addEventListener('click', () => removeAttachment(index));
+    card.append(thumb, remove);
+    strip.appendChild(card);
+  });
+}
+
+/** 清空附件（发送成功后调用；失败保留供重试）。 */
+function clearAttachments() {
+  ui.attachments = [];
+  renderComposer();
+}
+
+// ---------------------------------------------------------------------------
+// 图片 lightbox（dsh ImageLightbox 简化：全屏浮层原图 + 关闭钮；Esc/遮罩/钮关闭）
+// ---------------------------------------------------------------------------
+
+function openLightbox(url, alt) {
+  el.imageLightboxImg.src = url;
+  el.imageLightboxImg.alt = alt ?? '';
+  el.imageLightbox.hidden = false;
+}
+
+function closeLightbox() {
+  el.imageLightbox.hidden = true;
+  el.imageLightboxImg.src = '';
+}
+
+/** lightbox 是否打开（Esc 层叠处理：先于其它 modal）。 */
+function lightboxOpen() {
+  return !el.imageLightbox.hidden;
+}
+
+// ---------------------------------------------------------------------------
+// 拖放（dsh DropOverlay 简化：document 级 Files 拖入显示遮罩；drop 进 intake）
+// ---------------------------------------------------------------------------
+
+/** 拖放是否可接受（dsh canAcceptDrop：未锁、未忙；简化到「intake 有门」）。 */
+function canAcceptDropFiles() {
+  return inputUnlocked() && workspacePicked() && ui.lastSnap?.runActive !== true;
+}
+
+/** 文件拖入（含 DataTransfer）→ intake（同 pickAttachment 管线；逐文件预检）。 */
+async function intakeDroppedFiles(files) {
+  await pickAttachment(files);
+}
+
+/** 拖放声控（document 级监听装配一次；dragDepth 计数防子元素抖动——dsh 同款）。 */
+function armDropTargets() {
+  let depth = 0;
+  const fileTransfer = (event) => {
+    const dataTransfer = event?.dataTransfer;
+    return dataTransfer !== null &&
+      dataTransfer !== undefined &&
+      Array.from(dataTransfer.types ?? []).includes('Files')
+      ? dataTransfer
+      : null;
+  };
+  const reset = () => {
+    depth = 0;
+    el.dropOverlay.hidden = true;
+  };
+  const setOverlay = (active) => {
+    if (active && canAcceptDropFiles()) {
+      el.dropOverlayText.textContent = DROP_OVERLAY_TEXT;
+      el.dropOverlay.hidden = false;
+    } else if (active) {
+      el.dropOverlayText.textContent = '运行中或未解锁：暂不可拖入图片';
+      el.dropOverlay.hidden = false;
+    } else {
+      el.dropOverlay.hidden = true;
+    }
+  };
+  document.addEventListener('dragenter', (event) => {
+    if (fileTransfer(event) === null) return;
+    event.preventDefault();
+    depth += 1;
+    setOverlay(true);
+  });
+  document.addEventListener('dragover', (event) => {
+    const dataTransfer = fileTransfer(event);
+    if (dataTransfer === null) return;
+    event.preventDefault();
+    dataTransfer.dropEffect = canAcceptDropFiles() ? 'copy' : 'none';
+  });
+  document.addEventListener('dragleave', (event) => {
+    if (fileTransfer(event) === null) return;
+    depth = Math.max(0, depth - 1);
+    if (depth === 0) setOverlay(false);
+  });
+  document.addEventListener('drop', (event) => {
+    const dataTransfer = fileTransfer(event);
+    if (dataTransfer === null) return;
+    event.preventDefault();
+    reset();
+    if (canAcceptDropFiles()) void intakeDroppedFiles(dataTransfer.files);
+  });
+  window.addEventListener('dragend', reset);
+  document.addEventListener('dragend', reset);
+}
+
+/**
+ * 粘贴图像（dsh PASTE_COMMAND 同款）：input 的 paste 事件里剪贴板 file 项 →
+ * intake（pickAttachment 同管线）；文本粘贴走默认（不拦截）——图片+文本并存。
+ */
+function onInputPaste(event) {
+  const clipboardData = event?.clipboardData;
+  if (clipboardData === null || clipboardData === undefined) return; // 文本粘贴：默认
+  const files = Array.from(clipboardData.items ?? [])
+    .filter((item) => item.kind === 'file')
+    .map((item) => item.getAsFile())
+    .filter((file) => file !== null);
+  if (files.length === 0) return; // 文本粘贴：默认
+  const text = clipboardData.getData('text/plain');
+  if (text === '') {
+    event.preventDefault(); // 仅图片粘贴：吞掉默认（不产生粘贴文本）
+  }
+  void intakeDroppedFiles(files);
+}
+
 // ============================================================== 发送 / 流
 
 function inputUnlocked() {
@@ -2790,7 +3411,14 @@ function inputUnlocked() {
 
 async function send() {
   const text = el.input.value.trim();
-  if (!text) return;
+  const images = ui.attachments;
+  if (!text && images.length === 0) return;
+  // 严格先选工作区（A 档）门禁：锁态拒绝（输入框已 disabled，此为其兜底——
+  // 防任何绕过（程序化调用/未来入口）悄悄进入会话）
+  if (!workspacePicked()) {
+    toast('请先选择工作区（「选择工作区…」或「使用默认工作区」）', 'warn');
+    return;
+  }
   if (!inputUnlocked()) {
     openSettings();
     toast('请先在设置里配置 API Key', 'warn');
@@ -2803,15 +3431,31 @@ async function send() {
   }
   el.input.value = '';
   autogrow();
+  await postChat(text, images);
+}
+
+/**
+ * 聊天发送公共路径（门禁后）：POST /api/chat {sessionId, text, images?} → 会话指针
+ * + 用户回声 + 单流接入。send()（输入框）与 sendContinue()（/continue、run-strip
+ * 「继续」钮）共用；图片（ADR-0015）随消息并入（乐观气泡与回放帧同形状）。
+ * 发送成功清空附件；失败保留（供重试——不丢用户已选内容）。
+ */
+async function postChat(text, images) {
+  const payloadImages = Array.isArray(images) ? images.map((i) => normalizeAttachment(i)) : [];
+  const carryImages = payloadImages.some((i) => i !== null) ? payloadImages.filter(Boolean) : [];
   try {
     const res = await fetchJson('/api/chat', {
       method: 'POST',
-      body: { sessionId: ui.sessionId, text },
+      body: {
+        sessionId: ui.sessionId,
+        text,
+        ...(carryImages.length > 0 ? { images: carryImages } : {}),
+      },
     });
     ui.sessionId = res?.sessionId ?? ui.sessionId;
     store.setSessionId(ui.sessionId);
-    if (ui.sessionId) localStorage.setItem(LS_SESSION, ui.sessionId);
-    store.addUser(text);
+    store.addUser(text, carryImages);
+    clearAttachments();
     // 单流模型：连接先于 run 事件建立（SessionBroker 全量缓冲兜底首轮 gap），
     // 此后该会话不再重开流 —— 第二条消息的帧为实时帧，不再重放重复。
     await ensureStream(ui.sessionId);
@@ -2824,6 +3468,29 @@ async function send() {
     store.endStream();
     store.addSystem(`消息发送失败：${err instanceof Error ? err.message : String(err)}`);
   }
+}
+
+/**
+ * /continue（或 run-strip「继续」钮）：向当前会话发送 CONTINUE_PROMPT —— 走正常
+ * chat 路径 POST /api/chat {sessionId, text}，引擎从历史 + interrupted 结果续跑
+ * （含工具结果中断占位如实存在）；无 sessionId → 不发送，落 info 提示（按钮侧
+ * 由 continueVisible 隐藏，命令侧此处兜底）。
+ */
+async function sendContinue() {
+  if (!ui.sessionId) {
+    store.addSystem('当前没有会话可继续：先新建或恢复一个会话再试。', 'info');
+    return;
+  }
+  if (!inputUnlocked()) {
+    openSettings();
+    toast('请先在设置里配置 API Key', 'warn');
+    return;
+  }
+  if (!store.startStream()) {
+    toast('上一条任务仍在运行，请等待或按停止', 'warn');
+    return;
+  }
+  await postChat(CONTINUE_PROMPT);
 }
 
 /**
@@ -2859,9 +3526,10 @@ async function ensureStream(sessionId) {
     if (err?.name !== 'AbortError') {
       // 语义判断（isStatus，替代 message.includes('404')）：状态码以 err.status 为权威
       if (isStatus(err, 404)) {
-        // localStorage 里的旧会话已被服务端清除：丢弃恢复指针，交给下一条消息开新会话
+        // 旧会话已被服务端清除：丢弃会话指针，交给下一条消息开新会话。
+        // 严格先选工作区：流 404 不撤销本轮选择（下一消息经 /api/chat 建新会话）
         ui.sessionId = null;
-        localStorage.removeItem(LS_SESSION);
+        ui.wsChosenRound = true;
         store.setSessionId(null);
         store.addSystem('上次会话不存在，将开启新会话', 'info');
       } else {
@@ -3009,6 +3677,9 @@ async function executeCommandLine(line) {
     case 'stop':
       if (!store.snapshot().runActive) store.addSystem('当前没有运行中的任务', 'info');
       else await stopStream();
+      break;
+    case 'continue':
+      void sendContinue();
       break;
     case 'theme': {
       const value = parsed.argList[0];
@@ -3257,29 +3928,86 @@ function openCompactPanel() {
   ]);
 }
 
-// ============================================================== 思考强度选择器（分段 pill）
+// ============================================================== 模型·思考强度 combo（dsh 右下同款）
 
-/** 分段 pill：选项由 settings.js REASONING_VALUES/LABELS 装配（单一来源防漂移）。 */
-function buildReasoningSeg() {
-  el.reasoningSeg.replaceChildren();
+/**
+ * 模型·思考强度 combo：右下「{model} · {强度} ▾」单壳选择器（dsh 右下同款 ——
+ * 取代旧「composer 上方分段 pill」，两控制项合并为一个 combo）：
+ * - 菜单两段：模型名（只读显示；点击跳设置）+ 思考强度四档单选（options 由
+ *   settings.js REASONING_VALUES/LABELS 装配 —— 单一来源防漂移）；
+ * - 强度变更即 POST（防抖 300ms 合并；失败回滚重读 + toast —— 旧 pill 同纪律）；
+ * - 模型名显示来自 settings.model（服务端权威回显；改动在设置→模型接口）。
+ */
+function buildModelMenu() {
+  el.mmModelValue.textContent = ui.settings.model || DEFAULT_SETTINGS.model;
+  el.modelMenuOpts.replaceChildren();
   for (const value of REASONING_VALUES) {
     const btn = document.createElement('button');
     btn.type = 'button';
-    btn.className = 'reasoning-opt';
+    btn.className = 'model-menu-item mm-opt';
     btn.dataset.reasoning = value;
     btn.setAttribute('role', 'radio');
-    btn.textContent = REASONING_LABELS[value];
-    btn.title = `思考强度：${REASONING_LABELS[value]}`;
-    el.reasoningSeg.appendChild(btn);
+    btn.tabIndex = -1;
+    const label = document.createElement('span');
+    label.className = 'mm-opt-label';
+    label.textContent = REASONING_LABELS[value];
+    const check = document.createElement('span');
+    check.className = 'mm-opt-check';
+    check.setAttribute('aria-hidden', 'true');
+    check.appendChild(iconSvg('check', { size: 14 }));
+    btn.append(label, check);
+    btn.addEventListener('click', () => {
+      selectReasoningFromMenu(value);
+    });
+    el.modelMenuOpts.appendChild(btn);
   }
-  syncReasoningSeg();
+  syncModelCombo();
 }
 
-function syncReasoningSeg() {
-  for (const btn of el.reasoningSeg.querySelectorAll('.reasoning-opt')) {
-    const active = btn.dataset.reasoning === ui.settings.reasoning;
-    btn.classList.toggle('active', active);
+/** combo 回显（模型名 + 强度标签；强度归一 = settings.js normalizeReasoning）。 */
+function syncModelCombo() {
+  const model = ui.settings.model || DEFAULT_SETTINGS.model;
+  const reasoning = normalizeReasoning(ui.settings.reasoning);
+  el.mcModel.textContent = model;
+  el.mcModel.title = `模型：${model}`;
+  el.mcReasoning.textContent = REASONING_LABELS[reasoning];
+  for (const btn of el.modelMenuOpts.querySelectorAll('.mm-opt')) {
+    const active = btn.dataset.reasoning === reasoning;
+    btn.classList.toggle('current', active);
     btn.setAttribute('aria-checked', String(active));
+  }
+}
+
+/** 菜单选中（强度档位）：当前档 no-op；其余本地回显 + 防抖 POST（失败回滚 toast）。 */
+function selectReasoningFromMenu(value) {
+  const normalized = normalizeReasoning(value);
+  toggleModelMenu(false);
+  if (normalized === ui.settings.reasoning) return;
+  ui.settings = { ...ui.settings, reasoning: normalized };
+  syncModelCombo();
+  scheduleReasoningSync(normalized);
+}
+
+/** 菜单开关（定位 = menu.js menuPosition；视口钳制，同 perm-menu 语义）。 */
+function toggleModelMenu(force) {
+  const open = force !== undefined ? force : !ui.modelMenuOpen;
+  if (open) {
+    const rect = el.modelCombo.getBoundingClientRect();
+    el.modelMenu.hidden = false; // 先解除隐藏：offsetWidth/Height 实测
+    const size = { width: el.modelMenu.offsetWidth, height: el.modelMenu.offsetHeight };
+    const pos = menuPosition(
+      { left: rect.left, top: rect.top, width: rect.width, height: rect.height },
+      size,
+      { width: window.innerWidth, height: window.innerHeight },
+    );
+    el.modelMenu.style.left = `${pos.left}px`;
+    el.modelMenu.style.top = `${pos.top}px`;
+    ui.modelMenuOpen = true;
+    el.modelCombo.setAttribute('aria-expanded', 'true');
+  } else {
+    el.modelMenu.hidden = true;
+    ui.modelMenuOpen = false;
+    el.modelCombo.setAttribute('aria-expanded', 'false');
   }
 }
 
@@ -3306,7 +4034,7 @@ async function flushReasoningSync() {
     await revertReasoning();
     toast('思考强度保存失败，已还原', 'warn');
   }
-  syncReasoningSeg();
+  syncModelCombo();
 }
 
 /** POST 失败回滚：GET 服务端态还原（GET 也失败 → 保持现显示，不猜测）。 */
@@ -3374,7 +4102,7 @@ async function openSettings() {
       el.settingsStatus.className = 'drawer-status err';
     }
   }
-  syncReasoningSeg(); // 服务端档位权威：回显（含窗口覆盖 —— meter 随之取值）
+  syncModelCombo(); // 服务端档位权威：回显（模型名 + 强度；含窗口覆盖 —— meter 随之取值）
   syncPermChip(); // 权限档位（含 permissionConfirmedAt 记录 —— 风险门判定依据）
   syncMethodFirstToggle(); // R2-S1：方法论先行开关（GET /api/settings 权威回显）
   syncReviewModeToggle(); // R2-S2：收尾评审开关（GET /api/settings 权威回显）
@@ -3389,15 +4117,44 @@ async function openSettings() {
   el.setBaseUrl.focus(); // 键盘可达：打开即聚焦第一表单
 }
 
+/**
+ * 上限输入解析（A 档）：空串 → null（未设置——不发送）；纯数字串（仅 [0-9]+）且为
+ * 正整数 → number；其余抛错（保存中止 + 文案）。与 service 端「严格正整数」同口径。
+ */
+function tokenLimitInputValue(input) {
+  const raw = String(input?.value ?? '').trim();
+  if (raw === '') return null;
+  if (!/^[0-9]+$/.test(raw)) {
+    throw new Error('输入/输出上限必须是正整数（留空 = 厂商默认）');
+  }
+  const value = Number(raw);
+  if (!Number.isSafeInteger(value) || value < 1) {
+    throw new Error('输入/输出上限必须是正整数（留空 = 厂商默认）');
+  }
+  return value;
+}
+
 async function saveSettingsForm() {
   const baseUrl = el.setBaseUrl.value.trim();
   const model = el.setModel.value.trim();
   const apiKey = el.setKey.value; // 明文仅存在于此刻读值
   el.setKey.value = ''; // 立即清空输入框 —— 明文不滞留
+  // A 档：输入/输出上限（留空 = 不发送——「留空=厂商默认」；
+  // 非空必须是正整数才保存：双端校验，客户端先拦、服务端 400 兜底）。
+  let maxInputTokens;
+  let maxOutputTokens;
+  try {
+    maxInputTokens = tokenLimitInputValue(el.setMaxInputTokens);
+    maxOutputTokens = tokenLimitInputValue(el.setMaxOutputTokens);
+  } catch (err) {
+    el.settingsStatus.textContent = `保存失败：${err instanceof Error ? err.message : String(err)}`;
+    el.settingsStatus.className = 'drawer-status err';
+    return;
+  }
   el.settingsStatus.textContent = '保存中…';
   el.settingsStatus.className = 'drawer-status';
   try {
-    const saved = await saveSettings({ baseUrl, model, apiKey });
+    const saved = await saveSettings({ baseUrl, model, apiKey, maxInputTokens, maxOutputTokens });
     ui.settings = { ...ui.settings, ...saved };
     el.settingsStatus.textContent = '✓ 已保存';
     el.settingsStatus.className = 'drawer-status';
@@ -3412,6 +4169,11 @@ async function saveSettingsForm() {
 function fillSettingsForm() {
   el.setBaseUrl.value = ui.settings.baseUrl || DEFAULT_SETTINGS.baseUrl;
   el.setModel.value = ui.settings.model || DEFAULT_SETTINGS.model;
+  // A 档：输入/输出上限回显（null = 未设置 → 输入框留空——「留空=厂商默认」占位）
+  el.setMaxInputTokens.value =
+    ui.settings.maxInputTokens !== null ? String(ui.settings.maxInputTokens) : '';
+  el.setMaxOutputTokens.value =
+    ui.settings.maxOutputTokens !== null ? String(ui.settings.maxOutputTokens) : '';
   // 工作区目录：服务端未提供时为占位（显示字段，不可改）
   el.setWorkspace.textContent =
     ui.settings.workspaceDir || '（服务端未提供 · 工作目录由 DevMate 启动位置决定）';
@@ -3426,11 +4188,15 @@ function fillSettingsForm() {
 
 // ============================================================== 设置页扩展区（Subagent / Skills / MCP）
 
-/** Subagent 偏好填写 + 并行数随开关联动（disabled 只降视觉，不改提交/保存值）。 */
+/** Subagent 偏好填写 + 并行数随开关联动（disabled 只降视觉，不改提交/保存值）；
+ *  0 档（无上限）挂显「无上限（按需派遣）＋ 风险说明」标签（parallelLabelText 单一来源）。 */
 function fillSubagentPref() {
   el.setSubagentEnabled.checked = ui.subagent.enabled;
   el.setSubagentParallel.value = String(ui.subagent.parallel);
   el.setSubagentParallel.disabled = !ui.subagent.enabled;
+  const label = parallelLabelText(ui.subagent.parallel);
+  el.setSubagentParallelLabel.hidden = label === '';
+  el.setSubagentParallelLabel.textContent = label;
 }
 
 /** 「未同步（仅本地）」旁注：仅降级态（source='local'）挂显 —— 与服务端源回显形成明示。 */
@@ -3463,8 +4229,8 @@ function applySubagentField(field) {
     if (ui.subagentSource === 'server') patch = { enabled };
     else ui.subagent = saveSubagentPref(localStorage, ui.subagent);
   } else if (field === 'parallel') {
-    // 1-4 步进，禁 0：越界/0/负 → 回落当前合法并行数（normalizeParallel 收口；纯函数
-    // 缺省兜底 2 —— 提交值已归一，服务端再 400 走「回滚重读 + 提示」）
+    // 0-8 步进（0 = 无上限）：非整/负/>8 → normalizeParallel 归一（0 合法保留；
+    // 非有限值回落当前值兜底；提交值已归一，服务端再 400 走「回滚重读 + 提示」）
     const parallel = normalizeParallel(el.setSubagentParallel.value, ui.subagent.parallel);
     ui.subagent = { ...ui.subagent, parallel };
     if (ui.subagentSource === 'server') patch = { parallel };
@@ -3759,12 +4525,45 @@ function autogrow() {
   el.input.style.height = Math.min(el.input.scrollHeight, 160) + 'px';
 }
 
+/**
+ * 严格先选工作区（A 档）解锁条件：有会话指针（sessionId 非空）或本轮已明确选择
+ * 工作区（wsChosenRound）。锁态 = 两者皆无 → hero 常显 + composer 区域禁用。
+ */
+function workspacePicked() {
+  return ui.sessionId !== null || ui.wsChosenRound;
+}
+
+/** 输入占位双态（JS 单一来源：锁态「先选择工作区…」，解锁还原缺省文案 —— 与
+ *  index.html 的 placeholder 属性同值，首帧先由属性供字，此后以 JS 为准）。 */
+const COMPOSER_PLACEHOLDER_DEFAULT = '描述你想构建什么';
+const COMPOSER_PLACEHOLDER_LOCKED = '先选择工作区…';
+
 function renderComposer() {
+  // 严格先选工作区（A 档）：无会话且本轮未选工作区 → 输入区整区禁用（锁态）——
+  // textarea disabled + 发送钮禁用 + aria-disabled + .composer-locked 样式类
+  const locked = !workspacePicked();
   // 运行中不禁用发送钮：点击由 send() 门禁 toast「仍在运行」（不再静默吞）。
-  const canSend = el.input.value.trim().length > 0 && inputUnlocked();
+  // 附件存在时无需文本（纯图消息形态）：canSend = 文本非空 ∨ 已附图片
+  const canSend =
+    (el.input.value.trim().length > 0 || ui.attachments.length > 0) && inputUnlocked() && !locked;
   el.send.disabled = !canSend;
-  // 访问模式 chip：会话不可用（未配置密钥）时锁定（dsh PermissionSelect locked 语义）
-  el.permChip.disabled = !inputUnlocked();
+  // 附件条可见性 + 附件钮可用性（锁态禁选；满额禁选但 移除 恒可用）
+  renderAttachmentStrip();
+  el.btnAttach.disabled = locked || attachmentsFull(ui.attachments.length);
+  // 满额 tooltip 提示（不 popover，改在 title 呈明）
+  el.btnAttach.title = attachmentsFull(ui.attachments.length)
+    ? `最多 ${ATTACH_LIMITS.maxCount} 张图片`
+    : `添加图片（≤${Math.round(ATTACH_LIMITS.maxImageBytes / 1024 / 1024)}MB，最多 ${ATTACH_LIMITS.maxCount} 张）`;
+  // 访问模式 chip：会话不可用（未配置密钥 / 未选工作区）时锁定（dsh PermissionSelect locked 语义）
+  el.permChip.disabled = !inputUnlocked() || locked;
+  el.input.disabled = !inputUnlocked() || locked;
+  el.input.placeholder = locked ? COMPOSER_PLACEHOLDER_LOCKED : COMPOSER_PLACEHOLDER_DEFAULT;
+  el.composer.classList.toggle('composer-locked', locked);
+  el.composer.setAttribute('aria-disabled', String(locked));
+  // 配置指引轻量条款（替代三步卡；dsh InputBar .notice）：只在空态且密钥未配置时出现
+  // —— 已配置/已发消息即藏（不冒充「还没开始」）。
+  const emptyState = (ui.lastSnap?.items.length ?? 0) === 0;
+  el.composerHint.hidden = !(emptyState && ui.settingsReady && !ui.settings.keyConfigured);
 }
 
 // ============================================================== 全局渲染收口
@@ -3793,6 +4592,25 @@ function render(snap) {
 function wireEvents() {
   el.send.addEventListener('click', send);
   el.stop.addEventListener('click', stopStream);
+  // 附件（ADR-0015）：钮 → 文件选择；change → 预检 + 读图 + 预览（value 清空——
+  // 同一文件重复选择也触发 change）；预览条移除钮经事件委托（renderAttachmentStrip 内装）。
+  el.btnAttach.addEventListener('click', () => {
+    if (el.btnAttach.disabled) return;
+    el.attachInput.click();
+  });
+  el.attachInput.addEventListener('change', () => {
+    void pickAttachment(el.attachInput.files);
+    el.attachInput.value = '';
+  });
+  // dsh 对照：粘贴图像（clipboard 文件项 → intake；文本粘贴走默认）与 document 级拖放
+  // （DropOverlay 遮罩；drop → 同一预检管线）—— 组装一次，常驻。
+  el.input.addEventListener('paste', onInputPaste);
+  armDropTargets();
+  // lightbox 关闭钮（遮罩点击/Esc 由键控与 click 兜底）
+  el.imageLightboxClose.addEventListener('click', closeLightbox);
+  el.imageLightbox.addEventListener('click', (event) => {
+    if (event.target === el.imageLightbox) closeLightbox();
+  });
   // 内嵌审批卡双键（无附注框 —— dsh ApprovalPanel：拒绝(outline)/允许(primary)）
   el.btnBannerApprove.addEventListener('click', () => {
     void decideBannerApproval(true);
@@ -3812,6 +4630,11 @@ function wireEvents() {
     // 与点「拒绝」键完全同语义 —— 内嵌卡非 modal，无焦点陷阱，仅在页内停靠）；
     // 设置抽屉 / 删除确认 / 风险确认门同样支持 Esc 关闭。
     if (e.key === 'Escape') {
+      // ADR-0015 图片 lightbox：最上层（先于审批/菜单等模态收口）
+      if (lightboxOpen()) {
+        closeLightbox();
+        return;
+      }
       if (ui.riskConfirmOpen) {
         closeRiskConfirm();
         return;
@@ -3853,11 +4676,16 @@ function wireEvents() {
         togglePermMenu(false);
         return;
       }
+      if (ui.modelMenuOpen || !el.modelMenu.hidden) {
+        toggleModelMenu(false);
+        return;
+      }
       hideCommandMenu();
     }
   });
   el.btnSettings.addEventListener('click', openSettings);
-  document.getElementById('btn-empty-open-settings').addEventListener('click', openSettings);
+  // 配置指引（composer 上方一行小字）点击 = 直达设置（三步卡「去设置」语义迁入）
+  el.composerHint.addEventListener('click', openSettings);
   document.getElementById('btn-settings-close').addEventListener('click', closeDrawer);
   // dsh 设置卡 Cancel/Apply 对：取消 = 关闭设置页（配置改动不落盘）
   el.btnSettingsCancel?.addEventListener('click', closeDrawer);
@@ -3909,7 +4737,9 @@ function wireEvents() {
     toggleWsNewMenu();
   });
   // 工作区组列表（#ws-groups 单点委托）：会话行点击 = 恢复；组头 = 折叠切换；
-  // 组内 ＋ = 新建会话于该组；组头 kebab = 行菜单（移除工作区）
+  // 组内 ＋ = 新建会话于该组；组头 kebab = 行菜单（移除工作区）；
+  // 会话行 kebab = 行菜单（删除会话 —— dsh SessionNodeItem row menu；此前只认
+  // [data-ws-kebab]，会话行 kebab 落回「行=恢复」→ 菜单永不打开）
   el.wsGroups.addEventListener('click', (event) => {
     const kebab = event.target.closest('[data-ws-kebab]');
     if (kebab) {
@@ -3922,6 +4752,21 @@ function wireEvents() {
           root,
           disabled: root === ui.wsDefaultRoot,
         });
+      } else {
+        closeRowMenu();
+      }
+      return;
+    }
+    const rowKebab = event.target.closest('[data-kebab]');
+    if (rowKebab) {
+      event.stopPropagation();
+      // 会话数据从行取（buildSessionItem 的 li.dataset.sessionId 在列）；
+      // 与组头 kebab 同款 toggle：菜单 hidden 时开，开着则关（换行点击见 wireRowMenu）。
+      const row = rowKebab.closest('li.sessionRow');
+      const sessionId = row?.dataset.sessionId ?? '';
+      if (!sessionId) return;
+      if (el.rowMenu.hidden) {
+        openRowMenu(rowKebab, { type: 'session', sessionId });
       } else {
         closeRowMenu();
       }
@@ -3943,6 +4788,7 @@ function wireEvents() {
     if (row?.dataset.sessionId) void restoreSession(row.dataset.sessionId);
   });
   wireRowMenu();
+  wireToastCopy();
   // ＋新建 菜单外点关闭（菜单自身点击由 item handler 负责 —— 不得抢先关）
   document.addEventListener('click', (event) => {
     if (!ui.wsNewMenuOpen) return;
@@ -3950,13 +4796,34 @@ function wireEvents() {
     if (event.target instanceof Element && event.target.closest('#btn-new-session')) return;
     closeWsNewMenu();
   });
-  // 添加工作区（区块头 ＋ / 空态按钮）：直达目录弹窗
+  // 添加工作区（区块头 ＋）：直达目录弹窗
   el.btnAddWorkspace.addEventListener('click', () => {
     void openWsPicker();
   });
-  el.btnEmptyAddWorkspace.addEventListener('click', () => {
-    void openWsPicker();
+  // hero「选择工作区…」：直开目录弹窗；选定后自动建该工作区新会话并进入
+  el.heroPickWorkspace?.addEventListener('click', () => {
+    openHeroWorkspacePicker();
   });
+  // hero 次钮「使用默认工作区」：明确确认默认根（启动目录）→ 建默认根会话解锁
+  // （POST /api/sessions 不带 workspaceRoot = 服务端默认根）
+  el.heroDefaultWorkspace?.addEventListener('click', () => {
+    void newSession(null);
+  });
+  // 区头搜索/排序（dsh WorkspaceBrowser 区头三图标；过滤=纯客户端 filterSessionList）
+  el.btnWsSearch.addEventListener('click', () => {
+    toggleWsSearch();
+  });
+  el.wsSearchInput.addEventListener('input', () => {
+    ui.wsSearchQuery = el.wsSearchInput.value;
+    if (ui.sessionsLoaded) renderSessionList(ui.sessionItems);
+  });
+  el.wsSearchInput.addEventListener('keydown', (event) => {
+    if (event.key === 'Escape') {
+      event.preventDefault();
+      toggleWsSearch(false);
+    }
+  });
+  el.btnWsSort.addEventListener('click', cycleWsSort);
   // 目录选择弹窗（browse 形态）：面包屑/目录行/手动输入/取消/选择 全部这里挂
   el.btnWsPickerClose.addEventListener('click', closeWsPicker);
   el.btnWsPickerCancel.addEventListener('click', closeWsPicker);
@@ -4009,15 +4876,13 @@ function wireEvents() {
   });
   // 技能安装输入：非空即解锁安装钮（提交前仍有一次空串拦截）
   el.skillInstallSource.addEventListener('input', syncSkillInstallButton);
-  // 思考强度分段 pill：点击即选 + 防抖提交（失败回滚 toast）
-  el.reasoningSeg.addEventListener('click', (event) => {
-    const btn = event.target.closest('.reasoning-opt');
-    if (!btn) return;
-    const value = btn.dataset.reasoning ?? '';
-    if (value === ui.settings.reasoning || !REASONING_VALUES.includes(value)) return;
-    ui.settings = { ...ui.settings, reasoning: value };
-    syncReasoningSeg();
-    scheduleReasoningSync(value);
+  // 模型·思考强度 combo：点击开菜单；模型行（只读）点击 = 直达设置（跳「模型接口」）
+  el.modelCombo.addEventListener('click', () => {
+    toggleModelMenu();
+  });
+  el.mmModel.addEventListener('click', () => {
+    toggleModelMenu(false);
+    openSettings();
   });
   // 命令面板关闭（X 外点）
   el.cmdPanelClose.addEventListener('click', closeCmdPanel);
@@ -4034,6 +4899,11 @@ function wireEvents() {
       if (event.target instanceof Node && el.permMenu.contains(event.target)) return;
       if (event.target instanceof Element && event.target.closest('#perm-chip')) return;
       togglePermMenu(false);
+    }
+    if (ui.modelMenuOpen || !el.modelMenu.hidden) {
+      if (event.target instanceof Node && el.modelMenu.contains(event.target)) return;
+      if (event.target instanceof Element && event.target.closest('#model-combo')) return;
+      toggleModelMenu(false);
     }
   });
   // 输入离开即收起命令下拉（贴外层关闭不覆盖输入区的点击）
@@ -4078,6 +4948,7 @@ async function boot() {
   sidebarEverWide = !effectiveCollapsed();
   syncSidebarUi();
   el.buildVersion.textContent = BUILD_VERSION;
+  syncWsSortButton(); // 区头排序按钮态（缺省 recent = 按时间；静态标记已同值）
 
   // 设置与密钥状态（失败 → 按「静态预览」降级：输入不锁，界面可演示）
   try {
@@ -4087,9 +4958,13 @@ async function boot() {
   } catch {
     ui.settingsReady = false;
   }
-  // 思考强度分段 pill（选项 = settings.js 常量；回显当前档位）
-  buildReasoningSeg();
-  syncReasoningSeg();
+  // 附件钮图标（ADR-0015：imagePlus 装配；未知名 → null 只留空钮壳）
+  const attachIcon = iconSvg('imagePlus', { size: 16 });
+  if (attachIcon !== null) {
+    el.btnAttach.replaceChildren(attachIcon);
+  }
+  // 模型·思考强度 combo（选项 = settings.js 常量；回显当前档位）
+  buildModelMenu();
   // 访问模式 chip（选项 = permissions.js 常量；回显当前档位 + 盾形 glyph）
   buildPermMenu();
   syncPermChip();
@@ -4100,14 +4975,13 @@ async function boot() {
   // 窗口覆盖就绪：上下文环重新取值（首帧可能在 settings 未到前渲染过）
   if (ui.lastSnap) renderMeter();
 
-  // 会话恢复：localStorage 里的 sessionId 直接续用（无需额外端点）；
-  // 单流模型：恢复即接入该会话的长活流（全量回放历史；run 若仍在进行则终态随流到达）
-  ui.sessionId = localStorage.getItem(LS_SESSION) || null;
-  store.setSessionId(ui.sessionId);
-  if (ui.sessionId) {
-    store.addSystem(`已恢复上次会话 #${shortId(ui.sessionId)}，发送下一条消息继续。`, 'info');
-    void ensureStream(ui.sessionId);
-  }
+  // 启动不自动恢复上次会话（2026-08-30 决策）：首屏 = 空态 hero「让每个想法动起来」；
+  // 历史恢复仅经侧栏点击行（restoreSession，原样）。会话指针不再持久化于 localStorage。
+  // 严格先选工作区（A 档）：启动恒锁态（sessionId 空 + 本轮未选工作区；hero 常显、
+  // composer 禁用）——解锁仅经 工作区选定建会话 / 侧栏会话行恢复（见 A 档契约）。
+  ui.sessionId = null;
+  ui.wsChosenRound = false;
+  store.setSessionId(null);
 
   // S14：per-workspace 折叠映射（损坏/缺失 → 全展开；读写容错见 workspaces.js）
   ui.wsCollapsed = loadWorkspaceCollapse(localStorage);
@@ -4118,11 +4992,12 @@ async function boot() {
   void refreshStats();
 
   if (ui.settingsReady && !ui.settings.keyConfigured) {
-    el.step1.classList.add('hot');
-    toast('欢迎使用 DevMate：第一步，先配置你的 API Key');
+    toast('欢迎使用 DevMate：填写 API 密钥后即可开始（设置→模型接口）');
   }
 
-  el.input.disabled = !inputUnlocked();
+  // 锁态收口：启动即按「严格先选工作区 + 密钥」双闸渲染 composer（disabled/
+  // placeholder/aria/样式类）——不再只按密钥单闸写 input.disabled
+  renderComposer();
   autogrow();
 }
 

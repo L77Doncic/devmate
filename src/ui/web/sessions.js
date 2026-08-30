@@ -170,9 +170,11 @@ export function toProtocolEvent(e) {
         event: 'session-user',
         // R2-S2：评审哨兵存储形态 meta.system=true → 协议帧 data.system=true
         // （messages.js 渲染为系统样式消息；与在线流/replay 帧同规）
+        // ADR-0015：images 同形透传（存储 payload → 协议帧——历史回放渲染图像卡）
         data: {
           text: String(p.content ?? ''),
           ...(e.meta?.system === true ? { system: true } : {}),
+          ...(Array.isArray(p.images) && p.images.length > 0 ? { images: p.images } : {}),
         },
       };
     case 'assistant':

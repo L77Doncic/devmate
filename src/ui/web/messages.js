@@ -44,6 +44,11 @@
  * - tool-start      ：生成/复位工具卡（执行中）。可在无 delta 时先到（独立成卡）。
  * - tool-result     ：工具卡落定 成功/失败；preview 供列表 + content 全量供展开详情
  *                     （服务端 64KB 缓冲上限，超出已由服务端截断）。
+ * - 审查标记（B）   ：工具卡 review 标志 = spawn_subagent 且 arguments.prompt 含
+ *                     审查|review（isReviewSubagent 纯函数；tool-start / tool-result /
+ *                     assistant-done(toolCalls) / approval-request 皆在名称参数已知时
+ *                     即标即走，与事件时序无关）—— 快照工具卡携带 review:boolean，
+ *                     渲染层据此输出独立审查块（.review-block，不混入工具卡）。
  * - approval-request：工具卡挂起（待审批）并进入审批队列（内嵌审批卡一次呈现一个，
  *                     快照按队列保序，渲染层只取第一个等待项）。**协议演进（本轮）：
  *                     仅 ask 类需问询时到来；权限矩阵 deny 直拒不再产生本帧** ——
@@ -71,7 +76,7 @@
 /** run-status 终态清单（S12 RunStatus 八值；terminal 后 runActive=false），
  *  由 format.js 的 RUN_STATUS_SEMANTICS 导出（终态/标签/tone 三处镜像已合并为这一份表；
  *  dispatch 用它判定「run 落幕」，防漂移测试见 format.test.ts）。 */
-import { TERMINAL_STATUSES, methodologyLine } from './format.js';
+import { TERMINAL_STATUSES, methodologyLine, isReviewSubagent } from './format.js';
 
 /** 长会话 DOM 轻量化（任务书 C）：保留消息数上限，超出裁剪最旧为摘要行。 */
 export const DEFAULT_MAX_ITEMS = 200;
@@ -297,9 +302,18 @@ export function createMessageStore({ maxItems = DEFAULT_MAX_ITEMS } = {}) {
     const exist = findToolCard(id);
     if (exist) return exist;
     const holder = activeAssistant();
-    const card = { id, name: '', arguments: '', state: 'running', result: null };
+    const card = { id, name: '', arguments: '', state: 'running', result: null, review: false };
     holder.tools.push(card);
     return card;
+  }
+
+  /** 审查标记（B：spawn_subagent 且 arguments.prompt 含 审查|review → 独立审查块）。
+   *  判定只依赖调用形状（name+arguments），与事件时序无关 —— 工具卡无论由
+   *  tool-start / tool-result / assistant-done(toolCalls) / approval-request 任何路径
+   *  建立或更新，都在名称/参数已知时即标即走（isReviewSubagent 纯函数，见 format.js）。 */
+  function maybeReview(card) {
+    if (card.review) return;
+    if (isReviewSubagent({ name: card.name, arguments: card.arguments })) card.review = true;
   }
 
   // ---------------------------------------------------------------------
@@ -350,7 +364,14 @@ export function createMessageStore({ maxItems = DEFAULT_MAX_ITEMS } = {}) {
         // ② SSE 帧先落地（长活流直投快于 POST 响应）：本帧即该消息的唯一渲染 —
         //    记 awaitedEcho 供接下来的 addUser 消费（追加被吞，不产生第二行）。
         state.awaitedEcho = { text };
-        state.items.push({ id: nextId(), kind: 'user', text, at: Date.now() });
+        state.items.push({
+          id: nextId(),
+          kind: 'user',
+          text,
+          at: Date.now(),
+          // 多模态（ADR-0015）：图像卡数据源（与协议帧 images 同形；缺省无键）
+          ...(data?.images?.length > 0 ? { images: data.images } : {}),
+        });
         if (!state.title) state.title = text.slice(0, 24);
         break;
       }
@@ -380,13 +401,16 @@ export function createMessageStore({ maxItems = DEFAULT_MAX_ITEMS } = {}) {
         }
         for (const tc of data?.toolCalls ?? []) {
           if (!a.tools.some((t) => t.id === tc.id)) {
-            a.tools.push({
+            const card = {
               id: tc.id,
               name: String(tc.name ?? ''),
               arguments: String(tc.arguments ?? ''),
               state: 'done-waiting-result', // 服务端告知但未回 result（常见顺序），静待
               result: null,
-            });
+              review: false,
+            };
+            maybeReview(card);
+            a.tools.push(card);
           }
         }
         state.streaming = false;
@@ -415,11 +439,13 @@ export function createMessageStore({ maxItems = DEFAULT_MAX_ITEMS } = {}) {
         if (data?.arguments !== undefined) card.arguments = String(data.arguments);
         card.state = 'running';
         card.result = null;
+        maybeReview(card);
         break;
       }
       case 'tool-result': {
         const card = toolCard(String(data?.id));
         if (data?.name !== undefined) card.name = String(data.name);
+        if (data?.arguments !== undefined) card.arguments = String(data.arguments);
         card.state = data?.ok === false ? 'failed' : 'success';
         card.result = {
           ok: data?.ok !== false,
@@ -428,6 +454,7 @@ export function createMessageStore({ maxItems = DEFAULT_MAX_ITEMS } = {}) {
           content: data?.content != null ? String(data.content) : null,
           error: data?.error != null ? String(data.error) : null,
         };
+        maybeReview(card);
         break;
       }
       case 'approval-request': {
@@ -435,6 +462,7 @@ export function createMessageStore({ maxItems = DEFAULT_MAX_ITEMS } = {}) {
         const card = toolCard(toolCallId);
         card.name = String(data?.name ?? card.name);
         if (data?.arguments !== undefined) card.arguments = String(data.arguments);
+        maybeReview(card);
         card.state = 'pending';
         // 同一工具只挂一次等待
         if (!state.approvals.some((ap) => ap.toolCallId === toolCallId)) {
@@ -558,7 +586,7 @@ export function createMessageStore({ maxItems = DEFAULT_MAX_ITEMS } = {}) {
   // ---------------------------------------------------------------------
   // 主动作（UI 层调用）
   // ---------------------------------------------------------------------
-  function addUser(text) {
+  function addUser(text, images) {
     const t = String(text);
     // 竞态收口（CS-001）：echo 帧（session-user）先落地（长活流直投快于 /api/chat 响应
     // 返回）而 send() 的乐观渲染尚未执行时，该消息的唯一渲染已由回声完成 —— 消费标记，
@@ -568,7 +596,15 @@ export function createMessageStore({ maxItems = DEFAULT_MAX_ITEMS } = {}) {
       state.awaitedEcho = null;
       return;
     }
-    const item = { id: nextId(), kind: 'user', text: t, at: Date.now(), local: true };
+    const item = {
+      id: nextId(),
+      kind: 'user',
+      text: t,
+      at: Date.now(),
+      local: true,
+      // 多模态（ADR-0015）：乐观气泡同形状携带（回声合并保留本地数据——不入空）
+      ...(Array.isArray(images) && images.length > 0 ? { images } : {}),
+    };
     state.items.push(item);
     state.localUserId = item.id;
     state.awaitedEcho = null;
@@ -725,10 +761,20 @@ export function createMessageStore({ maxItems = DEFAULT_MAX_ITEMS } = {}) {
               arguments: t.arguments,
               state: t.state,
               result: t.result ? { ...t.result } : null,
+              review: t.review === true,
             })),
           };
         }
-        if (it.kind === 'user') return { id: it.id, kind: 'user', text: it.text, at: it.at };
+        if (it.kind === 'user') {
+          return {
+            id: it.id,
+            kind: 'user',
+            text: it.text,
+            at: it.at,
+            // 多模态（ADR-0015）：图像卡数据（无图不带键——旧快照形状不变）
+            ...(Array.isArray(it.images) && it.images.length > 0 ? { images: it.images } : {}),
+          };
+        }
         if (it.kind === 'sys') return { id: it.id, kind: 'sys', text: it.text, at: it.at };
         if (it.kind === 'compaction') {
           return {

@@ -2,7 +2,7 @@
  * # commands.js — 「/」命令表与解析纯逻辑（node 可直接 import；无 DOM / 无 fetch）
  *
  * 输入区首个字符 `/` 触发（防抖 150ms 出下拉在 app.js），本模块只承载可测裁决：
- * 命令表（12 条的单一来源）、行解析（parseCommandLine）、前缀匹配
+ * 命令表（13 条的单一来源）、行解析（parseCommandLine）、前缀匹配
  * （matchCommands —— 下拉过滤）、theme 参数校验（commandArgValid）。
  * 执行（面板/网络/消息流）在 app.js —— 纯逻辑与副作用分离（同 menu.js 纪律）。
  *
@@ -16,6 +16,9 @@
 
 /** /theme 的参数白名单（与 theme.js THEME_VALUES 同序同值；单一来源防漂移断言）。 */
 export const THEME_ARG_VALUES = Object.freeze(['dark', 'light', 'system']);
+
+/** /continue（及 run-strip「继续」钮）的发往会话的续跑指令文本（单一来源）。 */
+export const CONTINUE_PROMPT = '请继续刚才未完成的任务。';
 
 /** 命令表（id/name/label/desc/hint 单一来源；执行分派在 app.js 按 id 白名单匹配）。 */
 export const COMMANDS = Object.freeze([
@@ -45,6 +48,13 @@ export const COMMANDS = Object.freeze([
     name: '/stop',
     label: '停止任务',
     desc: '中断当前运行中的任务',
+    hint: '',
+  }),
+  Object.freeze({
+    id: 'continue',
+    name: '/continue',
+    label: '继续任务',
+    desc: '向当前会话发送「请继续刚才未完成的任务。」（走正常聊天路径续跑）',
     hint: '',
   }),
   Object.freeze({

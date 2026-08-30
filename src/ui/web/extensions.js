@@ -22,8 +22,10 @@
  * - GET  /api/workflow        → { subagentsEnabled, maxParallel }（成功：回显服务端值）
  * - POST /api/workflow        → 混合字段部分提交 { subagentsEnabled? } | { maxParallel? }
  *                               （200 → 服务端全量回体；非法值/越界 → 400）
- * 失败/缺端点 → 降级 localStorage 'devmate.ui.subagents' = { enabled, parallel: 1|2|3|4 }，
- * 默认 { enabled: true, parallel: 2 }（任务书：开关默认开、并行数默认 2、1-4 禁 0），
+ * 失败/缺端点 → 降级 localStorage 'devmate.ui.subagents' = { enabled, parallel: 0|1|…|8 }，
+ * 默认 { enabled: true, parallel: 2 }（subagent 无上限语义：0 = 无上限（按需派遣）——
+ * 并行步进 0-8；负 → 0、>8 → 8、非整 → floor、非数 → 兜底 2，与 shared/workflow 的
+ * clampMaxParallel 同口径；浏览器不 import TS 模块——镜像纪律见 README-UI.md），
  * 控件旁注「未同步（仅本地）」（copy 常量单一来源）。
  *
  * 纯函数边界：无 DOM；fetchImpl 与 storageLike 注入（与 api.js/theme.js 同接缝，node 可测）。
@@ -35,8 +37,15 @@ export const SUBAGENT_LS_KEY = 'devmate.ui.subagents';
 /** 工作流端点（服务端已实现：GET 全量 / POST 混合字段部分提交，见 server/index.ts）。 */
 export const WORKFLOW_API_URL = '/api/workflow';
 export const SUBAGENT_DEFAULTS = Object.freeze({ enabled: true, parallel: 2 });
-export const SUBAGENT_PARALLEL_MIN = 1;
-export const SUBAGENT_PARALLEL_MAX = 4;
+/** 并行数档位下界：0 = 无上限（按需派遣）——0 是合法档位，不再是「禁 0」。 */
+export const SUBAGENT_PARALLEL_MIN = 0;
+/** 并行数档位上界（与服务端 POST /api/workflow 校验 0-8 口径一致）。 */
+export const SUBAGENT_PARALLEL_MAX = 8;
+/** 0 档（无上限）的显示标签（设置-常规 subagent 卡；与提示词层「无上限」文案同源不同面）。 */
+export const SUBAGENT_PARALLEL_UNLIMITED_LABEL = '无上限（按需派遣）';
+/** 0 档风险说明小字（resource/成本随并行子任务数上升——预算内使用建议）。 */
+export const SUBAGENT_PARALLEL_RISK_NOTE =
+  '0 = 任意并发：资源与成本随任务复杂度上升，建议在预算内使用';
 
 // ---- 用户可见文案（单一来源；纪律：零端点路径，防漂移断言见 test/ui-web） ----
 
@@ -55,20 +64,32 @@ export const MCP_BADGE_ENABLED = '已登记';
 export const MCP_BADGE_DISABLED = '已停用';
 
 /**
- * 并行数归一：round 到整数后 clamp 1..4；非有限值/越界 0 一律回落 fallback（默认 2）。
+ * 并行数归一：0-8（0 = 无上限合法档）。与 shared/workflow 的 clampMaxParallel 同口径：
+ * 非整 → floor；负 → 0（无上限）；>8 → 8；非有限（NaN/±Infinity）→ 回落 fallback（默认 2）。
  * @param {unknown} value 输入值（number|string|undefined 均可归一）
- * @param {number} [fallback] 兜底并行数，默认 2
- * @returns {number} 1-4 的整数
+ * @param {number} [fallback] 兜底并行数（仅非有限值），默认 2
+ * @returns {number} 0-8 的整数
  */
 export function normalizeParallel(value, fallback = SUBAGENT_DEFAULTS.parallel) {
   const n = Number(value);
   if (!Number.isFinite(n)) return fallback;
-  const rounded = Math.round(n);
-  if (rounded < SUBAGENT_PARALLEL_MIN) return fallback; // 禁 0（含负值）：退回默认
-  return Math.min(SUBAGENT_PARALLEL_MAX, Math.max(SUBAGENT_PARALLEL_MIN, rounded));
+  const floored = Math.floor(n);
+  if (floored < SUBAGENT_PARALLEL_MIN) return SUBAGENT_PARALLEL_MIN; // 负 → 0（无上限）
+  return Math.min(SUBAGENT_PARALLEL_MAX, floored);
 }
 
-/** Subagent 偏好归一（缺省/坏值 → 默认：开关保持上次布尔，并行数兜底 2）。 */
+/**
+ * 0 档显示文案（设置-常规 subagent 卡）：parallel===0 → 无上限标签；风险说明小字
+ * （单一来源：app.js 经此渲染，index.html 不重复写文案）；1-8 → 空串（不显示）。
+ * @param {number} parallel 归一后的并行数
+ * @returns {string}
+ */
+export function parallelLabelText(parallel) {
+  if (parallel !== SUBAGENT_PARALLEL_MIN) return '';
+  return `${SUBAGENT_PARALLEL_UNLIMITED_LABEL}；${SUBAGENT_PARALLEL_RISK_NOTE}`;
+}
+
+/** Subagent 偏好归一（缺省/坏值 → 默认：开关保持上次布尔，并行数归一 0-8——0 合法保留）。 */
 export function normalizeSubagentPref(raw) {
   const r = raw ?? {};
   return {
@@ -101,7 +122,8 @@ export function saveSubagentPref(storageLike, pref) {
 
 /**
  * 工作流偏好的服务端形状归一：同时接受服务端 {subagentsEnabled,maxParallel} 与本地
- * {enabled,parallel}（宽容双形状）；缺省/坏值 → 默认（parallel 兜底 2，禁 0）。
+ * {enabled,parallel}（宽容双形状）；缺省/坏值 → 默认；parallel 归一 0-8
+ * （0 = 无上限原样保留；负 → 0；非有限 → 兜底 2）。
  * @returns {{enabled: boolean, parallel: number}}
  */
 export function normalizeWorkflowPref(raw) {
@@ -138,7 +160,8 @@ export async function loadWorkflowPref({ fetchImpl = globalThis.fetch, storageLi
 
 /**
  * 同步工作流偏好：POST /api/workflow 混合字段部分提交（patch 内部形状 {enabled?,parallel?}
- * → 服务端字段 {subagentsEnabled?,maxParallel?}；maxParallel 提交前归一——0/负本地兜底 2）。
+ * → 服务端字段 {subagentsEnabled?,maxParallel?}；maxParallel 提交前归一 0-8——
+ * 0 = 无上限原样上行；负 → 0；>8 → 8；非有限兜底 2）。
  * 成功 → {ok:true, value:服务端回体归一}；失败（含服务端 400）→ {ok:false, error}。绝不 throw。
  * @param {{enabled?: boolean, parallel?: number}} [patch]
  * @param {{fetchImpl?: typeof fetch}} [opts]

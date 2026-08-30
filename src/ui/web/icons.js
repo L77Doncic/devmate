@@ -56,6 +56,35 @@ export const ICONS = Object.freeze({
   }),
   /** 目录弹窗 `..` 上级行（arrow-up + 下基线）。 */
   upDir: Object.freeze({ d: Object.freeze(['M3.2 12.8h9.6M8 3.6v6M5 6.4L8 3.4l3 3']) }),
+  /** 「对话」区头搜索（dsh WorkspaceBrowser search：放大镜 + 柄；过滤会话行）。 */
+  search: Object.freeze({
+    d: Object.freeze([
+      'M6.9 3.35a3.55 3.55 0 1 1-.01 7.1A3.55 3.55 0 0 1 6.9 3.35zM9.7 9.7l3.1 3.1',
+    ]),
+  }),
+  /** 「对话」区头排序（dsh sort：左升右降双箭头 —— 点击轮换 时间/名称）。 */
+  sort: Object.freeze({
+    d: Object.freeze([
+      'M5.1 12.7V3.3M5.1 6.3 3.3 8.1M5.1 6.3l1.8 1.8',
+      'M10.9 3.3v9.4M10.9 9.7l-1.8-1.8M10.9 9.7l1.8-1.8',
+    ]),
+  }),
+  /** 审查块 leading（dsh shieldCheck：盾形轮廓 + 内勾；review-block 专属）。 */
+  shieldCheck: Object.freeze({
+    d: Object.freeze([
+      'M8 2.1l4.9 1.6v3.5c0 3.2-2 5.5-4.9 6.7-2.9-1.2-4.9-3.5-4.9-6.7V3.7L8 2.1Z',
+      'M5.6 8.1l1.7 1.7 3.1-3.4',
+    ]),
+  }),
+  /** composer 附件钮（ADR-0015：图像加号——外框圆角矩形 + 山形/山 + 中心加号；
+   * 与 side/slot 图标同几何语言，16px 下不糊）。 */
+  imagePlus: Object.freeze({
+    d: Object.freeze([
+      'M3.4 4.4a1.2 1.2 0 0 1 1.2-1.2h6.8a1.2 1.2 0 0 1 1.2 1.2v7.2a1.2 1.2 0 0 1-1.2 1.2H4.6a1.2 1.2 0 0 1-1.2-1.2V4.4Z',
+      'M5.2 9.8l1.9-2.2 1.5 1.5 1.2-1.3 1.5 2',
+      'M11.6 3.9v2.4M10.4 5.1h2.4',
+    ]),
+  }),
 });
 
 /** 图标存在性（未知名 → null；调用方防御：null 时只挂空 slots）。 */

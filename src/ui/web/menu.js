@@ -19,6 +19,12 @@ export const MENU_GAP = 6;
 export const MENU_VIEWPORT_PAD = 8;
 
 /**
+ * 行菜单 kebab 的可访问名 / 悬停提示（会话行与组头 kebab 共用同一来源；
+ * title 与 aria-label 同值 —— 组头 kebab 两种状态（默认根禁用/可用）亦恒有 title）。
+ */
+export const ROW_MENU_KEBAB_TITLE = '更多（删除/恢复等）';
+
+/**
  * 会话行菜单条目表（dsh SessionNodeItem row menu 的本地实例：
  * 我们无 rename/fork/archive 语义 —— 只有删除，危险项红着）。
  * 文案单一来源：menu.js（与 extensions.js 同纪律，防漂移断言见 menu.test.ts）。

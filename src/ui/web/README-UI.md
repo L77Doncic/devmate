@@ -37,14 +37,14 @@ python3 -m http.server 8123            # 在 src/ui/web 目录内
 > - 注册根 → 工作区分组组树（ProjectRowItem 34px 组头：folder↔hover chevron + basename/meta + kebab/组内 ＋；
 >   SessionNodeItem 32px 行保留）；「＋新建」= dsh WorkspacePickFlow 菜单（工作区列表 + 勾选当前 + 分隔 +
 >   底部钉置「添加工作区…」，默认根项在下）；目录选择弹窗 = dsh ui-directory-picker-browse 形态（标题 + 可点路径条 +
->   「..」首行 + 目录行 + 手动路径输入 + 「选择此文件夹」启用裁决）；错误对话框复用 dsh folderError 形态（取消/重试）。
+>   「..」首行 + 目录行 + 手动路径输入 + 「选择此文件夹」启用裁决）；错误对话框复用 dsh folderError 形态（取消/重试）；
+>   区头三图标 = 搜索（展开过滤条，纯客户端 filterSessionList）+ 排序（时间/名称点击轮换）+ 添加工作区（dsh 同款）。
 >   **已知差异（≤4，注明）**：① 默认根识别 = 「注册表首项」启发（服务端 GET /api/workspaces 无默认根字段），DELETE
 >   400 回授校正 —— 与 dsh workspace controller 的权威顺序不同；② 组内会话**无拖拽排序**、行菜单仅「移除工作区」
 >   （dsh: drag 排序 + host 回写 + rename/fork/archive）；③ 目录浏览无「新建文件夹」affordance（服务端 browse 仅展示）；
->   ④ 主列空态保留 DevMate 三步卡 + hero「选择工作区…」快捷入口（dsh EmptyHero 无三步卡；wsCollapsed 逐工作区
->   持久化 —— dsh 为 groupExpansion 全局数组）。
+>   ④ wsCollapsed 逐工作区持久化（dsh 为 groupExpansion 全局数组）；空态差异见下「dsh 对齐 2026-08-29」。
 >   | `extensions.js` | 设置页扩展区纯逻辑：Subagent 工作流（/api/workflow 同步 + localStorage 降级）、Skills/MCP 清单归一化（MCP 徽章按 enabled 渲染，不依赖 status）、args 解析 |
->   | `commands.js` | 「/」命令纯逻辑：12 条命令表（id/name/label/desc/hint 单一来源）、parseCommandLine 行解析、matchCommands 前缀过滤（下拉）、commandFor 白名单匹配、commandArgValid 参数合法裁决、THEME_ARG_VALUES 白名单 |
+>   | `commands.js` | 「/」命令纯逻辑：13 条命令表（id/name/label/desc/hint 单一来源）、parseCommandLine 行解析、matchCommands 前缀过滤（下拉）、commandFor 白名单匹配、commandArgValid 参数合法裁决、THEME_ARG_VALUES 白名单、CONTINUE_PROMPT（/continue 续跑指令文本） |
 >   | `meter.js` | 上下文窗口占用环纯逻辑：meterRatio（contextEstimateTokens / window，夹取 [0,1]、只认 number）、meterTier（>80% 琥珀 / >95% 红 / 缺窗 unknown）、百分比文本、tooltip 与 aria（缺窗「—」= 估算模式）、周长常量 |
 >   | `permissions.js` | dsh 式权限预设纯逻辑（**三档枚举/中文标签/描述/盾形 glyph 单一来源**）：档位归一（非法 → workspace-write）、permissionConfirmedAt 归一与已确认判定、**风险门计算**（切 full-access 且无确认记录 → 一次性确认门）、风险门文案（复用删除确认视觉） |
 >   | `approval-banner.js` | 内嵌审批卡视图模型纯逻辑：headline（工具名+一句话）、命令预览提取（JSON cmd/command/path → mono 卡文本，截断 300）、**队列 → 卡视图换算（一次一个，取首个等待项）**；出现/应答收敛/拒绝语义状态机在 messages.js（approvals 队列）+ app.js（渲染首个等待项） |
@@ -78,7 +78,8 @@ npm run typecheck 需要能解析测试里的 `.js` import：`tsconfig.test.json
 
 ## 协议速记（详见 app.js/sse.js 头注释与 emit.ts）
 
-GET `/api/stream?sessionId=` → SSE（**帧清单 11 类**）：`session-user{text}` / `assistant-delta{text}` /
+GET `/api/stream?sessionId=` → SSE（**帧清单 11 类**）：`session-user{text, images?}`（images = 多模态图片 [{url
+   dataURL,width?,height?}]，ADR-0015；无图帧不带键）/ `assistant-delta{text}` /
 `reasoning{text}`（思考**增量**帧：流内逐段推送、历史回放为折叠单帧——前端就地累积；服务端已下发）/
 `assistant-done{content,toolCalls}` / `tool-start{id,name,arguments}` /
 `tool-result{id,name,ok,contentPreview,content,error}` / `approval-request{toolCallId,name,arguments}` /
@@ -93,7 +94,10 @@ GET `/api/stream?sessionId=` → SSE（**帧清单 11 类**）：`session-user{t
 POST `/api/chat {sessionId?,text} → {sessionId}`；POST `/api/approval {sessionId,toolCallId,approve}`；
 POST `/api/interrupt`；GET/POST `/api/settings {baseUrl,model,apiKey?,reasoning?,windowTokens?,permission?}`
 （只回掩码；response 恒带 `reasoning`（off/low/medium/high，缺省 medium）、`window`（
-上下文窗口覆盖；未配置 → 缺省不带键 = 估算模式）与 `permission`（read-only/
+上下文窗口取窗：用户显式覆盖 > 网关 /models 探测 > 供应商 preset 估算——窗口来源仅
+此三源，模型名尾标注层已取消（2026-08-30 用户裁定）；模型名中的 `[N]m`/`[N]k` 不再
+解析为窗口，发送前仍净化该 UI 标记后缀；未配置 → 缺省不带键 = 估算模式）
+与 `permission`（read-only/
 workspace-write/full-access，缺省 workspace-write；`permissionConfirmedAt`（epoch ms）仅在
 已记录时携带 —— full-access 风险确认记录，后端记录不强制）；POST `reasoning`/`windowTokens`/
 `permission` 为**补丁字段**（未触碰保持现值）—— 思考强度 pill 只上行 `{reasoning}`，
@@ -110,6 +114,12 @@ GET `/api/stats → {rssMb,heapMb,sessions,activeShells}`；GET `/api/tools → 
 64KB 上限内完整；`contentPreview` 保留供列表/降级，展开详情渲染 `content` 不截断至 300）；
 `usage` 增补 `contextEstimateTokens?`（run 内最后一次投影的上下文估算；缺省不带键 ——
 上下文占用环在无估算时隐藏）；`sessions[]` 增补 `workspaceRoot`（分组键）。
+
+**spawn_subagent 协议（B-1 借鉴①）**：工具参数 `{prompt, skill?}`——`skill` = 技能 id
+（与 use_skill 同 id 语义，见系统提示技能清单节）；给出时该技能全文经 capSkill
+（≤6000 字符 + 「…（截断）」标记）机械注入子代理 system（「## 方法论（注入）」节），
+客户端渲染零改动（仍是普通工具卡/审查块判定不变：prompt 含 审查|review）；
+未知/关闭/索引未回填 → 零注入（子代理普通模式）。
 
 **设置页扩展区（Skills / MCP / Subagent 工作流；纯逻辑见 `extensions.js`）**：
 
@@ -128,7 +138,9 @@ GET `/api/stats → {rssMb,heapMb,sessions,activeShells}`；GET `/api/tools → 
   防抖 300ms 一次性提交，卸载/切换前 flush）；失败/缺端点 → 回滚重读（GET）+ toast
   「同步失败，已还原」（服务端 400 同一路径）。服务端不可达时**降级 localStorage**
   `devmate.ui.subagents` `{enabled,parallel}`（默认 `{enabled:true,parallel:2}`；
-  parallel 1-4 步进禁 0，0/负 → 本地兜底 2），控件旁注「未同步（仅本地）」。
+  parallel 0-8 步进：0 = 无上限（按需派遣，0 档挂显「无上限（按需派遣）」+ 风险说明
+  小字——parallelLabelText 单一来源），负 → 0、>8 → 8、非整 → floor、非数 → 兜底 2，
+  与 shared/workflow 的 clampMaxParallel 同口径），控件旁注「未同步（仅本地）」。
 - 扩展区用户可见文案全部为纯中文说明（零端点路径；copy 单一来源 = extensions.js 常量，
   防漂移断言见 `test/ui-web/extensions.test.ts`）。新设置控件全部走 `data-*` 事件委托
   （drawer 上单一 change/click 监听），app.js 不逐控件挂监听。
@@ -144,6 +156,12 @@ GET `/api/stats → {rssMb,heapMb,sessions,activeShells}`；GET `/api/tools → 
 - **run-status 终态（8 值）**：completed / cost-guard / max-steps / wall-time /
   circuit-break / compaction-debounce / user-interrupted / fatal（中文标签见
   format.js RUN_STATUS_SEMANTICS；tone 完成=绿 / 中断与预算类=琥珀 / 熔断与致命=红 / 未知=灰）。
+  **继续钮**：仅终态 `user-interrupted` 时 run-strip 右侧渲染「继续」小钮
+  （primary-outline 12px；裁决单一源 = format.js `continueVisible` ——
+  cost-guard/max-steps/wall-time 等独立停机原因**不提供**）；点击 = 向当前会话发送
+  `CONTINUE_PROMPT`「请继续刚才未完成的任务。」（正常 chat 路径 POST /api/chat
+  {sessionId, text}，引擎从历史 + interrupted 占位结果续跑）；无 sessionId 时隐藏；
+  run-strip 内 /continue 命令同语义。
 - **运行状态条（dsh「状态属于输入框上下文」）**：停靠式，从顶栏移到 **composer 输入区
   上方**。运行中 = 细横条（色点脉冲 + 闪烁阶段词「生成中/工具执行中/待审批」+ 实时墙钟
   耗时——秒表锚点 runStartedAt 由 startStream 设立）；终态/完成 = 折叠单行小字
@@ -198,12 +216,34 @@ GET `/api/stats → {rssMb,heapMb,sessions,activeShells}`；GET `/api/tools → 
   hover 面同色）；空态 = dsh `empty.none`（pad 16/12、13px、tertiary）。
   kebab → 行菜单：dsh Menu 语义本地形态（侧栏内绝对定位浮层，逃出 .list 剪裁；条目 =
   删除（danger 红）、外点/Escape/pointer-leave/滚动关闭；纯逻辑 = menu.js 可测）。
+  （2026-08-30 修复：会话行 kebab（`[data-kebab]`）此前缺失于 #ws-groups 单点委托 ——
+  点击落入「行 = 恢复」导致菜单永不打开；现委托新增该分支（stopPropagation + 从
+  `li.sessionRow[data-session-id]` 取会话 → `openRowMenu({type:'session'})`，hidden 时开、
+  开着则关，与组头 kebab 同款 toggle）。委托逻辑在 app.js —— 测试环境为纯 node 无
+  jsdom，该分支以 CDP 探针在真服务（127.0.0.1:4321）上验收：行 kebab → `.rowMenu`
+  可见且条目 = 删除会话；外点/Esc/toggle 关闭；删除 → 确认 modal → 列表移除；组头
+  kebab 与行点击恢复回归均绿；menu.js 的 item 模型单测照旧。）
   会话列表走 `GET /api/sessions`；点列表项 = `restoreSession`（**单流协调时序**：关旧流
   broker → 视旧 run 状态 POST /api/interrupt → store.reset + `GET /api/sessions/:id`
   协议形状事件回放 → ensureStream(新会话)）；`newSession` 按钮/品牌按钮 =
   `POST /api/sessions`（前端仍保留「未实现时回退首条消息创建」的防御路径）；删除 =
   kebab 菜单 → 确认 modal（复用审批视觉语言，危险色调）+ `DELETE`（409 提示先停止）。
-  会话恢复仍由 localStorage 记忆，刷新后续发。
+  会话恢复**不经 localStorage 记忆**（2026-08-30 决策：**启动默认 hero 空态**——
+  `LS_SESSION` 持久化键全删，刷新/重启不自动恢复；首屏即「让每个想法动起来」+
+  副行「先选工作区，再开始与 DevMate 协作」+ 主 CTA「选择工作区…」（hero 先选工作区
+  流程：点击 → 目录弹窗 → 选定即注册该工作区并**自动新建会话进入**（addWorkspace +
+  newSession(root) 链；未选关闭 → 仍空态；侧栏「添加工作区」仍只注册不建会话），
+  历史恢复仅经侧栏点击行 restoreSession，首条消息仍走 POST /api/chat 无 sessionId
+  新建）。**严格先选工作区（A 档）**：启动首屏必须先选或确认工作区——boot 无会话
+  且本轮未选工作区时 composer 整区锁定（textarea 禁用 + 占位「先选择工作区…」+
+  `#composer` `aria-disabled` + `.composer-locked` 弱化卡），hero 常显；解锁 =
+  `ui.sessionId` 非空 或 本轮已明确选择工作区（`ui.wsChosenRound`：任何 newSession
+  路径 —— hero 目录选定 / hero 次钮**「使用默认工作区」**（显式确认默认根=启动目录，
+  POST /api/sessions 无 workspaceRoot → 建默认根会话解锁）/ ＋新建菜单/组头＋/品牌钮
+  均置位；会话行恢复即解锁）。刷新回锁（会话指针不持久化），复点侧栏会话行即解锁；
+  删除当前会话/流 404 不回收选择（下一条消息仍可经 /api/chat 建新会话，不强制回 hero）。
+  恢复成功**不弹 toast**（2026-08-30 静默化：列表选中态 + 消息区换载即反馈；
+  toast clickable 复制机制保留，其它场景复用）。
 - **主题（S13）**：三态（跟随系统/浅色/深色），localStorage 键 `devdev.theme`（任务书
   原文；与侧栏折叠键 `devdev.sidebarCollapsed` 同族）。`data-theme` 缺省时纯 CSS 走
   `prefers-color-scheme`（系统切换零 JS），显式值经 theme.js 写入 html 属性并同步
@@ -251,14 +291,16 @@ GET `/api/stats → {rssMb,heapMb,sessions,activeShells}`；GET `/api/tools → 
    **会话按 `workspaceRoot` 分作者分组**：组头 = 文件夹 basename（组内行解剖不变）；
    无 workspace 的旧会话归「未知项目」组（**尾组**）；空态「暂无会话，点新建开始」。
 2. **「/」命令**（输入区首个字符 `/` 触发，防抖 150ms 出下拉；纯逻辑 =
-   `commands.js` 可单测）：12 条 —— `/help`（命令表+说明面板）、`/new`（新建会话）、
-   `/clear`（新会话，同 `/new`，注明）、`/stop`（POST /api/interrupt）、`/sessions`
-   （列表+数量）、`/cost`（本会话累计成本面板，数据 = messages.js `costUsdCum` ——
-   usage 事件按 run 边界累加）、`/stats`（/api/stats 数字）、`/model`（当前模型+去设置
-   按钮）、`/skill`（已启用技能数+提示）、`/theme <dark|light|system>`、`/mcp`
-   （MCP 服务器登记态）、`/compact`（诚实信息条：**自动压缩运行中，无需手动**）。
-   未知命令 → 消息流红字「未知命令 /xx，/help 查看」；命令结果面板 = dsh Menu/Modal
-   表面（r12、shadow-lv3、标题+X、Escape/外点关闭）；命令面板/下拉锚于输入卡上缘。
+   `commands.js` 可单测）：13 条 —— `/help`（命令表+说明面板）、`/new`（新建会话）、
+   `/clear`（新会话，同 `/new`，注明）、`/stop`（POST /api/interrupt）、`/continue`
+   （向当前会话发送「请继续刚才未完成的任务。」——正常 chat 路径续跑，引擎从历史
+   - interrupted 占位结果续跑；run-strip「继续」钮 = 同一条目）、`/sessions`
+     （列表+数量）、`/cost`（本会话累计成本面板，数据 = messages.js `costUsdCum` ——
+     usage 事件按 run 边界累加）、`/stats`（/api/stats 数字）、`/model`（当前模型+去设置
+     按钮）、`/skill`（已启用技能数+提示）、`/theme <dark|light|system>`、`/mcp`
+     （MCP 服务器登记态）、`/compact`（诚实信息条：**自动压缩运行中，无需手动**）。
+     未知命令 → 消息流红字「未知命令 /xx，/help 查看」；命令结果面板 = dsh Menu/Modal
+     表面（r12、shadow-lv3、标题+X、Escape/外点关闭）；命令面板/下拉锚于输入卡上缘。
 3. **停止按钮**：34px 圆形（同发送钮几何），**danger 红底** + 白 stop 图标
    （深 #f25a5a / 浅 #ec1313，hover brightness 0.92），贴发送按钮左侧、间距 8px；
    runActive（含工具执行/审批等待）时始终可见 —— 顶栏停止按钮已移除。
@@ -344,8 +386,10 @@ GET `/api/stats → {rssMb,heapMb,sessions,activeShells}`；GET `/api/tools → 
    （组1 步数、组2 耗时、组3 入/出/总、组4 ≈成本）。**数据缺口注明**：turns/LLM-工具
    耗时拆分/TTFT/tok/s/缓存命中 需 run-status 协议与 usage 缓存字段扩展 —— 现状保留
    可得项，溢出省略 + hover tooltip 全文（CSS 原已有 ellipsis + `title`）。
-5. **空态语言（B6 EmptyHero 对齐局部）**：hero 标题改纯品牌 `DevMate` + 「**预览版**」
-   badge（r6 小字 chip）；三步引导保留（DevMate 本地差异化，见下方差异清单）。
+5. **空态语言（B6 EmptyHero 对齐局部，后被 2026-08-29 波升级为 dsh 形态）**：
+   hero 标题改纯品牌 `DevMate` + 「**预览版**」badge（r6 小字 chip）。
+   （2026-08-29：三步卡已移除，hero = 品牌 mark + 「让每个想法动起来」+ badge，
+   见下方「dsh 对齐 2026-08-29」。）
 
 ### 与 dsh 仍存差异（Wave 2 后）
 
@@ -356,3 +400,32 @@ GET `/api/stats → {rssMb,heapMb,sessions,activeShells}`；GET `/api/tools → 
   命中行明黄）。
 - `Ran for` 为消息级钟差，非 run 级 duration 事件（run-status 无每消息时长）。
 - TurnNavigator / turn-process 折叠 / turn-tail 用量 Disclosure 未做（P2 之外）。
+
+## dsh 对齐 2026-08-29（三项：空态/composer 单壳/区头三图标 + 审查块 + 权限文案）
+
+1. **空态 hero（dsh EmptyHero 形态）**：品牌 mark 与标题同行居中 + 大标题
+   `让每个想法动起来`（26/32 500）+ 「预览版」badge；**三步卡与 hero「选择工作区…」
+   按钮已移除**（工作区入口仍在侧栏 ＋/组头 ＋/新建菜单；配置指引收敛为 composer
+   上方一行小字「填写 API 密钥后即可开始（设置→模型接口）」，仅空态且密钥未配置时
+   显示，点击直达设置 —— 替代“step1 去设置”语义，为本地轻量差异）。
+2. **composer 单壳卡**：思路强度分段 pill 已并入右下**模型·强度 combo**
+   （`{model} · {档} ▾`；点击展开两段 = 模型名【只读，点击跳设置】+ 强度四档单选；
+   变更即 POST /api/settings {reasoning}，防抖/toast 纪律沿用）；placeholder 改为
+   居中大文本「描述你想构建什么」；权限 chip 定位于输入框下左（原有）；发送圆钮
+   右下（原有）。**差异**：dsh 左下为「＋」附件钮 —— 无附件功能，**不做占位钮**
+   （不做假功能），该位留给方法线状态徽标（若后续有）；dsh 输入卡上方还有
+   工作区名+Standard mode 行 —— 我们保留顶栏 session-chip（无 mode 概念）。
+3. **侧栏「对话」区头三图标**：搜索（展开过滤条，client filterSessionList ——
+   标题/编号包含，大小写不敏感）+ 排序（时间/名称轮换，nextWsSortMode +
+   sortWorkspaceSessions；图标 active 态标记当前=按名称）+ 添加工作区（原有）。
+4. **独立审查块（B）**：spawn_subagent 且 arguments.prompt 含 审查|review
+   （isReviewSubagent，format.js）→ 消息状态机给工具卡打 review 标志（messages.js）
+   → 渲染层输出 `.review-block`（与工具卡同网格、accent-border 描边 + 淡蓝底；
+   标题行 = shieldCheck + 「独立审查」+ 副题【title/prompt 首 40】+ 结论首行
+   【报告首行 60】；默认折叠、全文惰性展开）。协议零改动（client 判定）。
+5. **权限文案（矩阵契约同步）**：chip 菜单三档描述 = read-only「仅允许读取与只读
+   命令；写入与危险命令逐项确认」/ workspace-write「命令直接执行（含破坏性命令），
+   请在信任的工作区内使用」（风险声明）/ full-access「全部放行：任何命令直接执行
+   （含删除/破坏性操作），不再问询」；chip glyph 工作区写入档 = 锁形 padlock；
+   风险确认门文案同步（全部放行…）。矩阵行为由服务端 decidePermission 落地（本波
+   之后），前端只同步描述。

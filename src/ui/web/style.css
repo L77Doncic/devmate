@@ -280,6 +280,7 @@
   --accent-dim: var(--dsw-alias-state-business-tertiary); /* deepseek-800 */
   --accent-soft: var(--dsw-alias-interactive-bg-hover-accent); /* white 24% */
   --accent-border: rgba(103, 158, 254, 0.28);
+  --review-bg: rgba(103, 158, 254, 0.1); /* 审查块底（深色：accent 淡蓝铺底） */
 
   --success: var(--dsw-alias-state-success-primary); /* green-500 */
   --success-dim: var(--dsw-alias-state-success-tertiary); /* green-900 */
@@ -448,6 +449,7 @@
   --accent-dim: var(--dsw-alias-state-business-tertiary);
   --accent-soft: var(--dsw-alias-interactive-bg-hover-accent);
   --accent-border: rgba(65, 118, 230, 0.25);
+  --review-bg: rgba(65, 118, 230, 0.06); /* 审查块底（浅色：accent 淡蓝铺底） */
 
   --success: var(--dsw-alias-state-success-primary);
   --success-dim: var(--dsw-alias-state-success-tertiary);
@@ -1802,6 +1804,25 @@ pre {
 .run-strip.live .rs-meta {
   color: var(--dsw-alias-label-caption);
 }
+/* 「继续」小钮（primary-outline 12px，条右端；仅终态 user-interrupted 显隐
+   由 format.js continueVisible 裁决，app.js 挂 click = sendContinue） */
+.run-strip .rs-continue {
+  flex: 0 0 auto;
+  margin-left: auto;
+  padding: 3px 10px;
+  border: 1px solid var(--accent-border);
+  border-radius: 999px;
+  background: transparent;
+  color: var(--accent);
+  font: inherit;
+  font-size: 12px;
+  line-height: 16px;
+  cursor: pointer;
+}
+.run-strip .rs-continue:hover,
+.run-strip .rs-continue:focus-visible {
+  background: var(--accent-soft);
+}
 /* quiet（终态/完成/出错）：无内距、单行小字 */
 .run-strip.quiet {
   color: var(--dsw-alias-label-tertiary);
@@ -1897,6 +1918,40 @@ pre {
   color: var(--dsw-alias-label-primary);
   white-space: pre-wrap;
   word-break: break-word;
+}
+/* 用户图像卡（ADR-0015；dsh MessageImage 同款几何）：单图单卡（long-edge 240 +
+   比例钳制 [0.25,4] + cover 裁剪锚——尺寸由 app.js imageFitSingle 计算在按钮上）、
+   多图 64px 方 tile；单击 → lightbox。裁剪锚随 object-position 渲染。 */
+.user-image-card {
+  display: inline-block;
+  margin: 0 8px 8px 0;
+  vertical-align: top;
+}
+.user-image-card:last-child {
+  margin-right: 0;
+}
+.user-image-card.tile {
+  margin-bottom: 0;
+}
+.user-image-btn {
+  display: block;
+  padding: 0;
+  border: none;
+  border-radius: 12px;
+  background: transparent;
+  cursor: zoom-in;
+  overflow: hidden;
+}
+.user-image-btn:hover {
+  outline: 1px solid var(--dsw-alias-border-l2-darkmode-thin);
+}
+.user-image {
+  display: block;
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+  border-radius: 12px;
+  border: 1px solid var(--dsw-alias-border-l2-darkmode-thin);
 }
 /* 助手：无气泡（dsh 纯文本流，作者行在其上） */
 .msg-row.assistant .bubble {
@@ -2160,6 +2215,88 @@ pre {
   overflow: auto;
   white-space: pre-wrap;
   word-break: break-word;
+}
+
+/* ---------- 独立审查块（B：spawn_subagent 且 prompt 含 审查|review —— 与工具卡
+   同网格（tool-slot）但区分色：accent-border 描边 + 淡蓝底（--review-bg）。标题行 =
+   shieldCheck + 「独立审查」+ 副题 + 结论首行 + chevron；正文惰性（展开才写）。） ---------- */
+.review-block {
+  margin: 8px 0 0;
+  border: 1px solid var(--accent-border);
+  border-radius: 10px;
+  background: var(--review-bg);
+  overflow: hidden;
+  font-size: var(--dsw-font-size-s);
+}
+.review-head {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  width: 100%;
+  height: 32px;
+  min-width: 0;
+  padding: 0 8px;
+  border: none;
+  border-radius: 10px;
+  background: transparent;
+  color: var(--dsw-alias-label-primary);
+  text-align: left;
+  white-space: nowrap;
+  cursor: pointer;
+  transition: background var(--t);
+}
+.review-head:hover {
+  background: var(--dsw-alias-interactive-bg-hover);
+}
+.review-leading {
+  flex: none;
+  display: inline-flex;
+  color: var(--dsw-alias-state-business-primary);
+}
+.review-leading svg {
+  width: 16px;
+  height: 16px;
+}
+.review-title {
+  flex: none;
+  font-weight: 500;
+}
+.review-subject {
+  flex: 0 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  color: var(--dsw-alias-label-secondary);
+}
+.review-verdict {
+  flex: 0 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  color: var(--dsw-alias-label-tertiary);
+}
+.review-verdict.err {
+  color: var(--dsw-alias-state-error-primary);
+}
+.review-body {
+  display: none;
+}
+.review-body.open {
+  display: block;
+}
+.review-content {
+  margin: 0;
+  max-height: 320px;
+  overflow: auto;
+  padding: 8px 12px;
+  white-space: pre-wrap;
+  word-break: break-word;
+  background: var(--dsw-alias-markdown-code-block);
+  color: var(--dsw-alias-label-primary);
+  font: var(--dsw-font-markdown-code-block-small);
+}
+.review-content.err {
+  color: var(--dsw-alias-state-error-primary);
 }
 
 /* ---------- 工具调用行（dsh DisclosureRow/ToolRow：24px 单行摘要 + chevron 展开） ---------- */
@@ -2547,7 +2684,8 @@ pre {
   background: var(--dsw-alias-interactive-bg-hover);
 }
 
-/* ---------- 空态引导（dsh HeroShell：26/32 wt500 headline + 输入卡同宽、蓝色辉光） ---------- */
+/* ---------- 空态引导（dsh HeroShell：品牌 mark 与标题同行 + 26/32 wt500 headline
+   + 输入卡同宽、蓝色辉光；三步卡已移除 —— 配置指引收敛为 composer 提示条） ---------- */
 .empty {
   position: relative;
   z-index: 0;
@@ -2569,22 +2707,78 @@ pre {
   background: radial-gradient(closest-side, rgba(103, 158, 254, 0.24), transparent 72%);
   pointer-events: none;
 }
+/* hero（dsh EmptyHero 本地形态 + hero 先选工作区）：mark 28 + 标题同轴居中，
+   下方副行小字 + 主 CTA（primary-outline 形态，直开工作区目录弹窗） */
 .empty-hero {
-  text-align: center;
-  margin-bottom: 28px;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 10px;
+  margin-bottom: 10px;
+}
+.hero-row {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 12px;
 }
 .empty-logo {
-  width: 34px;
-  height: 34px;
-  border-radius: 8px;
+  flex: none;
+  width: 28px;
+  height: 28px;
+  border-radius: 7px;
 }
 .empty-hero h1 {
-  margin: 14px 0 6px;
+  margin: 0;
   font-size: var(--dsw-font-size-xxl);
   font-weight: 500;
   line-height: 32px;
   letter-spacing: 0;
 }
+/* 副行（先选工作区提示）：弱化小字 */
+.hero-sub {
+  margin: 0;
+  font-size: var(--dsw-font-size-m);
+  color: var(--dsw-alias-label-tertiary);
+}
+/* 主 CTA（primary-outline：accent 边 + accent 字，r8 胶囊；hover 弱底） */
+.hero-cta {
+  margin-top: 6px;
+  padding: 7px 18px;
+  border: 1px solid var(--accent-border);
+  border-radius: 999px;
+  background: transparent;
+  color: var(--accent);
+  font: inherit;
+  font-size: var(--dsw-font-size-m);
+  line-height: 20px;
+  cursor: pointer;
+}
+.hero-cta:hover,
+.hero-cta:focus-visible {
+  background: var(--accent-soft);
+}
+/* 次钮「使用默认工作区」（严格先选工作区 A 档）：文本钮弱形态——「确认默认根
+   （启动目录）即建会话」的次要路径，不抢主 CTA 视觉 */
+.hero-link {
+  margin-top: -2px;
+  padding: 2px 10px;
+  border: 0;
+  background: transparent;
+  color: var(--dsw-alias-label-tertiary);
+  font: inherit;
+  font-size: var(--dsw-font-size-s);
+  line-height: 20px;
+  cursor: pointer;
+  text-decoration: underline;
+  text-underline-offset: 3px;
+}
+.hero-link:hover,
+.hero-link:focus-visible {
+  color: var(--accent);
+}
+
 /* 「预览版」badge（dsh EmptyHero 徽章；r6 实底小字，非交互） */
 .hero-badge {
   display: inline-block;
@@ -2598,66 +2792,6 @@ pre {
   line-height: 18px;
   vertical-align: middle;
   letter-spacing: 0.5px;
-}
-.empty-sub {
-  color: var(--dsw-alias-label-secondary);
-  font-size: var(--dsw-font-size-s);
-  line-height: var(--dsw-font-line-s);
-  margin: 0;
-}
-.steps {
-  list-style: none;
-  margin: 0;
-  padding: 0;
-  display: flex;
-  flex-direction: column;
-  gap: 12px;
-}
-.step {
-  display: flex;
-  align-items: center;
-  gap: 14px;
-  padding: 14px 16px;
-  border: 1px solid var(--dsw-alias-border-l2);
-  border-radius: 16px;
-  background: transparent;
-  transition:
-    border-color var(--t),
-    box-shadow var(--t);
-}
-.step.hot {
-  border-color: var(--accent-border);
-  box-shadow: 0 0 0 3px var(--accent-dim);
-}
-.step-no {
-  flex: 0 0 auto;
-  width: 28px;
-  height: 28px;
-  border-radius: 50%;
-  background: var(--dsw-alias-markdown-code-block);
-  border: none;
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  font-family: var(--font-mono);
-  font-size: var(--dsw-font-size-xs);
-  color: var(--dsw-alias-state-business-primary);
-}
-.step-body {
-  flex: 1;
-  min-width: 0;
-}
-.step-body h2 {
-  margin: 0 0 3px;
-  font-size: var(--dsw-font-size-l);
-  font-weight: 500;
-  line-height: 20px;
-}
-.step-body p {
-  margin: 0;
-  color: var(--dsw-alias-label-secondary);
-  font-size: var(--dsw-font-size-s);
-  line-height: 18px;
 }
 
 /* ---------- 输入区（dsh InputBar：r22 输入卡 + 底部控制行；dock 卡在其上） ---------- */
@@ -2709,12 +2843,28 @@ pre {
   overflow-wrap: anywhere;
   caret-color: var(--dsw-alias-state-business-primary);
 }
+/* 占位居中大文本（dsh 空态 placeholder：「Describe what you want to build」同款 ——
+   输入正文仍左对齐；CSS 只对 placeholder 居中，无 JS 分支） */
 .composer-input::placeholder {
   color: var(--dsw-alias-label-caption);
+  text-align: center;
+  font-size: var(--dsw-font-size-l);
 }
 .composer-input:disabled {
   color: var(--dsw-alias-label-tertiary);
   cursor: not-allowed;
+}
+/* 严格先选工作区（A 档）锁态：无会话且本轮未选工作区 → 输入卡弱化（去焦点辉光 +
+   降不透明度），textarea 已 disabled；解锁即还原（.composer-locked 随 renderComposer
+   切换 —— 只弱化输入卡，设置/侧栏入口保持可达） */
+.composer-locked .composer-box,
+.composer-locked .composer-box:focus-within {
+  border-color: var(--dsw-alias-border-l2-darkmode-thin);
+  box-shadow: none;
+  opacity: 0.62;
+}
+.composer-locked .composer-actions {
+  pointer-events: none;
 }
 /* 底部控制行（dsh InputBar .row：pad 2/8/6，右侧 = 发送钮） */
 .composer-foot {
@@ -2768,7 +2918,8 @@ pre {
   overflow: hidden;
   text-overflow: ellipsis;
 }
-/* 输入卡上方的提示条（dsh InputBar .notice：整卡宽、r8、淡填充、12/18 secondary） */
+/* 输入卡上方的提示条（dsh InputBar .notice：整卡宽、r8、淡填充、12/18 secondary；
+   现专职「配置指引」轻量条款 —— 空态+密钥未配置时显示；点击直达设置） */
 .composer-hint {
   width: 100%;
   max-width: var(--dsh-composer-card-max-width);
@@ -2779,7 +2930,11 @@ pre {
   color: var(--dsw-alias-label-secondary);
   font-size: var(--dsw-font-size-xs);
   line-height: var(--dsw-font-line-xs);
-  text-align: left;
+  text-align: center;
+  cursor: pointer;
+}
+.composer-hint:hover {
+  color: var(--dsw-alias-label-primary);
 }
 
 /* ---------- 遮罩（删除确认 / 风险确认 / 设置抽屉共用） ---------- */
@@ -3436,6 +3591,15 @@ pre {
   background: var(--dsw-alias-state-warn-tertiary);
   color: var(--dsw-alias-state-warn-label);
 }
+/* toast clickable（恢复会话 toast：点击复制完整会话 ID）——基础态 pointer-events:none 仅供此变体放开 */
+.toast.clickable {
+  pointer-events: auto;
+  cursor: pointer;
+}
+.toast.clickable:focus-visible {
+  outline: 2px solid var(--dsw-alias-label-caption);
+  outline-offset: 1px;
+}
 @keyframes toast-in {
   from {
     opacity: 0;
@@ -3592,6 +3756,150 @@ pre {
   flex: 0 1 auto;
   min-width: 0;
 }
+/* 附件钮（ADR-0015：imagePlus 图标钮；34px 圆形同 stop/send 族，quiet 描边） */
+.attach-btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 34px;
+  height: 34px;
+  padding: 0;
+  border: 1px solid var(--dsw-alias-border-l2-darkmode-thin);
+  border-radius: 50%;
+  background: var(--dsw-alias-interactive-bg-hover);
+  color: var(--dsw-alias-label-secondary);
+  cursor: pointer;
+  flex: none;
+}
+.attach-btn:hover {
+  color: var(--dsw-alias-label-primary);
+  background: var(--dsw-alias-interactive-bg-active, var(--dsw-alias-interactive-bg-hover));
+}
+.attach-btn:disabled {
+  opacity: 0.4;
+  cursor: default;
+}
+.attach-btn svg {
+  width: 16px;
+  height: 16px;
+}
+/* 拖放遮罩（dsh DropOverlay 简化：全屏半透明 + 中心文案；document 级 Files 拖入时显示） */
+.drop-overlay {
+  position: fixed;
+  inset: 0;
+  z-index: 120;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: color-mix(in srgb, var(--dsw-color-surface) 55%, transparent);
+  backdrop-filter: blur(2px);
+  pointer-events: none;
+}
+.drop-overlay-text {
+  padding: 14px 28px;
+  border: 1px dashed var(--dsw-alias-border-l2-darkmode-thin);
+  border-radius: 16px;
+  background: var(--dsw-alias-interactive-bg-hover);
+  color: var(--dsw-alias-label-primary);
+  font-size: var(--dsw-font-size-m);
+}
+/* 图片 lightbox（dsh ImageLightbox 简化：全屏浮层 + 关闭钮；遮罩点击关闭） */
+.image-lightbox {
+  position: fixed;
+  inset: 0;
+  z-index: 200;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: color-mix(in srgb, var(--dsw-color-surface) 88%, transparent);
+  backdrop-filter: blur(4px);
+  cursor: zoom-out;
+}
+.image-lightbox-img {
+  max-width: min(88vw, 1080px);
+  max-height: 86vh;
+  border-radius: 12px;
+  background: var(--dsw-color-surface);
+}
+.image-lightbox-close {
+  position: absolute;
+  top: 18px;
+  right: 22px;
+  width: 36px;
+  height: 36px;
+  border: none;
+  border-radius: 50%;
+  background: var(--dsw-alias-interactive-bg-hover);
+  color: var(--dsw-alias-label-primary);
+  font-size: 20px;
+  line-height: 1;
+  cursor: pointer;
+}
+.image-lightbox-close:hover {
+  color: var(--dsw-alias-label-primary);
+  background: var(--dsw-alias-interactive-bg-active, var(--dsw-alias-interactive-bg-hover));
+}
+
+/* 附件预览条（composer-box 内、textarea 上方）：空 → hidden。
+ * dsh AttachmentRail 几何：单图 = 长边 240（imageFitSingle）/ 多图 = 64px 方 tile——
+ * 尺寸由 JS 落 inline（单图 fit 或 IMAGE_TILE_DIMENSION）；本面只做容器（图占满卡）。 */
+.attach-strip {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  padding: 10px 12px 0;
+}
+.attach-card {
+  position: relative;
+  display: inline-block;
+  overflow: hidden;
+  border: 1px solid var(--dsw-alias-border-l2-darkmode-thin);
+  border-radius: 10px;
+  background: var(--dsw-alias-interactive-bg-hover);
+}
+.attach-thumb {
+  display: block;
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+  border-radius: 9px;
+  flex: none;
+}
+.attach-caption {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: var(--dsw-font-size-xs);
+  color: var(--dsw-alias-label-secondary);
+}
+.attach-remove {
+  position: absolute;
+  top: 2px;
+  right: 2px;
+  width: 18px;
+  height: 18px;
+  padding: 0;
+  border: none;
+  border-radius: 50%;
+  background: transparent;
+  color: var(--dsw-alias-label-tertiary);
+  font-size: 14px;
+  line-height: 1;
+  cursor: pointer;
+  opacity: 0; /* dsh AttachmentRail：hover/focus 揭示 */
+  transition: opacity 120ms ease-out;
+}
+.attach-card:hover .attach-remove,
+.attach-remove:focus-visible {
+  opacity: 1;
+}
+.attach-card:hover .attach-thumb {
+  cursor: zoom-in;
+}
+.attach-remove:hover {
+  color: var(--dsw-alias-state-danger-primary, #e5484d);
+  background: var(--dsw-alias-interactive-bg-active, var(--dsw-alias-interactive-bg-hover));
+}
 /* chip：盾形 glyph 16 + 档标签 + chevron（dsh PermissionSelect：触发体 = glyph 14 缩显 +
    标签（满宽 220） + chevron；hover 面同 reasoning-opt 族；disabled = 输入锁定）。 */
 .perm-chip {
@@ -3718,51 +4026,140 @@ pre {
   color: var(--dsw-alias-state-warn-primary);
 }
 
-/* ---------- 思考强度分段 pill（composer 输入卡上方右侧；dsh segmented 同族） ---------- */
-.reasoning-row {
-  display: flex;
-  align-items: center;
-  justify-content: flex-end;
-  gap: 10px;
-  width: 100%;
-  max-width: var(--dsh-composer-card-max-width);
-  margin: 0 auto 6px;
-}
-.reasoning-label {
-  color: var(--dsw-alias-label-tertiary);
-  font-size: var(--dsw-font-size-xs);
-  line-height: 18px;
-}
-.reasoning-seg {
+/* ---------- 模型·思考强度 combo（dsh 右下同款：model 名 + 档标签 + chevron；
+   —— 取代旧 composer 上方分段 pill：两控制项合并为一个选择器） ---------- */
+.model-combo {
   display: inline-flex;
   align-items: center;
-  gap: 2px;
-  padding: 2px;
+  gap: 5px;
+  height: 26px;
+  max-width: 300px;
+  padding: 0 10px;
   border: 1px solid var(--dsw-alias-border-l2-darkmode-thin);
   border-radius: 999px;
   background: var(--dsw-alias-interactive-bg-hover);
-}
-.reasoning-opt {
-  display: inline-flex;
-  align-items: center;
-  justify-content: center;
-  min-width: 30px;
-  height: 22px;
-  padding: 0 8px;
-  border: none;
-  border-radius: 999px;
-  background: transparent;
   color: var(--dsw-alias-label-secondary);
   font-size: var(--dsw-font-size-xs);
   line-height: 20px;
   cursor: pointer;
 }
-.reasoning-opt:hover {
+.model-combo:hover {
   color: var(--dsw-alias-label-primary);
 }
-.reasoning-opt.active {
-  background: var(--dsw-alias-button-info-fill);
-  color: var(--dsw-static-neutral-bluish-50);
+.mc-model {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.mc-dot {
+  flex: none;
+  color: var(--dsw-alias-label-tertiary);
+}
+.mc-reasoning {
+  flex: none;
+}
+.mc-chevron {
+  flex: none;
+  width: 12px;
+  height: 12px;
+  color: var(--dsw-alias-label-tertiary);
+  transition: transform 120ms ease-out;
+}
+.model-combo[aria-expanded='true'] .mc-chevron {
+  transform: rotate(90deg);
+}
+@media (max-width: 460px) {
+  .model-combo .mc-model {
+    display: none;
+  }
+}
+/* 模型·强度菜单（dsh Menu 表面：浮层、r8、阴影；锚于 combo —— 同 perm-menu 族） */
+.model-menu {
+  position: fixed;
+  z-index: 46;
+  min-width: 236px;
+  max-width: min(320px, calc(100vw - 16px));
+  padding: 4px;
+  border: 1px solid var(--dsw-alias-border-l1);
+  border-radius: 8px;
+  background: var(--dsw-specific-menu);
+  box-shadow: var(--dsw-shadow-lv2);
+  animation: row-menu-in 120ms ease-out;
+}
+.model-menu-item {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  width: 100%;
+  padding: 6px 8px;
+  border: none;
+  border-radius: 6px;
+  background: transparent;
+  color: var(--dsw-alias-label-secondary);
+  text-align: left;
+  cursor: pointer;
+}
+.model-menu-item:hover {
+  background: var(--dsw-alias-interactive-bg-hover);
+}
+.mm-model-row {
+  color: var(--dsw-alias-label-primary);
+}
+.mm-label {
+  flex: none;
+  color: var(--dsw-alias-label-tertiary);
+  font-size: var(--dsw-font-size-xs);
+  line-height: 16px;
+}
+.mm-value {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: var(--dsw-font-size-m);
+}
+.mm-go {
+  flex: none;
+  color: var(--dsw-alias-state-business-primary);
+  font-size: var(--dsw-font-size-xs);
+  line-height: 16px;
+}
+.model-menu-sep {
+  height: 1px;
+  margin: 4px;
+  background: var(--dsw-alias-border-l1);
+}
+.model-menu-sec {
+  padding: 4px 8px 2px;
+  color: var(--dsw-alias-label-tertiary);
+  font-size: var(--dsw-font-size-xs);
+  line-height: 16px;
+}
+.mm-opt {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+.mm-opt.current {
+  background: var(--dsw-alias-interactive-bg-hover);
+  color: var(--dsw-alias-label-primary);
+  font-weight: 500;
+}
+.mm-opt-label {
+  flex: 1;
+}
+.mm-opt-check {
+  flex: none;
+  display: inline-flex;
+  width: 14px;
+  height: 14px;
+  color: var(--dsw-alias-state-business-primary);
+  visibility: hidden;
+}
+.mm-opt.current .mm-opt-check {
+  visibility: visible;
 }
 
 /* ---------- 上下文窗口占用环（dsh ContextMeter：composer 与 stats 行之间） ---------- */
@@ -4219,18 +4616,32 @@ pre {
   line-height: 18px !important;
 }
 
-/* ---------- 空态「选择工作区…」快捷入口（dsh EmptyHero 次级动作胶囊） ---------- */
-.hero-add-workspace {
-  margin-top: 14px;
-  height: 36px;
-  padding: 0 16px;
-  border-radius: 18px;
-  font-size: 14px;
-  line-height: 22px;
+/* ---------- 区块头搜索过滤条（dsh WorkspaceBrowser search 展开态：32px 行 + 圆角输入） ---------- */
+.ws-search-field {
+  height: 32px;
+  margin: 2px -4px 4px;
+  padding: 0 4px;
 }
-.hero-add-workspace svg {
-  flex: none;
-  width: 16px;
-  height: 16px;
-  color: var(--dsw-alias-label-tertiary);
+.ws-search-input {
+  width: 100%;
+  height: 28px;
+  padding: 0 10px;
+  border: 1px solid var(--dsw-alias-border-l2-darkmode-thin);
+  border-radius: 8px;
+  background: var(--dsw-alias-interactive-bg-hover);
+  color: var(--dsw-alias-label-primary);
+  font-size: var(--dsw-font-size-xs);
+  line-height: 24px;
+  outline: none;
+}
+.ws-search-input::placeholder {
+  color: var(--dsw-alias-label-caption);
+}
+.ws-search-input:focus {
+  border-color: var(--dsw-alias-border-l3);
+}
+/* 排序钮 active 态（当前 = 按名称：图标着色 = dsh toggle 已激活语义） */
+.sectionHeader .headerActions .iconButton.active {
+  color: var(--dsw-alias-state-business-primary);
+  background: var(--dsw-alias-interactive-bg-hover-accent);
 }
