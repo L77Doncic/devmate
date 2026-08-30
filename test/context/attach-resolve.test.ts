@@ -13,7 +13,6 @@ import { project, attachmentMissingNote, attachmentOversizeNote } from '../../sr
 const REF_A = `sha256/${'a'.repeat(64)}.png`;
 const REF_B = `sha256/${'b'.repeat(64)}.jpg`;
 const DATA_A = 'data:image/png;base64,AAAA';
-const DATA_B = 'data:image/jpeg;base64,BBBB';
 
 function userEvent(seq: number, content: string, images: Array<Record<string, unknown>>): SessionEvent<'user'> {
   return {

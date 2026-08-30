@@ -115,11 +115,11 @@ import { assertValidSessionId } from '../../core/session/base.js';
 import { SessionExistsError, SessionNotFoundError } from '../../core/session/errors.js';
 import type { SessionStore } from '../../core/session/index.js';
 import {
-  PROVIDER_PRESETS,
-  defaultProviderPreset,
+  clampLimits,
+  providerPresetOfBaseUrl,
   sanitizeProviderModel,
 } from '../../core/llm/index.js';
-import type { DiscoverWindowResult, ProviderPreset } from '../../core/llm/index.js';
+import type { DiscoverWindowResult } from '../../core/llm/index.js';
 import type { ReasoningEffort, StreamSnapshot } from '../../shared/llm-types.js';
 import type {
   EventKind,
@@ -1720,10 +1720,13 @@ export function createDevmateServer(deps: DevmateServerDeps): DevmateServer {
     reasoning: ReasoningEffort;
     /** 上下文窗口覆盖（C 档；未提供 = 未知（不传 runOptions，压缩不触发）。 */
     windowTokens?: number;
-    /** 请求侧输入上限（A 档；未提供 = 不发送/厂商默认）。 */
+    /** 请求侧输入上限（A 档；未提供 = 不发送/厂商默认）。注意：**存的是钳后值**（S 档）。 */
     maxInputTokens?: number;
-    /** 请求侧输出上限（A 档；未提供 = runOptions.maxTokens 缺省（DEFAULT_MAX_TOKENS 估价/不发送））。 */
+    /** 请求侧输出上限（A 档；未提供 = runOptions.maxTokens 缺省（DEFAULT_MAX_TOKENS 估价/不发送））。注意：存的是钳后值（S 档）。 */
     maxOutputTokens?: number;
+    /** S 档钳制标记（运行时态；GET 经 clamped 键回执——「已按 <model> 上限钳制为 N」）。 */
+    maxInputTokensClamped?: boolean;
+    maxOutputTokensClamped?: boolean;
     /** 权限预设（权限预设定案：缺省 'workspace-write'；POST /api/settings 即时生效）。 */
     permission: PermissionPreset;
     /** full-access 风险确认记录（epoch ms；前端风险门后写入——纯记录、不强制）。 */
@@ -1775,6 +1778,13 @@ export function createDevmateServer(deps: DevmateServerDeps): DevmateServer {
    */
   let explicitWindowTokens = deps.settings?.windowTokensExplicit === true;
 
+  /**
+   * E7 上限学习（ADR-0016 L2）：运行时「超限报错 → 压缩重试」链从 400 message 免费解析的
+   * 供应商上限（0 token 计费的「真值探测」）。全局单值（settings 是全局的——provider 变更
+   * 即清空）；参与窗口预算钳制（min）与 GET /api/settings 的 windowDetail 注记（「由错误学习」）。
+   */
+  let learnedLimitCaps: { windowCap?: number; outputCap?: number; evidence?: string } = {};
+
   /** 评审哨兵门（R2-S2）语义版装配：hasSubstantiveWork/hasReviewRun 由 ctx 观察器记帐的
    * RunStats 判定（纯函数 loop/types）；flag 为会话级一次性（注入即置位——护栏即一次）。 */
   function reviewGateFor(ctx: SessionCtx): ReviewGate {
@@ -1809,13 +1819,32 @@ export function createDevmateServer(deps: DevmateServerDeps): DevmateServer {
         const runOptions: Partial<RunOptions> = { ...deps.runOptions };
         // C 档：设置侧思考强度 / 三源窗口（覆盖 > 网关探测 > preset）每次 run 现读
         runOptions.reasoning = current.reasoning;
-        const windowDecision = effectiveWindow();
-        if (windowDecision.window !== undefined) runOptions.windowTokens = windowDecision.window;
+        // 窗口预算（ADR-0016）：三源取窗 > E7 学习钳（min——「由错误学习」真值只降不抬）
+        // > INPUT=预算上限钳（用户设了 maxInputTokens → 窗口预算钳于它：INPUT 双语义——
+        // DashScope wire 载体 + 预算上限；README 有注明）。
+        let windowBudget = effectiveWindow().window;
+        if (learnedLimitCaps.windowCap !== undefined) {
+          windowBudget =
+            windowBudget === undefined
+              ? learnedLimitCaps.windowCap
+              : Math.min(windowBudget, learnedLimitCaps.windowCap);
+        }
+        if (current.maxInputTokens !== undefined) {
+          windowBudget =
+            windowBudget === undefined
+              ? current.maxInputTokens
+              : Math.min(windowBudget, current.maxInputTokens);
+        }
+        if (windowBudget !== undefined) runOptions.windowTokens = windowBudget;
         // A 档：输入/输出上限——每次 run 现读（POST /api/settings 即时生效）；
         // 未设置 → 回到缺省（输出：闸门 A 按 DEFAULT_MAX_TOKENS 估价且请求不发送 max_tokens；
-        // 输入：不发送/厂商默认）。「最小契约」：maxInputTokens 不参与窗口预算结算。
+        // 输入：不发送/厂商默认）。S 档：current 存的是钳后值（POST 已钳）；
+        // E7 学习钳（min）作为最后一道（供应商变更/更小上限的运行时真值）。
         if (current.maxOutputTokens !== undefined) {
-          runOptions.maxTokens = current.maxOutputTokens;
+          runOptions.maxTokens =
+            learnedLimitCaps.outputCap !== undefined
+              ? Math.min(current.maxOutputTokens, learnedLimitCaps.outputCap)
+              : current.maxOutputTokens;
         } else {
           delete runOptions.maxTokens;
         }
@@ -1824,6 +1853,23 @@ export function createDevmateServer(deps: DevmateServerDeps): DevmateServer {
         } else {
           delete runOptions.maxInputTokens;
         }
+        // E7 自愈链学习回调（L2）：核心循环从 400 message 免费学到上限 →
+        // 全局记入 learnedLimitCaps（windowDetail「由错误学习」/ 后续 run 钳制）。
+        runOptions.onLimitsError = async (learning) => {
+          if (learning.kind === 'context-exceeded' && learning.hintMax !== undefined) {
+            learnedLimitCaps = {
+              ...learnedLimitCaps,
+              windowCap: learning.hintMax,
+              evidence: learning.message,
+            };
+          } else if (learning.kind === 'output-limit' && learning.hintMax !== undefined) {
+            learnedLimitCaps = {
+              ...learnedLimitCaps,
+              outputCap: learning.hintMax,
+              evidence: learning.message,
+            };
+          }
+        };
         // R2-S1：方法论前置门按开关传递——false → 删除 methodology 键（门不拦）；
         // true 时装配层已注入（gate 只含 route/状态观察，索引内容服务端现读）。
         if (current.methodFirst === false) delete runOptions.methodology;
@@ -1922,10 +1968,7 @@ export function createDevmateServer(deps: DevmateServerDeps): DevmateServer {
    * attach-too-large；单会话累计 ≤200MiB → attach-session-quota。sessionId 必填
    * （单会话累计记账键；与 /api/chat 的会话同键——客户端在首条消息前即生成）。
    */
-  async function handleAttachmentsUpload(
-    req: IncomingMessage,
-    res: ServerResponse,
-  ): Promise<void> {
+  async function handleAttachmentsUpload(req: IncomingMessage, res: ServerResponse): Promise<void> {
     const body = await readJson(req, { limit: ATTACH_LIMITS.maxUploadBodyBytes });
     if (typeof body !== 'object' || body === null) {
       throw new HttpError(400, 'request body must be a JSON object');
@@ -1959,7 +2002,10 @@ export function createDevmateServer(deps: DevmateServerDeps): DevmateServer {
       input.dataUrl === undefined &&
       (input.data === undefined || input.mediaType === undefined)
     ) {
-      throw new HttpError(400, 'body must be {sessionId, dataUrl, ...} or {sessionId, data, mediaType, ...}');
+      throw new HttpError(
+        400,
+        'body must be {sessionId, dataUrl, ...} or {sessionId, data, mediaType, ...}',
+      );
     }
     try {
       const attached = await attachmentStore.receive(input);
@@ -2959,19 +3005,38 @@ export function createDevmateServer(deps: DevmateServerDeps): DevmateServer {
    */
   function effectiveWindow(): { window?: number; detail?: string } {
     if (explicitWindowTokens && current.windowTokens !== undefined) {
-      return { window: current.windowTokens, detail: '用户显式覆盖（settings.windowTokens）' };
+      return withLearnedCap(current.windowTokens, '用户显式覆盖（settings.windowTokens）');
     }
     const discovered = deps.windowDiscovered !== undefined ? deps.windowDiscovered() : null;
     if (discovered !== null && discovered.window !== null) {
+      return withLearnedCap(
+        discovered.window,
+        `网关 /models 探测：${discovered.detail ?? '未知来源'}`,
+      );
+    }
+    // E7 学习源（L2）：运行时超限报错 message 明示的窗口——证据密度高于 preset 估算
+    //（供应商自证），此时它作为取窗来源本身（无其它源时）。
+    if (learnedLimitCaps.windowCap !== undefined) {
       return {
-        window: discovered.window,
-        detail: `网关 /models 探测：${discovered.detail ?? '未知来源'}`,
+        window: learnedLimitCaps.windowCap,
+        detail: `由错误学习：${learnedLimitCaps.windowCap}（运行时超限报错 message 解析）`,
       };
     }
     if (current.windowTokens !== undefined) {
-      return { window: current.windowTokens, detail: '供应商 preset 估算（可在设置覆盖）' };
+      return withLearnedCap(current.windowTokens, '供应商 preset 估算（可在设置覆盖）');
     }
     return {};
+  }
+
+  /** E7 学习钳（min）：三源任一出值后按「由错误学习」真值钳制（只降不抬；钳到则注记来源）。 */
+  function withLearnedCap(window: number, detail: string): { window: number; detail: string } {
+    if (learnedLimitCaps.windowCap !== undefined && learnedLimitCaps.windowCap < window) {
+      return {
+        window: learnedLimitCaps.windowCap,
+        detail: `${detail}；由错误学习：${learnedLimitCaps.windowCap}（超限报错 message 解析）`,
+      };
+    }
+    return { window, detail };
   }
 
   /**
@@ -2980,13 +3045,7 @@ export function createDevmateServer(deps: DevmateServerDeps): DevmateServer {
    * contextWindowTokens（估算；说明语见 windowDetail 来源标注——「估算，可在设置覆盖」）。
    */
   function inputTokensPresetOf(baseUrl: string): number {
-    const target = baseUrl.trim().replace(/\/+$/, '');
-    if (target !== '') {
-      for (const preset of Object.values(PROVIDER_PRESETS) as readonly ProviderPreset[]) {
-        if (preset.baseUrl.replace(/\/+$/, '') === target) return preset.contextWindowTokens;
-      }
-    }
-    return defaultProviderPreset().contextWindowTokens;
+    return providerPresetOfBaseUrl(baseUrl).contextWindowTokens;
   }
 
   function settingsResponse(): {
@@ -3000,6 +3059,8 @@ export function createDevmateServer(deps: DevmateServerDeps): DevmateServer {
     maxOutputTokens: number;
     maxInputTokensDefault?: boolean;
     maxOutputTokensDefault?: boolean;
+    maxInputTokensClamped?: boolean;
+    maxOutputTokensClamped?: boolean;
     modelSanitized?: boolean;
     permission: PermissionPreset;
     permissionConfirmedAt?: number;
@@ -3017,6 +3078,8 @@ export function createDevmateServer(deps: DevmateServerDeps): DevmateServer {
       maxOutputTokens: number;
       maxInputTokensDefault?: boolean;
       maxOutputTokensDefault?: boolean;
+      maxInputTokensClamped?: boolean;
+      maxOutputTokensClamped?: boolean;
       modelSanitized?: boolean;
       permission: PermissionPreset;
       permissionConfirmedAt?: number;
@@ -3038,6 +3101,11 @@ export function createDevmateServer(deps: DevmateServerDeps): DevmateServer {
       maxOutputTokens: current.maxOutputTokens ?? DEFAULT_MAX_TOKENS,
       ...(current.maxInputTokens === undefined ? { maxInputTokensDefault: true } : {}),
       ...(current.maxOutputTokens === undefined ? { maxOutputTokensDefault: true } : {}),
+      // S 档钳制标记（ADR-0016）：POST 时被钳制（> 供应商上限/窗口）→ 回执 clamped 键；
+      // 与 Default 键同族——前端提示「已按 <model> 上限钳制为 N」。仅当被钳制才挂；
+      // 未钳制/未触达 → 无键（与 Default 语义一致：缺席 = 无需提示）。
+      ...(current.maxInputTokensClamped === true ? { maxInputTokensClamped: true } : {}),
+      ...(current.maxOutputTokensClamped === true ? { maxOutputTokensClamped: true } : {}),
       // A 档：存量模型名尾标在读取时被剥离（净化显示）→ 告知前端「已自动校正」一次
       ...(modelSanitizedOnRead ? { modelSanitized: true } : {}),
     };
@@ -3045,7 +3113,7 @@ export function createDevmateServer(deps: DevmateServerDeps): DevmateServer {
       const masked = maskApiKey(current.apiKey);
       if (masked !== undefined) response.apiKey = masked;
     }
-    // 窗口（取窗：用户覆盖 > 网关探测 > preset；无任何源 → 不带键，前端回退内置估算）
+    // 窗口（取窗：用户覆盖 > 网关探测 > preset > 由错误学习；无任何源 → 不带键，前端回退内置估算）
     const windowSource = effectiveWindow();
     if (windowSource.window !== undefined) response.window = windowSource.window;
     if (windowSource.detail !== undefined) response.windowDetail = windowSource.detail;
@@ -3134,6 +3202,28 @@ export function createDevmateServer(deps: DevmateServerDeps): DevmateServer {
         'max-input-output-required',
       );
     }
+    // S 档钳制（ADR-0016）：按当前 baseUrl 匹配 preset——输出 > 供应商上限（有据）→ 钳到
+    // 上限 + clampedMaxOutput；输入 > 供应商窗口 → 钳到窗口 + clampedMaxInput；
+    // 供应商无上限（无据/模型各异）→ 不钳（运行时「超限报错 → 钳制重试」链兜底）。
+    // 契约：**钳制值 = 持久化值**（存的是钳后值——保存即生效；GET 经 clamped 键回执）。
+    // 注：provider 以 baseUrl 变更**后**为准（patch 语义——baseUrl 与应用在同一 POST；
+    // 下方 application 段先应用 baseUrl，钳制用解析后的 current.baseUrl）。
+    let clampedMaxInputOnPost = false;
+    let clampedMaxOutputOnPost = false;
+    {
+      const provider = providerPresetOfBaseUrl(baseUrl ?? current.baseUrl);
+      const clamped = clampLimits(
+        {
+          ...(maxInputTokens !== undefined ? { maxInputTokens } : {}),
+          ...(maxOutputTokens !== undefined ? { maxOutputTokens } : {}),
+        },
+        provider,
+      );
+      maxInputTokens = clamped.maxInputTokens;
+      maxOutputTokens = clamped.maxOutputTokens;
+      clampedMaxInputOnPost = clamped.clampedMaxInput;
+      clampedMaxOutputOnPost = clamped.clampedMaxOutput;
+    }
     const rawPermission = record.permission;
     let permission: PermissionPreset | undefined;
     if (rawPermission !== undefined) {
@@ -3191,6 +3281,11 @@ export function createDevmateServer(deps: DevmateServerDeps): DevmateServer {
       methodFirst?: boolean;
       reviewMode?: boolean;
     } = {};
+    // 端点/模型/密钥变更 → E7 上限学习清空（旧供应商「由错误学习」的真值对新端点无意义；
+    // 端点未变（纯上限/补丁类 POST）→ 学习保留——它是该供应商的稳定真值）。
+    if (baseUrl !== undefined || model !== undefined || apiKey !== undefined) {
+      learnedLimitCaps = {};
+    }
     if (baseUrl !== undefined) current.baseUrl = baseUrl;
     // 模型名保存即净化（用户实测残留根除）：POST 的 `[N]m/k` 尾标剥离后才应用/持久化/
     // 重探——config 持久化与 GET/下次 run 消费且恒净化名。本编辑器值已换新（用户重新
@@ -3218,10 +3313,12 @@ export function createDevmateServer(deps: DevmateServerDeps): DevmateServer {
     }
     if (maxInputTokens !== undefined) {
       current.maxInputTokens = maxInputTokens;
+      current.maxInputTokensClamped = clampedMaxInputOnPost; // 触碰即更新标记（未钳 → 清位）
       touched.maxInputTokens = true;
     }
     if (maxOutputTokens !== undefined) {
       current.maxOutputTokens = maxOutputTokens;
+      current.maxOutputTokensClamped = clampedMaxOutputOnPost;
       touched.maxOutputTokens = true;
     }
     if (permission !== undefined) {
@@ -3387,7 +3484,9 @@ export function createDevmateServer(deps: DevmateServerDeps): DevmateServer {
           sendJson(
             res,
             err.status,
-            err.code !== undefined ? { error: err.message, code: err.code } : { error: err.message },
+            err.code !== undefined
+              ? { error: err.message, code: err.code }
+              : { error: err.message },
           );
           return;
         }

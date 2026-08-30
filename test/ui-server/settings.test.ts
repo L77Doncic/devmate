@@ -16,6 +16,7 @@ import { defineRegistry } from '../../src/core/loop/index.js';
 import type { DevmateServer } from '../../src/ui/server/index.js';
 import { MemorySessionAdapter } from '../../src/core/session/index.js';
 import type { DevmateServerDeps } from '../../src/ui/server/index.js';
+import { buildRequest, PROVIDER_PRESETS } from '../../src/core/llm/index.js';
 import { echoTool, FakeLlm, runCommandTool } from '../loop/support.js';
 import { postJson, SseClient, startServer, waitForFrames } from './support.js';
 
@@ -23,7 +24,7 @@ const RAW_KEY = 'sk-1234567890abcdef';
 /** B 档：POST 必填上限对（测试共用值；断言只用存在性/数字等同——见各用例）。 */
 const TEST_TOKENS = { maxInputTokens: 4096, maxOutputTokens: 2048 };
 const DEFAULT_OUTPUT_TOKENS = 8192; // DEFAULT_MAX_TOKENS（core/loop/types）
-const DEFAULT_PRESET_WINDOW = 128_000; // deepseek preset 估算（输入上限缺省回填）
+const DEFAULT_PRESET_WINDOW = 1_000_000; // deepseek preset 窗口（实测过 1M；输入上限缺省回填，ADR-0016）
 
 function baseDeps(llm: FakeLlm): DevmateServerDeps {
   return {
@@ -562,6 +563,133 @@ describe('ui/server：settings 输入/输出上限（A/B 档必填）', () => {
     expect(got.maxInputTokens).toBe(1111);
     expect(got.maxOutputTokens).toBe(2222);
     expect(got.maxOutputTokensDefault).toBeUndefined();
+  });
+
+  it('b7) S 档输出钳制：POST 1000000（deepseek）→ 回执 393216 + maxOutputTokensClamped；钳制值持久化；后续 run 发钳后值', async () => {
+    const fake = new FakeLlm([
+      { content: 'a' },
+      { content: 'b', usage: { promptTokens: 1, completionTokens: 1, totalTokens: 2 } },
+    ]);
+    const persisted: Array<Record<string, unknown>> = [];
+    const { base, server } = await startServer({
+      ...baseDeps(fake),
+      persistSettings: (s: unknown) => {
+        persisted.push(JSON.parse(JSON.stringify(s)) as Record<string, unknown>);
+      },
+    });
+    servers.push(server);
+
+    const res = await postJson(base, '/api/settings', {
+      maxInputTokens: 4096,
+      maxOutputTokens: 1_000_000,
+    });
+    expect(res.status).toBe(200);
+    const saved = (await res.json()) as Record<string, unknown>;
+    expect(saved.maxOutputTokens).toBe(393_216); // 实测 valid-range 上界
+    expect(saved.maxOutputTokensClamped).toBe(true);
+    expect(saved.maxInputTokensClamped).toBeUndefined();
+    // 钳制值持久化（存的是钳后值——保存的即生效值）
+    expect(persisted[persisted.length - 1]!).toMatchObject({ maxOutputTokens: 393_216 });
+
+    const got = (await (await fetch(new URL('/api/settings', base))).json()) as Record<
+      string,
+      unknown
+    >;
+    expect(got.maxOutputTokens).toBe(393_216);
+    expect(got.maxOutputTokensClamped).toBe(true);
+
+    // 后续 run：runOptions.maxTokens = 钳后值（FakeLlm 停留在 ChatRequest 层）
+    const created = (await (await postJson(base, '/api/chat', { text: 'hi' })).json()) as {
+      sessionId: string;
+    };
+    const client = await SseClient.connect(base, created.sessionId);
+    clients.push(client);
+    await waitForFrames(client, 5, 10_000);
+    expect(fake.requests[0]!.maxTokens).toBe(393_216);
+
+    // 再保存非钳制值 → 标记随之清除（标记为触碰语义）
+    const again = await postJson(base, '/api/settings', {
+      maxInputTokens: 4096,
+      maxOutputTokens: 6480,
+    });
+    const savedAgain = (await again.json()) as Record<string, unknown>;
+    expect(savedAgain.maxOutputTokens).toBe(6480);
+    expect(savedAgain.maxOutputTokensClamped).toBeUndefined();
+  });
+
+  it('b8) S 档输入钳制：POST 2000000（deepseek 窗口 1M）→ 1000000 + maxInputTokensClamped；持久化钳后值', async () => {
+    const persisted: Array<Record<string, unknown>> = [];
+    const { base, server } = await startServer({
+      ...baseDeps(new FakeLlm([{ content: 'x' }])),
+      persistSettings: (s: unknown) => {
+        persisted.push(JSON.parse(JSON.stringify(s)) as Record<string, unknown>);
+      },
+    });
+    servers.push(server);
+
+    const res = await postJson(base, '/api/settings', {
+      maxInputTokens: 2_000_000,
+      maxOutputTokens: 2048,
+    });
+    const saved = (await res.json()) as Record<string, unknown>;
+    expect(saved.maxInputTokens).toBe(1_000_000);
+    expect(saved.maxInputTokensClamped).toBe(true);
+    expect(persisted[persisted.length - 1]!).toMatchObject({ maxInputTokens: 1_000_000 });
+  });
+
+  it('b9) 无据供应商不钳：dashscope/openai 无 maxOutputTokens → 输出超值保留、标记缺席；输入仍窗口钳', async () => {
+    const { base, server } = await startServer(baseDeps(new FakeLlm([{ content: 'x' }])));
+    servers.push(server);
+
+    const dash = await postJson(base, '/api/settings', {
+      baseUrl: 'https://dashscope.aliyuncs.com/compatible-mode/v1',
+      model: 'qwen3-coder-plus',
+      maxInputTokens: 500_000,
+      maxOutputTokens: 500_000,
+    });
+    const savedDash = (await dash.json()) as Record<string, unknown>;
+    expect(savedDash.maxOutputTokens).toBe(500_000); // 无据不钳（待实测）
+    expect(savedDash.maxOutputTokensClamped).toBeUndefined();
+    expect(savedDash.maxInputTokens).toBe(128_000); // 窗口 128000（估算）照钳
+    expect(savedDash.maxInputTokensClamped).toBe(true);
+  });
+
+  it('e2e 补审计缺口：settings 输出 64 → wire body.max_tokens=64（deepseek 无 max_input_tokens/无 max_completion_tokens）', async () => {
+    // 录制 adapter：把 ChatRequest 经真实 preset 序列化为 wire（body 字节口径），
+    // 再按 FakeLlm 出流——settings → run → adapter → wire 全链一口径。
+    const recorded: Record<string, unknown>[] = [];
+    const fake = new FakeLlm([{ content: 'ok' }]);
+    const { base, server } = await startServer({
+      ...baseDeps(fake),
+      createLlm: () => ({
+        async *chat(request, signal) {
+          const wire = buildRequest(request, PROVIDER_PRESETS.deepseek);
+          recorded.push(JSON.parse(JSON.stringify(wire.body)));
+          yield* fake.chat(request, signal);
+        },
+      }),
+    });
+    servers.push(server);
+
+    await postJson(base, '/api/settings', {
+      baseUrl: PROVIDER_PRESETS.deepseek.baseUrl,
+      model: PROVIDER_PRESETS.deepseek.defaultModel,
+      maxInputTokens: 8192,
+      maxOutputTokens: 64,
+    });
+    const created = (await (await postJson(base, '/api/chat', { text: 'hi' })).json()) as {
+      sessionId: string;
+    };
+    const client = await SseClient.connect(base, created.sessionId);
+    clients.push(client);
+    await waitForFrames(client, 5, 10_000);
+
+    expect(recorded).toHaveLength(1);
+    const body = recorded[0]!;
+    expect(body.model).toBe('deepseek-v4-flash');
+    expect(body.max_tokens).toBe(64);
+    expect('max_completion_tokens' in body).toBe(false);
+    expect('max_input_tokens' in body).toBe(false); // 仅 DashScope/Qwen 白名单
   });
 });
 

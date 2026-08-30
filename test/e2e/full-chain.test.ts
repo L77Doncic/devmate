@@ -881,7 +881,7 @@ describe('E2E-F：CLI web 设置读回（permission/reasoning/windowTokens）', 
       expect(settings2).toMatchObject({
         reasoning: 'medium',
         permission: 'workspace-write',
-        window: 128_000, // deepseek preset contextWindowTokens 估算（settings 未覆盖）
+        window: 1_000_000, // deepseek preset contextWindowTokens（实测过 1M，ADR-0016；settings 未覆盖）
       });
       await second.close();
     } finally {
@@ -907,7 +907,7 @@ describe('E2E-G：模型名尾标注全链净化（GET/POST 净化名 + 窗口�
     deps = await assembleDeps({
       workspaceRoot: dir,
       sessionsDir: join(dir, 'sessions'),
-      // B 档：模型名带尾标注 —— 全链净化（无 apiKey → 无网关探测；窗口 = preset 128000）
+      // B 档：模型名带尾标注 —— 全链净化（无 apiKey → 无网关探测；窗口 = preset 1000000）
       model: 'deepseek-v4-flash[128k]',
     });
     deps.llm = fake;
@@ -920,16 +920,16 @@ describe('E2E-G：模型名尾标注全链净化（GET/POST 净化名 + 窗口�
     await rm(dir, { recursive: true, force: true });
   });
 
-  it('G1) GET 净化名 + window=128000（preset 兜底）；chat 全链完成（run/引擎侧恒净化名）', async () => {
+  it('G1) GET 净化名 + window=1000000（preset 兜底）；chat 全链完成（run/引擎侧恒净化名）', async () => {
     const base = handle!.base;
-    // 取窗：无显式覆盖 / 无网关探测（未注入 apiKey）→ preset 128000 兜底；
+    // 取窗：无显式覆盖 / 无网关探测（未注入 apiKey）→ preset 1000000 兜底；
     // 模型名：GET 恒净化名（存量尾标净化显示——不再含 [N]m/k）
     const settings = (await (await fetch(new URL('/api/settings', base))).json()) as {
       window?: number;
       model: string;
       modelSanitized?: boolean;
     };
-    expect(settings.window).toBe(128_000);
+    expect(settings.window).toBe(1_000_000);
     expect(settings.model).toBe('deepseek-v4-flash');
     expect(settings.model).not.toMatch(/\[(?:[0-9.]+)(?:[km])/i);
     expect(settings.modelSanitized).toBe(true); // 存量尾标已自动校正（前端提示前提）

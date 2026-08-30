@@ -853,6 +853,7 @@
                   （档位由模型固有上下文决定）。
                 </p>
                 <p class="field-help err" id="set-max-input-tokens-err" hidden></p>
+                <p class="field-help warn" id="set-max-input-tokens-hint" hidden></p>
               </div>
               <div class="field-group">
                 <label for="set-max-output-tokens"
@@ -869,9 +870,11 @@
                 />
                 <p class="field-help">
                   请求侧单请求输出上限（max_tokens），必填正整数；未设置时按缺省 8192
-                  （DEFAULT_MAX_TOKENS）回填。
+                  （DEFAULT_MAX_TOKENS）回填。超过模型上限的值保存时按供应商上限钳制
+                  （提示「已按上限钳制为 N」）。
                 </p>
                 <p class="field-help err" id="set-max-output-tokens-err" hidden></p>
+                <p class="field-help warn" id="set-max-output-tokens-hint" hidden></p>
               </div>
               <div class="field-group">
                 <label for="set-key">API Key</label>

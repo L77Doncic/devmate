@@ -699,3 +699,47 @@ describe('A/B 档：normalizeTokenLimit / tokenLimitError（必填校验判据�
     expect(sanitizeModel('')).toBe('');
   });
 });
+
+describe('S 档钳制标记（ADR-0016）：normalize clamped 键 + softLimitHint 软提示', () => {
+  it('服务端 clamped 键 → 透传（前端「已按上限钳制为 N」提示依据）；无键 → false', async () => {
+    const res = await loadSettings({
+      fetchImpl: asFetch(async () =>
+        okResponse({
+          baseUrl: 'https://x',
+          model: 'deepseek-v4-flash',
+          maxInputTokens: 1000000,
+          maxOutputTokens: 393216,
+          maxInputTokensClamped: true,
+          maxOutputTokensClamped: true,
+        }),
+      ),
+    });
+    expect(res.maxInputTokens).toBe(1000000);
+    expect(res.maxOutputTokens).toBe(393216);
+    expect(res.maxInputTokensClamped).toBe(true);
+    expect(res.maxOutputTokensClamped).toBe(true);
+    const clean = await loadSettings({
+      fetchImpl: asFetch(async () =>
+        okResponse({ baseUrl: 'https://x', model: 'm', maxInputTokens: 1, maxOutputTokens: 2 }),
+      ),
+    });
+    expect(clean.maxInputTokensClamped).toBe(false);
+    expect(clean.maxOutputTokensClamped).toBe(false);
+  });
+
+  it('softLimitHint：窗口值比较发出软提示（不阻止保存——服务端钳制兜底）；窗口未知/值合法 → 空', async () => {
+    const { softLimitHint } = await import('../../src/ui/web/settings.js');
+    // 输入 > 窗口 → 红字软提示（含窗口值）
+    expect(softLimitHint('2000000', 1000000, '输入上限')).toContain('超过窗口预算 1000000');
+    // 窗口未知（null/缺省）→ 不提示（估算模式）
+    expect(softLimitHint('2000000', null, '输入上限')).toBe('');
+    expect(softLimitHint('2000000', undefined, '输入上限')).toBe('');
+    // ≤ 窗口 → 不提示
+    expect(softLimitHint('1000000', 1000000, '输入上限')).toBe('');
+    expect(softLimitHint('8192', null, '输出上限')).toBe('');
+    // 非法/空值 → 不提示（硬校验另负责）
+    expect(softLimitHint('', 1000000, '输出上限')).toBe('');
+    expect(softLimitHint('abc', 1000000, '输出上限')).toBe('');
+    expect(softLimitHint('0', 1000000, '输出上限')).toBe('');
+  });
+});

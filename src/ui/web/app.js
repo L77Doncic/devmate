@@ -57,6 +57,7 @@ import {
   normalizeReviewMode,
   saveReviewMode,
   tokenLimitError,
+  softLimitHint,
 } from './settings.js';
 import {
   PERMISSION_VALUES,
@@ -478,6 +479,9 @@ const el = {
   setMaxOutputTokens: document.getElementById('set-max-output-tokens'),
   setMaxInputTokensErr: document.getElementById('set-max-input-tokens-err'),
   setMaxOutputTokensErr: document.getElementById('set-max-output-tokens-err'),
+  // S 档软提示（ADR-0016）：窗口预算越限红字软提示 / 钳制注记（不阻止保存）
+  setMaxInputTokensHint: document.getElementById('set-max-input-tokens-hint'),
+  setMaxOutputTokensHint: document.getElementById('set-max-output-tokens-hint'),
   btnSaveSettings: document.getElementById('btn-save-settings'),
   setWorkspace: document.getElementById('set-workspace'),
   keyState: document.getElementById('key-state'),
@@ -4177,6 +4181,16 @@ function syncTokenLimitValidity() {
   const outErr = tokenLimitError(el.setMaxOutputTokens.value, '输出上限');
   showFieldError(el.setMaxInputTokensErr, inErr);
   showFieldError(el.setMaxOutputTokensErr, outErr);
+  // S 档软提示（ADR-0016）：值 > 窗口预算 → 红字软提示（**不阻止保存**——服务端钳制兜底；
+  // 硬校验（必填/非正）继续扣保存钮）
+  showFieldError(
+    el.setMaxInputTokensHint,
+    softLimitHint(el.setMaxInputTokens.value, ui.settings.windowTokens, '输入上限'),
+  );
+  showFieldError(
+    el.setMaxOutputTokensHint,
+    softLimitHint(el.setMaxOutputTokens.value, ui.settings.windowTokens, '输出上限'),
+  );
   const valid = inErr === '' && outErr === '';
   el.btnSaveSettings.disabled = !valid;
   return valid;
@@ -4218,7 +4232,20 @@ async function saveSettingsForm() {
     el.settingsStatus.textContent = '✓ 已保存';
     el.settingsStatus.className = 'drawer-status';
     fillSettingsForm();
-    toast('设置已保存');
+    // S 档钳制提示（ADR-0016）：保存响应 clamped → toast 「已按 <model> 上限钳制为 N」
+    // （回显已套钳后值——保存即生效，不静默）
+    const clampedNotes = [];
+    if (saved.maxOutputTokensClamped === true) {
+      clampedNotes.push(`输出上限钳制为 ${saved.maxOutputTokens}`);
+    }
+    if (saved.maxInputTokensClamped === true) {
+      clampedNotes.push(`输入上限钳制为 ${saved.maxInputTokens}`);
+    }
+    if (clampedNotes.length > 0) {
+      toast(`已按 ${saved.model || '模型'} 上限钳制：${clampedNotes.join('；')}`);
+    } else {
+      toast('设置已保存');
+    }
   } catch (err) {
     el.settingsStatus.textContent = `保存失败：${err instanceof Error ? err.message : String(err)}`;
     el.settingsStatus.className = 'drawer-status err';
@@ -4236,6 +4263,20 @@ function fillSettingsForm() {
   el.setMaxOutputTokens.value =
     ui.settings.maxOutputTokens !== null ? String(ui.settings.maxOutputTokens) : '';
   syncTokenLimitValidity(); // B 档：必填态随回显即算（红字/禁存随值）
+  // S 档钳制注记（ADR-0016）：GET/POST 回执 *Clamped=true → 提示「已按 <model> 上限钳制为 N」
+  //（覆盖窗口软提示——保存值即钳后值；用户再编辑则回到软提示/硬校验）
+  if (ui.settings.maxOutputTokensClamped === true) {
+    showFieldError(
+      el.setMaxOutputTokensHint,
+      `已按 ${ui.settings.model || '模型'} 上限钳制为 ${ui.settings.maxOutputTokens}（当前值）`,
+    );
+  }
+  if (ui.settings.maxInputTokensClamped === true) {
+    showFieldError(
+      el.setMaxInputTokensHint,
+      `已按 ${ui.settings.model || '模型'} 上限钳制为 ${ui.settings.maxInputTokens}（当前值）`,
+    );
+  }
   // B 档：缺省回填提示（GET 回体 *Default=true → 「已用默认，请修改保存」——不静默；
   // 保存后升格为存量，回体不再带 Default 键 → 不再提示）
   if (ui.settings.maxInputTokensDefault === true || ui.settings.maxOutputTokensDefault === true) {

@@ -10,7 +10,7 @@ import {
   attachmentErrorFor,
   attachmentsFull,
   normalizeAttachment,
-  attachmentRefValid,
+  // attachmentRefValid removed: unused
   resolveImageContent,
   imageFitSingle,
   IMAGE_TILE_DIMENSION,

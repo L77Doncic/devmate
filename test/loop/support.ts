@@ -29,6 +29,8 @@ export interface FakeScript {
   usage?: LlmUsage;
   usageMissing?: boolean;
   error?: LlmError;
+  /** 流终态 finish_reason（缺省 null；'length' 供 E8 截断提示链路）。 */
+  finishReason?: string | null;
   /** end 前等待（模拟流式挂起/中断窗口；测试用 promise gate）。 */
   gate?: Promise<void>;
 }
@@ -41,7 +43,7 @@ export function snapshotOf(script: FakeScript): StreamSnapshot {
     arguments: tc.arguments,
   }));
   return {
-    finishReason: null,
+    finishReason: script.finishReason ?? null,
     usage: script.usage ?? null,
     usageMissing: script.usageMissing ?? script.usage === undefined,
     toolCalls,

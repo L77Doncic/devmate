@@ -13,7 +13,7 @@ DevMate 是一个从零实现、零框架依赖的 TypeScript 编程智能体（
 
 ## 为什么是 DevMate？
 
-DevMate 是智能体（Agent）的「壳体」（harness）：给定一个任务，它驱动 LLM 自主循环——收集上下文 → 执行动作（文件工具、命令）→ 回注结果 → 再循环——直到任务完成或护栏命中。harness 所需的每一个机制都从零实现，并有 13 篇 ADR 记录在案：
+DevMate 是智能体（Agent）的「壳体」（harness）：给定一个任务，它驱动 LLM 自主循环——收集上下文 → 执行动作（文件工具、命令）→ 回注结果 → 再循环——直到任务完成或护栏命中。harness 所需的每一个机制都从零实现，并有 16 篇 ADR 记录在案：
 
 - **零依赖**——`dependencies: {}`。原生 `fetch`、手写 SSE 解析器、手写安全 Markdown 渲染器、零框架 Web UI。没有锁文件意外、没有供应链暴露面，Node 20 能跑的地方它就能跑。
 - **循环是自己的**——步（Step）、终止条件、熔断、错误回注、重试（Equal Jitter 退避 + `Retry-After`）、成本保险丝：全部是 `src/core/` 里可见、可测的代码。
@@ -30,7 +30,7 @@ DevMate 是智能体（Agent）的「壳体」（harness）：给定一个任务
 - **子代理工作流**——`spawn_subagent` 独立处理子任务，并行上限可配（`maxParallel` 1–4，缺省 2），设置页「Subagent」区开关；带 `skill:"code-review"` 创建时，该技能文本（上限 6000 码点，头截 + 标记）会注入子代理上下文（借鉴 Claude Code subagent `skills` 语义——审查员与主代理按同一方法论审查）。
 - **OpenAI 兼容供应商**（[`src/core/llm`](src/core/llm)）——DeepSeek（默认：`https://api.deepseek.com` / `deepseek-v4-flash`）、OpenAI、阿里云百炼 DashScope/Qwen、智谱 GLM、Kimi；每家一个适配层归一化 `reasoning` 处置、采样参数白名单、strict 默认值、finish_reason 词汇与错误体形态。
 - **图像理解（DeepSeek vision，[ADR-0015](docs/adr/0015-deepseek-vision-and-token-limits.md)）**——输入框可附加图片（服务端内容寻址附件：≤20MiB/图、每条消息 ≤20 张、单会话累计 ≤200MiB——dsh 三数；图片字节存 `<sessionsDir>/attachments/`，事件与会话文件只存 sha256 ref），`deepseek-v4-flash-vision-exp` 模型直接识别（截图文字/图表分析），请求时展开为 DeepSeek 协议的 base64 dataURL；其它供应商/模型自动降级为文本 + 说明（绝不 400）；ref 缺失/超 40MiB 同理降级（诚实路径）。token 预算含图像（每图 ≤384 token，官方上限；估算公式见 ADR-0015）。
-- **请求侧 token 上限（设置页）**——**必填**「输入上限 / 输出上限」（正整数；UI 缺值即红字 + 禁存，`POST /api/settings` 缺任一即 400 `max-input-output-required`——服务端为强制口径单点）。GET 恒返回两值：存量缺失时回填缺省（输出 `8192`=DEFAULT_MAX_TOKENS；输入=供应商 preset 估算）并带 `maxOutputTokensDefault`/`maxInputTokensDefault` 标记（前端据此提示「已用默认，请修改保存」——不静默）。输出上限映射 `max_tokens`（OpenAI/Kimi 用 `max_completion_tokens`）；输入上限只发送给白名单供应商（DashScope/Qwen 走 `max_input_tokens`——DeepSeek 官方无此参数，不发送）。
+- **请求侧 token 上限（设置页）**——**必填**「输入上限 / 输出上限」（正整数；UI 缺值即红字 + 禁存，`POST /api/settings` 缺任一即 400 `max-input-output-required`——服务端为强制口径单点）。GET 恒返回两值：存量缺失时回填缺省（输出 `8192`=DEFAULT_MAX_TOKENS；输入=供应商 preset 估算）并带 `maxOutputTokensDefault`/`maxInputTokensDefault` 标记（前端据此提示「已用默认，请修改保存」——不静默）。输出上限映射 `max_tokens`（OpenAI/Kimi 用 `max_completion_tokens`）；输入上限只发送给白名单供应商（DashScope/Qwen 走 `max_input_tokens`——DeepSeek 官方无此参数，不发送）。**钳制（ADR-0016）**——超过供应商上限的值在保存时钳制（`clampLimits`，preset 驱动：输出上限 DeepSeek `393216`——实测 valid-range、Kimi/GLM `131072`；DashScope/OpenAI 无据 → 不钳），持久化钳后值并回执 `maxOutputTokensClamped`/`maxInputTokensClamped`（UI 提示「已按 <model> 上限钳制为 N」）。输入上限同时是**预算上限**：投影窗口预算 = `min(三源窗口, maxInputTokens)`（输入上限双语义：DashScope wire 字段 + 本地预算上限）。适配层 wire 级再核（`buildRequest` 已知上限绝不 400）；运行时 400（上下文超窗 / `valid range of max_tokens`）**自愈不 fatal**：`classifyContextError` 升级压缩（forceLevel 0→1→2，每轮 ≤2 次重试、跨轮重置）后重试同轮；解析出的上限（`[1, N]`）被学习用于窗口钳制并在 `windowDetail` 报「由错误学习」（见 ADR-0016）。
 - **提示词工程**（[`src/ui/server/deps.ts`](src/ui/server/deps.ts)）——预算感知的系统提示合成（锚定词：界内动 / 小步闭环 / 失败是普通消息）+ 技能清单节 + 子代理节，按供应商分离处理而不是堆进一段长文。
 - **原生 Web UI**（[`src/ui/web`](src/ui/web)）——零框架 HTML/CSS/ES Modules、无构建步骤；双主题（浅色 GitHub / 深色 GitHub token 体系）、按工作区分组侧栏、12 条 `/` 命令、思考强度 pill（关闭/低/中/高）、上下文占用环、运行状态条、压缩披露小记。
 - **上下文工程**（[`src/core/context`](src/core/context)）——只作用于投影的上下文管理：工具输出截断（保头尾 + 省略标记）、工具结果裁剪 + 占位符、对话摘要 + 防抖、token 预算估算 + 服务端 usage 校准。
@@ -169,19 +169,25 @@ CLI 一览：
 
 UI 的所有动作都走这些端点（`src/ui/server/index.ts`）：
 
-| 方法                  | 路径                                                 | 用途                                                                                                                                                             |
-| --------------------- | ---------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `GET`                 | `/api/stream?sessionId=…`                            | SSE 帧流：`session-user`、`assistant-delta`、`assistant-done`、`tool-start`、`tool-result`、`approval-request`、`usage`、`run-status`、`run-error`、`compaction` |
-| `POST`                | `/api/chat`                                          | 发消息 / 启动（或续跑）一轮 run；可选 `images: [{url,width?,height?}]`（dataURL，≤6 张）；返回 `{sessionId}`（回显 `session-user` 帧携带同形 `images`）                                                                                                              |
-| `POST`                | `/api/approval`                                      | 应答待处理审批（`approve` / `deny` + 可选理由）                                                                                                                  |
-| `POST`                | `/api/interrupt`                                     | 中断运行中的智能体（终态 `run-status` 仍经流到达）                                                                                                               |
-| `GET`/`POST`          | `/api/settings`                                                        | 读返回 `{baseUrl, model, reasoning, apiKey?（掩码）, window?, maxInputTokens, maxOutputTokens, maxInputTokensDefault?, maxOutputTokensDefault?}`（`model` 恒净化名——无 `[N]m/k` UI 尾标；上限恒回显，缺失回填缺省+Default 标记）；写**必填** `{baseUrl, model, maxInputTokens, maxOutputTokens}` + 可选 `{apiKey?, reasoning?, windowTokens?, permission?, methodFirst?, reviewMode?}` —— 密钥只回掩码；上限缺失 → 400 `max-input-output-required` |
-| `GET`/`POST`/`DELETE` | `/api/sessions`、`/api/sessions/:id`                 | 会话列表（每项含 `workspaceRoot`）、历史回放（≤ 500 帧）、新建、删除（活跃时 409）                                                                               |
-| `GET`                 | `/api/stats`                                         | 进程统计：`{rssMb, heapMb, sessions, activeShells, mcpServers, mcpTools, queuedSubagents, memoryGuard}`                                                          |
-| `GET`                 | `/api/tools`                                         | 模型可见的实时工具定义                                                                                                                                           |
-| `GET`                 | `/api/skills` · `POST /api/skills/:id`               | 技能清单与启用开关                                                                                                                                               |
-| `GET`                 | `/api/mcp` · `POST /api/mcp` · `POST /api/mcp/:name` | MCP 服务器清单 / 登记（`name`+`command`+`args`）/ 开关                                                                                                           |
-| `GET`/`POST`          | `/api/workflow`                                      | 子代理配置：`{subagentsEnabled, maxParallel}`                                                                                                                    |
+| 方法                     | 路径                                 | 用途                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                     |
+| ------------------------ | ------------------------------------ | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `GET`                    | `/api/stream?sessionId=…`            | SSE 帧流：`session-user`、`assistant-delta`、`assistant-done`、`tool-start`、`tool-result`、`approval-request`、`usage`、`run-status`、`run-error`、`compaction`                                                                                                                                                                                                                                                                                                                                                                         |
+| `POST`                   | `/api/chat`                          | 发消息 / 启动（或续跑）一轮 run；可选 `images: [{url,width?,height?}]`（dataURL，≤6 张）；返回 `{sessionId}`（回显 `session-user` 帧携带同形 `images`）                                                                                                                                                                                                                                                                                                                                                                                  |
+| `POST`                   | `/api/approval`                      | 应答待处理审批（`approve` / `deny` + 可选理由）                                                                                                                                                                                                                                                                                                                                                                                                                                                                                          |
+| `POST`                   | `/api/interrupt`                     | 中断运行中的智能体（终态 `run-status` 仍经流到达）                                                                                                                                                                                                                                                                                                                                                                                                                                                                                       |
+| <<<<<<< Updated upstream |
+| `GET`/`POST`             | `/api/settings`                      | 读返回 `{baseUrl, model, reasoning, apiKey?（掩码）, window?, maxInputTokens, maxOutputTokens, maxInputTokensDefault?, maxOutputTokensDefault?, maxInputTokensClamped?, maxOutputTokensClamped?}`（`model` 恒净化名——无 `[N]m/k` UI 尾标；上限恒回显，缺失回填缺省+Default 标记；`*Clamped` = 保存值被钳到供应商上限）；写**必填** `{baseUrl, model, maxInputTokens, maxOutputTokens}` + 可选 `{apiKey?, reasoning?, windowTokens?, permission?, methodFirst?, reviewMode?}` —— 密钥只回掩码；上限缺失 → 400 `max-input-output-required` |
+| `GET`/`POST`/`DELETE`    | `/api/sessions`、`/api/sessions/:id` | 会话列表（每项含 `workspaceRoot`）、历史回放（≤ 500 帧）、新建、删除（活跃时 409）                                                                                                                                                                                                                                                                                                                                                                                                                                                       |
+| =======                  |
+| `GET`/`POST`             | `/api/settings`                      | 读写 `{baseUrl, model, apiKey?, reasoning, window?}`——窗口经 `windowTokens` 写入；密钥只回显掩码                                                                                                                                                                                                                                                                                                                                                                                                                                         |
+| `GET`/`POST`/`DELETE`    | `/api/sessions`、`/api/sessions/:id` | 会话列表（按 `workspaceRoot` 归组）、历史回放（≤ 500 帧）、新建、删除（活跃时 409）                                                                                                                                                                                                                                                                                                                                                                                                                                                      |
+
+> > > > > > > Stashed changes
+> > > > > > > | `GET` | `/api/stats` | 进程统计：`{rssMb, heapMb, sessions, activeShells, mcpServers, mcpTools, queuedSubagents, memoryGuard}` |
+> > > > > > > | `GET` | `/api/tools` | 模型可见的实时工具定义 |
+> > > > > > > | `GET` | `/api/skills` · `POST /api/skills/:id` | 技能清单与启用开关 |
+> > > > > > > | `GET` | `/api/mcp` · `POST /api/mcp` · `POST /api/mcp/:name` | MCP 服务器清单 / 登记（`name`+`command`+`args`）/ 开关 |
+> > > > > > > | `GET`/`POST` | `/api/workflow` | 子代理配置：`{subagentsEnabled, maxParallel}` |
 
 ## 安全模型
 
@@ -231,7 +237,7 @@ npm run build          # tsc + 复制静态 Web 资产 + 打包技能到 dist/
 | `src/core/mcp`     | stdio JSON-RPC MCP 客户端与注册表              |
 | `src/ui/server`    | HTTP 服务、SSE broker、审批器、设置与工具端点  |
 | `src/ui/web`       | 零框架浏览器应用（原样随包发布）               |
-| `docs/adr/`        | 13 篇架构决策记录                              |
+| `docs/adr/`        | 16 篇架构决策记录                              |
 | `CONTEXT.md`       | 领域术语与规则（单一事实来源）                 |
 
 ## 常见问题
@@ -258,7 +264,7 @@ npm run build          # tsc + 复制静态 Web 资产 + 打包技能到 dist/
 
 - [README.md](README.md) — English version
 - [CONTEXT.md](CONTEXT.md) — 领域术语与规则（中文，单一事实来源）
-- [docs/adr](docs/adr) — 13 篇架构决策记录
+- [docs/adr](docs/adr) — 16 篇架构决策记录
 - [src/ui/web/README-UI.md](src/ui/web/README-UI.md) — UI 工程笔记（协议、安全约束）
 
 MIT © [DevMate contributors](LICENSE)。Web UI 视觉设计（主题 token / 组件几何）复刻自

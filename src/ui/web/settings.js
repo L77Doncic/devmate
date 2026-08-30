@@ -3,13 +3,16 @@
  *
  * 协议（S12/C 档 + A/B 档修正 2026-08-30）：GET /api/settings → {baseUrl, model,
  * apiKey?: string|null, reasoning?, window?, maxInputTokens, maxOutputTokens,
- * maxInputTokensDefault?, maxOutputTokensDefault?, permission?, permissionConfirmedAt?,
- * methodFirst?, reviewMode?}（apiKey **掩码**，服务端永不回明文；model **恒净化名**
+ * maxInputTokensDefault?, maxOutputTokensDefault?, maxInputTokensClamped?,
+ * maxOutputTokensClamped?, permission?, permissionConfirmedAt?, methodFirst?, reviewMode?}
+ * （apiKey **掩码**，服务端永不回明文；model **恒净化名**
  * ——UI 标记后缀 `[N]m/k` 全链剥离（存量残留 → modelAutoCorrected 供「已自动校正」提示）；
  * reasoning = off/low/medium/high 缺省 medium；window = 上下文窗口覆盖，未配置 → 缺省
  * 不带键 = 估算模式；maxInputTokens/maxOutputTokens **恒回显**（B 档必填——存量缺失回填
  * 缺省：输出 8192=DEFAULT_MAX_TOKENS、输入=供应商 preset，并挂 `*Default=true` 提示键
- * 「已用默认，请修改保存」——不静默）；permission = read-only/workspace-write/full-access
+ * 「已用默认，请修改保存」——不静默；S 档钳制（ADR-0016）：保存值 > 供应商上限被钳
+ * → 回执 `*Clamped=true`（「已按 <model> 上限钳制为 N」——保存即套用钳后值）；
+ * permission = read-only/workspace-write/full-access
  * 缺省 workspace-write —— 枚举/标签/风险门的单一权威源 = permissions.js；
  * permissionConfirmedAt = full-access 风险确认记录（epoch ms），无记录不带键；
  * methodFirst/reviewMode = 前置门/评审哨兵开关，缺省 true）。
@@ -112,6 +115,23 @@ export function tokenLimitError(value, label = '输入/输出上限') {
   if (!/^[0-9]+$/.test(raw)) return `${label}必须是正整数`;
   const n = Number(raw);
   if (!Number.isSafeInteger(n) || n < 1) return `${label}必须是正整数`;
+  return '';
+}
+
+/**
+ * 上限软提示（S 档 · ADR-0016）：值 > 窗口预算（settings.window——三源取窗回显值）→
+ * 红字软提示（**不阻止保存**——由服务端钳制兜底：clampLimits 之后回执 clamped 键）；
+ * 窗口未知（null/缺省估算模式）/ 值合法 / 值非法 → `''`（硬校验另负责必填/非正）。
+ */
+export function softLimitHint(value, windowTokens, label = '输入上限') {
+  if (windowTokens === null || typeof windowTokens !== 'number') return '';
+  const raw = String(value ?? '').trim();
+  if (!/^[0-9]+$/.test(raw)) return '';
+  const n = Number(raw);
+  if (!Number.isSafeInteger(n) || n < 1) return '';
+  if (n > windowTokens) {
+    return `${label}超过窗口预算 ${windowTokens}，保存后将被供应商上限钳制（本地不拦，由服务端兜底）`;
+  }
   return '';
 }
 
@@ -232,6 +252,10 @@ function normalize(json) {
     maxOutputTokens: normalizeTokenLimit(j.maxOutputTokens),
     maxInputTokensDefault: j.maxInputTokensDefault === true && j.maxInputTokens !== undefined,
     maxOutputTokensDefault: j.maxOutputTokensDefault === true && j.maxOutputTokens !== undefined,
+    // S 档钳制标记（ADR-0016）：服务端 POST/GET 回执 clamped 键（保存值 > 供应商上限被钳）→
+    // 透传（前端「已按 <model> 上限钳制为 N」提示依据）；无键 → false。
+    maxInputTokensClamped: j.maxInputTokensClamped === true && j.maxInputTokens !== undefined,
+    maxOutputTokensClamped: j.maxOutputTokensClamped === true && j.maxOutputTokens !== undefined,
     // 权限预设（缺省 workspace-write；枚举/标签权威 = permissions.js）与风险确认记录
     // （无记录 → null —— 前端只在 full-access 且已确认时跳过风险门）
     permission: normalizePermission(j.permission),

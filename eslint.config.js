@@ -41,6 +41,7 @@ export default tseslint.config(
         ReadableStream: 'readonly',
         Node: 'readonly',
         Element: 'readonly',
+        crypto: 'readonly',
         FileReader: 'readonly',
         Image: 'readonly',
       },

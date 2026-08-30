@@ -22,6 +22,8 @@ const openai: ProviderPreset = {
   reasoningParam: 'reasoning_effort',
   // 估算（research 未能核实一手数字；「估算，可在设置覆盖」——settings.windowTokens 优先）
   contextWindowTokens: 128_000,
+  // 输出上限：模型各异（o 系列/gpt 系列差异大）无单值上限 → 无键不钳（运行时 400 →
+  // 钳制重试链兜底，ADR-0016；绝不本地猜数）。
   // §1.3 表/§5.2 行 6：Chat Completions 缺省即 false（Responses 才会自动严格化）→ 不注入（缺省即 false）
   strictDefault: false,
   allowedToolChoices: ['none', 'auto', 'required', 'named'],
@@ -38,11 +40,18 @@ const deepseek: ProviderPreset = {
   fixedSamplingParams: [],
   // C 档思考强度：DeepSeek 走 thinking（enabled + budget_tokens 1024/4096/16384；off 显式 disabled）
   reasoningParam: 'thinking',
-  // 估算（research 标注「未能核实」——给保守可调值：128k；「估算，可在设置覆盖」）
-  // V3.x 代际公开 128K，未经实测页核实（settings.windowTokens 优先）
-  // （2026-08-30 现场取证：DeepSeek /models 实测仅 {id, object, owned_by} 无窗口字段
-  //  ——预设为估算，非实测；窗口来源=显式覆盖/网关探测/preset（模型名标注层已取消，2026-08-30 用户裁定）。）
-  contextWindowTokens: 128_000,
+  // 窗口 1_000_000（ADR-0016 上限表，2026-08-30 定稿）：供应链「上下文 1M」
+  // （pricing 功能表，deepseek-vision.md §9）+ dsh 默认互证（DEFAULT_CONTEXT_WINDOW=1_000_000）
+  // + 用户模型名 `[1m]` 尾标语义；**本代理实测过 1M 代际请求**（输出 393217 → 400 输出区间
+  // 而 393216 → 200——上下文 1M 带 384K 输出是主默认实现一致口径）。
+  // 注：（2026-08-30 现场取证：DeepSeek /models 实测仅 {id, object, owned_by} 无窗口字段——
+  // 本值非 /models 探测而来；窗口来源=显式覆盖/网关探测/preset。）
+  contextWindowTokens: 1_000_000,
+  // 输出上限 393_216（2026-08-30 真实 API 实测："valid range of max_tokens is [1, 393216]"；
+  // 393217 → 400 invalid、393216 → 200；= 384K，与 pricing 页「输出最大 384K」一致）。
+  // 设置层（clampLimits）与适配层（S5 护栏）共用的钳制值——供应商是拒绝而非 clamp，
+  // 本地超限前先钳（绝不 400）。
+  maxOutputTokens: 393_216,
   // §1.6：思考模式默认 enabled；temperature/top_p 静默无效 → 思考时剔除。
   // penalties 在 §1.6 同被忽略，但 ChatRequest 无其载体（死数据不入剔除集）
   thinkingEnabled: true,
@@ -74,6 +83,8 @@ const dashscope: ProviderPreset = {
   // C 档：reasoningParam 未核实（无据）→ 保守 off（任何思考强度都不下发）
   // 估算（Qwen 系列 128k；「估算，可在设置覆盖」——settings.windowTokens 优先）
   contextWindowTokens: 128_000,
+  // 输出上限：qwen3-coder 系上限未核实（无一手证据）→ 无键不钳（「待实测」——运行时
+  // 超限 400 → 钳制重试链兜底，ADR-0016；绝不本地猜数）。
   // §1.3 表/§5.2 行 6：DashScope/Qwen 未提供 strict 字段（strictDefault 缺省即 undefined）
   maxTokensField: 'max_tokens',
   // A 档 max_input_tokens 白名单：仅 DashScope/Qwen 支持（笔记 §1，走 extra_body；
@@ -107,6 +118,8 @@ const glm: ProviderPreset = {
   // C 档：reasoningParam 未核实（无据）→ 保守 off（任何思考强度都不下发）
   // 估算（GLM 128k；「估算，可在设置覆盖」——settings.windowTokens 优先）
   contextWindowTokens: 128_000,
+  // 输出上限 131_072（API-SPEC §5.2 行 2 一手表：schema 上限 131072；钳制用）。
+  maxOutputTokens: 131_072,
   // §5.2 行 4：参考文档仅支持 auto；其余值在适配层即抛错，不发不可核实字段
   allowedToolChoices: ['auto'],
   // §3.3：clear_thinking 默认 true=清除历史轮 reasoning_content；Preserved 需显式 false
@@ -143,6 +156,9 @@ const kimi: ProviderPreset = {
   // C 档：reasoningParam 未核实（无据）→ 保守 off（任何思考强度都不下发）
   // 估算（Kimi 128k；「估算，可在设置覆盖」——settings.windowTokens 优先）
   contextWindowTokens: 128_000,
+  // 输出上限 131_072（API-SPEC §5.2 行 2 一手表：max_completion_tokens 默认/上限 131072；
+  // 文中另有「最大 1048576」口径——取保守档 131072 钳制，用户可设置覆盖，ADR-0016）。
+  maxOutputTokens: 131_072,
   // §5.2 行 1/3/11：temperature/top_p/penalties 固定不可改，传其他值报错 → 一律剔除
   fixedSamplingParams: ['temperature', 'top_p', 'presence_penalty', 'frequency_penalty'],
   // §1.3 表/§5.2 行 6：Kimi strict 缺省即 true（与 OpenAI/DeepSeek 相反）→ 注入 true 呈显
@@ -198,4 +214,19 @@ export function getProviderPreset(id: string): ProviderPreset {
 export function defaultProviderPreset(): ProviderPreset {
   // 主默认 preset 恒在表内；索引安全以 getProviderPreset 口径兜底
   return PROVIDER_PRESETS[DEFAULT_PROVIDER_ID]!;
+}
+
+/**
+ * 按 baseUrl（去尾斜杠、精确匹配各 preset 端点）取 preset；未知端点/空串 → 主默认。
+ * S 档钳制（clampLimits 的 provider 凭据）与 GET 缺省回填共用——
+ * 与 inputTokensPresetOf 同口径：unknown 端点按主默认处理（不自创供应商）。
+ */
+export function providerPresetOfBaseUrl(baseUrl: string): ProviderPreset {
+  const target = baseUrl.trim().replace(/\/+$/, '');
+  if (target !== '') {
+    for (const preset of Object.values(PROVIDER_PRESETS) as readonly ProviderPreset[]) {
+      if (preset.baseUrl.replace(/\/+$/, '') === target) return preset;
+    }
+  }
+  return defaultProviderPreset();
 }

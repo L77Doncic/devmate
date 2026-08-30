@@ -217,6 +217,22 @@ describe('buildRequest：wire 形状（自 client.test.ts 迁来，ADR-0001 修�
     expect('max_tokens' in req.body).toBe(field === 'max_tokens');
     expect('max_completion_tokens' in req.body).toBe(field === 'max_completion_tokens');
   });
+
+  it('S5 护栏（ADR-0016）：已知供应商上限时适配层钳制（绝不 400）——deepseek 393217 → 393216', () => {
+    const clamped = buildRequest(unified({ maxTokens: 393_217 }), PROVIDER_PRESETS.deepseek);
+    expect(clamped.body.max_tokens).toBe(393_216);
+    const bounded = buildRequest(unified({ maxTokens: 393_216 }), PROVIDER_PRESETS.deepseek);
+    expect(bounded.body.max_tokens).toBe(393_216);
+    const under = buildRequest(unified({ maxTokens: 2048 }), PROVIDER_PRESETS.deepseek);
+    expect(under.body.max_tokens).toBe(2048);
+  });
+
+  it('无据供应商（dashscope/openai maxOutputTokens undefined）：超值原样（运行时 400 链兜底，本地不猜数）', () => {
+    const d = buildRequest(unified({ maxTokens: 10_000_000 }), PROVIDER_PRESETS.dashscope);
+    expect(d.body.max_tokens).toBe(10_000_000);
+    const o = buildRequest(unified({ maxTokens: 10_000_000 }), PROVIDER_PRESETS.openai);
+    expect(o.body.max_completion_tokens).toBe(10_000_000);
+  });
 });
 
 // ---------- 切片 a3：WireRequest.meta 剔除可观测（ADR-0002「决策白的」） ----------
@@ -778,13 +794,22 @@ describe('buildRequest：reasoningEffort 映射（C 档切片）', () => {
   });
 });
 
-describe('presets：contextWindowTokens（估算，可在设置覆盖）', () => {
-  it('五家预设窗口值：deepseek 128000（V3.x 代际公开 128K）；qwen/glm/kimi/openai 128000', () => {
-    expect(PROVIDER_PRESETS.deepseek.contextWindowTokens).toBe(128000);
+describe('presets：contextWindowTokens / maxOutputTokens（ADR-0016 上限表）', () => {
+  it('deepseek：窗口 1_000_000（实测过 1M——模型名 [1m] / dsh 默认 1M / 供应商页）；输出 393216（2026-08-30 实测 valid-range）', () => {
+    expect(PROVIDER_PRESETS.deepseek.contextWindowTokens).toBe(1_000_000);
+    expect(PROVIDER_PRESETS.deepseek.maxOutputTokens).toBe(393_216);
+  });
+  it('qwen/glm/kimi/openai 窗口保持 128000（估算，可在设置覆盖）', () => {
     expect(PROVIDER_PRESETS.dashscope.contextWindowTokens).toBe(128000);
     expect(PROVIDER_PRESETS.glm.contextWindowTokens).toBe(128000);
     expect(PROVIDER_PRESETS.kimi.contextWindowTokens).toBe(128000);
     expect(PROVIDER_PRESETS.openai.contextWindowTokens).toBe(128000);
+  });
+  it('输出上限：kimi/glm=131072（§5.2）；dashscope/openai 无据 → undefined（不钳制，运行时 400 链兜底）', () => {
+    expect(PROVIDER_PRESETS.kimi.maxOutputTokens).toBe(131_072);
+    expect(PROVIDER_PRESETS.glm.maxOutputTokens).toBe(131_072);
+    expect(PROVIDER_PRESETS.dashscope.maxOutputTokens).toBeUndefined();
+    expect(PROVIDER_PRESETS.openai.maxOutputTokens).toBeUndefined();
   });
 });
 

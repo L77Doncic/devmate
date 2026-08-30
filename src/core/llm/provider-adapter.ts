@@ -169,6 +169,13 @@ export interface ProviderPreset {
   /** max_tokens 的 wire 名（§5.2 行 2：OpenAI/Kimi 已弃用 → max_completion_tokens）。 */
   readonly maxTokensField: 'max_tokens' | 'max_completion_tokens';
   /**
+   * 请求侧输出上限（token；ADR-0016 上限表——设置层 clampLimits 与适配层 S5 护栏共用）。
+   * undefined = 无据/模型各异（dashscope/openai 当前口径：「待实测」）→ **不钳制**
+   * （用户值直发；由「超限报错 → 钳制重试」链兜底——绝不本地猜数）。
+   * deepseek 393216（2026-08-30 真实 API 实测 valid-range）、kimi/glm 131072（API-SPEC §5.2）。
+   */
+  readonly maxOutputTokens?: number;
+  /**
    * 业务码→重试语义修正表（§6.1/§6.2/笔记 §5）：状态码打底（RETRYABLE_STATUS）
    * 之上按供应商业务码覆盖 retryable；无表=维持状态码口径（OpenAI/DeepSeek）。
    */
@@ -265,7 +272,15 @@ export function buildRequest(unified: ChatRequest, provider: ProviderPreset): Wi
     if (excludedKeys.has('top_p')) strippedParams.push('top_p');
     else body.top_p = unified.topP;
   }
-  if (unified.maxTokens !== undefined) body[provider.maxTokensField] = unified.maxTokens;
+  if (unified.maxTokens !== undefined) {
+    // S5 护栏（ADR-0016）：已知供应商上限时先钳再发（供应商行为是 400 拒绝而非 clamp——
+    // 本地超限前钳制，绝不 400）；无上限字段（无据/模型各异）原样直发，由运行时
+    // 「超限报错 → 钳制重试」链兜底。
+    body[provider.maxTokensField] =
+      provider.maxOutputTokens !== undefined
+        ? Math.min(unified.maxTokens, provider.maxOutputTokens)
+        : unified.maxTokens;
+  }
   // A 档：请求侧输入上限只在白名单供应商发送（deepseek-vision.md §8：DeepSeek 官方
   // 无 max_input_tokens——未证实绝不发；仅 DashScope/Qwen 走 extra_body）。
   if (unified.maxInputTokens !== undefined) {

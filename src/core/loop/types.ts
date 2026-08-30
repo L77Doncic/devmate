@@ -292,6 +292,22 @@ export interface RunOptions {
   attachResolver?: AttachmentResolver;
   /** 上下文窗口 token 预算（透传 S4；未知时不触发阈值压缩）。 */
   windowTokens?: number;
+  /**
+   * 超限自愈链学习回调（E7 · ADR-0016）：核心循环命中「上下文超窗/输出区间」错误并
+   * 自动修复（升级压缩重试）时调用——从 400 message 免费解析的上限（hintMax）与
+   * 升级档（escalation 1=裁剪/2=摘要）上报；服务端用它做会话级记账（上限学习进
+   * windowDetail「由错误学习」/ 钳制后续 run 的窗口与 maxTokens）。
+   * 回调故障不放大为行为故障（调用方 try/catch 后继续重试链）。
+   */
+  onLimitsError?: (learning: {
+    kind: 'context-exceeded' | 'output-limit';
+    /** 供应商错误 message（原件）。 */
+    message: string;
+    /** 从 message 解析的上限（`[1, N]` 区间上界 / "maximum context length is N"）。 */
+    hintMax?: number;
+    /** 本轮已升级到的压缩级（1=裁剪 2=摘要）。 */
+    escalation: 1 | 2;
+  }) => void | Promise<void>;
   /** 思考强度（C 档：/api/settings 的 reasoning；逐字进入 ChatRequest.reasoningEffort——adapter 按家映射）。 */
   reasoning?: ReasoningEffort;
   /** 持久规则载体（投影系统前缀，压缩永不触碰，ADR-0005）。 */

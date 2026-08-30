@@ -3251,6 +3251,11 @@ pre {
   color: var(--dsw-alias-state-error-primary);
   font-weight: 500;
 }
+/* S 档软提示（ADR-0016）：上限 > 窗口预算的红字软提示（不阻止保存——服务端钳制兜底）。 */
+.field-help.warn {
+  color: var(--dsw-alias-state-error-primary);
+  font-weight: 500;
+}
 /* B 档：标签内必填星标（输入/输出上限随 GET 回填缺省也须保存绑定） */
 .req-mark {
   color: var(--dsw-alias-state-error-primary);

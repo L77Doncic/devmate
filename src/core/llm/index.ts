@@ -37,7 +37,14 @@ export {
   PROVIDER_PRESETS,
   defaultProviderPreset,
   getProviderPreset,
+  providerPresetOfBaseUrl,
 } from './presets.js';
+// 上限钳制（S 档；ADR-0016）：settings POST/GET 与适配层护栏共用同一张上限表
+export { clampLimits } from './clamp-limits.js';
+export type { ClampLimitsInput, ClampLimitsResult } from './clamp-limits.js';
+// 超限错误分类（M1；ADR-0016 E7 自愈链/上限学习的数据源）
+export { classifyContextError } from './error-parse.js';
+export type { ContextErrorInfo, ContextErrorKind } from './error-parse.js';
 // 网关窗口探测（三源取窗 · 网关层；零依赖纯模块）
 export {
   DEFAULT_WINDOW_TIMEOUT_MS,

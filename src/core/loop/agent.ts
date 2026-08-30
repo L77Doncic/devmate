@@ -23,6 +23,8 @@ import type {
   StreamSnapshot,
 } from '../../shared/llm-types.js';
 import type { SessionEvent, ToolCall } from '../../shared/session-types.js';
+// E7 超限自愈链（ADR-0016）：超限错误分类（词表 + hintMax 免费解析）——单一来源
+import { classifyContextError } from '../llm/index.js';
 import { INTERRUPTED_RESULT_CONTENT } from '../../shared/session-types.js';
 import {
   CompactionDebouncer,
@@ -31,7 +33,7 @@ import {
   project,
 } from '../context/index.js';
 import { TEXT_TOKENS_PER_ASCII_PROSE } from '../context/constants.js';
-import type { ProjectOptions } from '../context/index.js';
+import type { CompactionLevel, ProjectOptions } from '../context/index.js';
 import type { SessionStore } from '../session/index.js';
 import {
   errorResultContent,
@@ -81,6 +83,15 @@ export const REVIEW_SENTINEL_USER_CONTENT =
   '以交付物对照任务目标，列出缺陷与放行理由（≤400 字）；对审查结论先修复或说明，再收尾。' +
   '建议 spawn_subagent 时带 skill:"code-review"（该方法论全文会注入审查子代理）；';
 
+/**
+ * 输出截断提示（E8 · ADR-0016 L3）：finish_reason='length' 时注入的系统样式 user 消息
+ * ——**纯提示**：告知模型上次回复被输出上限截断，请更简洁回答；续跑一次（≤1 次/run），
+ * 绝不自动重发同一请求（新请求 = 模型对提示的自然回应，正常计步计成本）。
+ */
+export const TRUNCATION_HINT_USER_CONTENT =
+  '【输出截断提示】上次回复因输出上限（max_tokens）被截断（finish_reason: length）。' +
+  '请用更简洁的方式回答：减少复述与详细展开，直接给出结论与最小必要内容。';
+
 export async function run(input: RunInput, opts: RunOptions): Promise<RunResult> {
   const pricing = opts.pricing ?? DEFAULT_PRICING;
   const costLimit = opts.costLimitUsd ?? DEFAULT_COST_LIMIT_USD;
@@ -98,6 +109,14 @@ export async function run(input: RunInput, opts: RunOptions): Promise<RunResult>
   let contextEstimate: number | undefined;
   const calibrator = new TokenEstimateCalibrator(); // L0 事后校准（ADR-0012；默认系数 1）
   const debouncer = new CompactionDebouncer(); // 压缩防抖（CONTEXT「压缩防抖」/ §8 A-1）
+  // E7 超限自愈链（ADR-0016）：升级档（0=未升 1=裁剪 2=摘要——升到 2 再失败 → fatal，
+  // 即 ≤2 次/轮重试；成功轮次后归零——「跨轮重置」）+ 从 400 message 免费学习的上限
+  // （窗口 / 输出；本 run 生效应，服务端经 onLimitsError 另记账）。
+  let overflowEscalation: CompactionLevel = 0;
+  let learnedWindowTokens: number | undefined;
+  let learnedOutputCap: number | undefined;
+  /** E8 截断提示一次性注入标记（run 级 ≤1 次）。 */
+  const truncationHint = { hinted: false };
   let formatErrors = 0;
   let steps = 0;
   let status: RunStatus | null = null;
@@ -148,8 +167,14 @@ export async function run(input: RunInput, opts: RunOptions): Promise<RunResult>
       const events = await readEvents(store, input.sessionId);
       const defs = opts.tools.list();
       const chatTools = defs.map(toChatTool);
+      // E7 重试链参与预算：窗口 = min(设置窗口, 错误学习窗口)（学习值只钳不抬——
+      // 若供应商明示的上限更小，以它为准；未学到 → 设置值原样）。
+      const windowBudget = minTokenBudget(opts.windowTokens, learnedWindowTokens);
       const projectOpts: ProjectOptions = {
-        ...(opts.windowTokens !== undefined ? { windowTokens: opts.windowTokens } : {}),
+        ...(windowBudget !== undefined ? { windowTokens: windowBudget } : {}),
+        // E7 升级钳：forceLevel ≥1 = 裁剪必执行；2 = 摘要必执行（穿透 maxLevel）——
+        // 与 window-unknown 对照：窗口未知时摘要仍需窗口判定（force 只保证「该试的层都试」）
+        ...(overflowEscalation > 0 ? { forceLevel: overflowEscalation } : {}),
         ...(chatTools.length > 0 ? { tools: chatTools } : {}),
         ...(opts.summarizer !== undefined ? { summarizer: opts.summarizer } : {}),
         ...(opts.systemPrompt !== undefined ? { systemPrefix: opts.systemPrompt } : {}),
@@ -208,6 +233,11 @@ export async function run(input: RunInput, opts: RunOptions): Promise<RunResult>
       }
 
       steps += 1;
+      // E7 输出区间学习：上次 400 明示的输出上限已钳制本轮 maxTokens（min——只降不抬）
+      const turnMaxTokens =
+        learnedOutputCap !== undefined && opts.maxTokens !== undefined
+          ? Math.min(opts.maxTokens, learnedOutputCap)
+          : opts.maxTokens;
       const turn = await runTurn({
         store,
         sessionId: input.sessionId,
@@ -220,12 +250,13 @@ export async function run(input: RunInput, opts: RunOptions): Promise<RunResult>
         tools: opts.tools,
         approver: opts.approver,
         toolTimeoutMs,
-        ...(opts.maxTokens !== undefined ? { maxTokens: opts.maxTokens } : {}),
+        ...(turnMaxTokens !== undefined ? { maxTokens: turnMaxTokens } : {}),
         ...(opts.maxInputTokens !== undefined ? { maxInputTokens: opts.maxInputTokens } : {}),
         ...(opts.reasoning !== undefined ? { reasoning: opts.reasoning } : {}),
         budget: { pricing, costLimit, promptEst, ledger },
         calibrator,
         rawEst,
+        truncationHint,
         methodology:
           opts.methodology !== undefined && methodologyRoutedId !== null
             ? { gate: opts.methodology, routedId: methodologyRoutedId }
@@ -233,12 +264,41 @@ export async function run(input: RunInput, opts: RunOptions): Promise<RunResult>
         review: opts.review,
       });
       if (turn.type === 'status') {
+        // E7 超限自愈链（ADR-0016）：fatal + 命中「上下文超窗/输出区间」→ 升级压缩
+        // 后重试本轮（≤2 次/轮；升到 2 仍失败 → fatal——与既有 E7「压缩后重试上限 2 次」
+        // 一致）。400 不再 fatal：window-unknown 承诺（「就算配置错了窗口，run 也不会死」）
+        // 兑现。重试计入步数/成本（steps 已 +1、失败轮已记账），不触熔断（格式错误无关）。
+        const limitError =
+          turn.status === 'fatal' ? classifyContextError(turn.errorMessage ?? '') : null;
+        if (limitError !== null && overflowEscalation < 2 && !interruptedMaybe(signal)) {
+          overflowEscalation = (overflowEscalation + 1) as CompactionLevel;
+          // 从 message 免费学习上限（L2）：窗口（钳制窗口预算）/ 输出钳制值（钳制 maxTokens）
+          if (limitError.kind === 'context-exceeded' && limitError.hintMax !== undefined) {
+            learnedWindowTokens = limitError.hintMax;
+          }
+          if (limitError.kind === 'output-limit' && limitError.hintMax !== undefined) {
+            learnedOutputCap = limitError.hintMax;
+          }
+          try {
+            await opts.onLimitsError?.({
+              kind: limitError.kind,
+              message: turn.errorMessage ?? '',
+              ...(limitError.hintMax !== undefined ? { hintMax: limitError.hintMax } : {}),
+              escalation: overflowEscalation as 1 | 2,
+            });
+          } catch {
+            // 学习回调故障不放大为行为故障（护栏兜底：自愈链照常继续）
+          }
+          continue; // 升级后重试本轮（下一 while 迭代以新 forceLevel/窗口/上限重投影）
+        }
         status = turn.status;
         errorMessage = turn.errorMessage;
         break;
       }
       if (turn.type === 'continue') {
-        // 评审哨兵续跑（R2-S2）：注入 system-user 后本轮继续——无终止面变化
+        // 评审哨兵/截断提示续跑（R2-S2 · E8）：注入 system-user 后本轮继续——无终止面变化；
+        // 本轮已成功（非超限失败）→ E7 升级归零（跨轮重置）
+        overflowEscalation = 0;
         continue;
       }
       if (turn.type === 'natural-end') {
@@ -246,6 +306,8 @@ export async function run(input: RunInput, opts: RunOptions): Promise<RunResult>
         break;
       }
       // 工具轮：熔断与回注成对（ADR-0006）；一次干净的 Step 清零连续计数
+      // E7：成功工具轮 → 升级归零（「≤2 次/轮」——下一轮失败从 0 重新升级）
+      overflowEscalation = 0;
       formatErrors = turn.malformed ? formatErrors + 1 : 0;
       if (formatErrors >= maxFormatErrors) {
         status = 'circuit-break';
@@ -321,6 +383,8 @@ interface TurnDeps {
   methodology: { gate: MethodologyGate; routedId: string } | null;
   /** 评审哨兵门（undefined = 关闭——从不注入；E2E/测试/老配置默认路径）。 */
   review: ReviewGate | undefined;
+  /** 输出截断提示一次性注入标记（E8；run 级 ≤1 次——跨轮共享同一对象）。 */
+  truncationHint: { hinted: boolean };
 }
 
 /** 成本护栏计价状态（ADR-0003：计价表 + 上限 + 本轮请求前估算 + 累计账本）。 */
@@ -442,6 +506,22 @@ async function runTurn(deps: TurnDeps): Promise<TurnOutcome> {
   }
 
   // 自然结束：本轮不再发起任何工具调用即告结束（CONTEXT「自然结束」）。
+  // E8 输出截断提示（ADR-0016 L3）：finish_reason='length' → 注入系统样式「请更简洁回答」
+  // 后续跑一次（≤1 次/run——truncationHint 跨轮共享）——**纯提示**：绝不自动重发同一
+  // 请求；模型对提示的自然回应 = 新请求（正常计步/计成本）。已提示过 → 直落自然结束。
+  if (
+    calls.length === 0 &&
+    snapshot?.finishReason === 'length' &&
+    deps.truncationHint.hinted === false
+  ) {
+    deps.truncationHint.hinted = true;
+    await deps.store.append(deps.sessionId, {
+      kind: 'user',
+      payload: { content: TRUNCATION_HINT_USER_CONTENT },
+      meta: { system: true },
+    });
+    return { type: 'continue' };
+  }
   // 评审哨兵（R2-S2）：实质变更 + 无独立审查 + 未注入过 → 注入 system-user 请求一次
   //（替代该轮收尾），模型续跑；已注入过而无审查 → 直接放行（护栏即一次）。
   if (calls.length === 0) {
@@ -810,6 +890,13 @@ async function readEvents(store: SessionStore, sessionId: string): Promise<Sessi
   const events: SessionEvent[] = [];
   for await (const ev of store.events(sessionId)) events.push(ev);
   return events;
+}
+
+/** 窗口预算合成（E7 学习值只钳不抬）：两源都无 → undefined（窗口未知）；有单一 → 该值；双有 → min。 */
+function minTokenBudget(a: number | undefined, b: number | undefined): number | undefined {
+  if (a === undefined) return b;
+  if (b === undefined) return a;
+  return Math.min(a, b);
 }
 
 class ToolTimeoutError extends Error {
