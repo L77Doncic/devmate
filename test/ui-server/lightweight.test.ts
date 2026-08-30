@@ -147,6 +147,10 @@ class FakeShell implements PersistentShell {
     }
   }
 
+  killActiveCommand(): boolean {
+    return true;
+  }
+
   async dispose(): Promise<void> {
     this.disposed += 1;
   }
