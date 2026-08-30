@@ -41,6 +41,11 @@ export interface StoredConfig {
   reasoning?: ReasoningEffort;
   /** 上下文窗口覆盖（C 档：settings windowTokens 持久化；缺省 = 供应商 preset 估算）。 */
   windowTokens?: number;
+  /** 请求侧输入上限（A 档：settings maxInputTokens 持久化；缺省不传——vendor 默认/不发送）。
+   *  只对白名单供应商生效（DashScope/Qwen），见 deepseek-vision.md §8。 */
+  maxInputTokens?: number;
+  /** 请求侧输出上限（A 档：settings maxOutputTokens 持久化；缺省 = 现有 DEFAULT_MAX_TOKENS 估价/不发送）。 */
+  maxOutputTokens?: number;
   /** 权限预设（settings permission 持久化；缺省 'workspace-write'——服务端兜底）。 */
   permission?: PermissionPreset;
   /** full-access 风险确认记录（epoch ms；前端风险门后写入——纯记录、不强制）。 */
@@ -51,7 +56,7 @@ export interface StoredConfig {
   reviewMode?: boolean;
   /** Skills 运行时开关（id → enabled；缺省空表 = 全开）。 */
   skills?: Record<string, boolean>;
-  /** 工作流配置（子代理开关/并行上限；缺省 true/2；maxParallel 消费时夹紧 1-4）。 */
+  /** 工作流配置（子代理开关/并行上限；缺省 true/2；maxParallel 消费时归一 0-8——0 = 无上限）。 */
   workflow?: StoredWorkflowConfig;
   /** MCP 服务器配置清单（配置层；P2 协议客户端接入前只存配置）。 */
   mcp?: StoredMcpServer[];
@@ -59,7 +64,7 @@ export interface StoredConfig {
   workspaces?: string[];
 }
 
-/** 工作流配置节（字段可缺省；服务端断言 maxParallel 整数 1-4，CLI 初值加载夹紧）。 */
+/** 工作流配置节（字段可缺省；服务端断言 maxParallel 整数 0-8——0 = 无上限，CLI 初值加载归一）。 */
 export interface StoredWorkflowConfig {
   subagentsEnabled?: boolean;
   maxParallel?: number;
@@ -83,6 +88,9 @@ export interface CliConfig {
   apiKey?: string;
   maxSteps?: number;
   costLimitUsd?: number;
+  /** 请求侧输入/输出上限（A 档；读回自配置，未配置缺省=不发送/厂商默认）。 */
+  maxInputTokens?: number;
+  maxOutputTokens?: number;
 }
 
 /** 配置损坏（JSON 解析失败）时抛出，调用方负责向用户呈现中文错误。 */
@@ -111,6 +119,9 @@ export function loadConfig(configPath: string, env: Record<string, string | unde
   if (apiKey !== undefined) cfg.apiKey = apiKey;
   if (stored.maxSteps !== undefined) cfg.maxSteps = stored.maxSteps;
   if (stored.costLimitUsd !== undefined) cfg.costLimitUsd = stored.costLimitUsd;
+  // A 档：输入/输出上限读回（未配置缺省 = 不发送（请求默认）——与引擎口径一致）
+  if (stored.maxInputTokens !== undefined) cfg.maxInputTokens = stored.maxInputTokens;
+  if (stored.maxOutputTokens !== undefined) cfg.maxOutputTokens = stored.maxOutputTokens;
   return cfg;
 }
 

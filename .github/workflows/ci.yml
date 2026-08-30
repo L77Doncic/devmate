@@ -36,6 +36,11 @@ jobs:
       - name: Build
         run: npm run build
 
+      # VT-6：Build 后校验 dist/ui/web 与 src/ui/web 的资产集一致（清单 + 字节；
+      # 源为基准、dist 为镜像）——dist 泄漏 src / stale dist 服役 → 本步退红。
+      - name: Verify dist sync
+        run: node scripts/check-dist-sync.mjs
+
       - name: Tests skipped on Windows (documented)
         if: runner.os == 'Windows'
         run: |

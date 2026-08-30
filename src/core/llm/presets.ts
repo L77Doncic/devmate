@@ -38,8 +38,11 @@ const deepseek: ProviderPreset = {
   fixedSamplingParams: [],
   // C 档思考强度：DeepSeek 走 thinking（enabled + budget_tokens 1024/4096/16384；off 显式 disabled）
   reasoningParam: 'thinking',
-  // 估算（research 标注「未能核实」——给保守可调值：64k；「估算，可在设置覆盖」）
-  contextWindowTokens: 64_000,
+  // 估算（research 标注「未能核实」——给保守可调值：128k；「估算，可在设置覆盖」）
+  // V3.x 代际公开 128K，未经实测页核实（settings.windowTokens 优先）
+  // （2026-08-30 现场取证：DeepSeek /models 实测仅 {id, object, owned_by} 无窗口字段
+  //  ——预设为估算，非实测；窗口来源=显式覆盖/网关探测/preset（模型名标注层已取消，2026-08-30 用户裁定）。）
+  contextWindowTokens: 128_000,
   // §1.6：思考模式默认 enabled；temperature/top_p 静默无效 → 思考时剔除。
   // penalties 在 §1.6 同被忽略，但 ChatRequest 无其载体（死数据不入剔除集）
   thinkingEnabled: true,
@@ -49,6 +52,12 @@ const deepseek: ProviderPreset = {
   // §3.3：带 tools 的请求必须每轮回传 reasoning_content，否则 400
   reasoningPolicy: 'keep',
   allowedToolChoices: ['none', 'auto', 'required', 'named'],
+  // 图像理解（ADR-0015）：供应商级 vision 能力 = true——模型级裁决按
+  // sanitizeProviderModel 后 /vision/i 匹配（官方仅 deepseek-v4-flash-vision-exp
+  // 接受图片，其余模型 400 "This model does not support image"——本地适配层先降级）。
+  // 文档（pricing 功能表）：vision 模型 Tool Calls / Json Output / Responses / Anthropic
+  // 均支持（FIM 不支持）→ 主循环 tools 零改动（deepseek-vision.md §7）。
+  vision: true,
   maxTokensField: 'max_tokens',
 };
 
@@ -67,6 +76,10 @@ const dashscope: ProviderPreset = {
   contextWindowTokens: 128_000,
   // §1.3 表/§5.2 行 6：DashScope/Qwen 未提供 strict 字段（strictDefault 缺省即 undefined）
   maxTokensField: 'max_tokens',
+  // A 档 max_input_tokens 白名单：仅 DashScope/Qwen 支持（笔记 §1，走 extra_body；
+  // 请求值来自 settings.maxInputTokens → ChatRequest.maxInputTokens；
+  // DeepSeek 官方无该参数——绝不发送，见 deepseek-vision.md §8）。
+  maxInputTokensField: 'max_input_tokens',
   // 笔记 §5：Throttling 系 429 成因不同——频率类退避，配额/鉴权/系统类重试无意义
   retryableRules: [
     { kind: 'prefix', prefix: 'InternalError', retryable: true },

@@ -3,7 +3,8 @@
  *
  * 职责（与 core 同进程直调，UI 只是会话的一个视图）：
  * - 上行（POST JSON）：/api/chat（首消息建会话 + run 异步启动）、/api/approval
- *   （危险操作审批应答）、/api/interrupt（用户中断）、GET/POST /api/settings（apiKey 只回掩码）。
+ *   （危险操作审批应答）、/api/interrupt（用户中断）、GET/POST /api/settings（apiKey 只回掩码；
+ *   window 取窗：用户覆盖 > 网关 /models 探测 > preset 估算，GET 附 windowDetail 注来源）。
  * - 会话 CRUD：GET /api/sessions（列表：deps.sessionLister 注入的数据源——服务端不直接
  *   fs）、GET /api/sessions/:id（历史映射回协议帧，最近 500 **帧**，帧数口径 + 剧集边界
  *   对齐——帧组整组裁剪、孤儿结果保留 d5 语义）、POST /api/sessions
@@ -93,7 +94,7 @@ import type {
   ToolResult,
 } from '../../core/loop/index.js';
 import { hasReviewRun, hasSubstantiveWork, run } from '../../core/loop/index.js';
-// 命令安全分类器（S10；本模块只读消费：run_command 的 ask/deny 直拒矩阵输入）
+// 命令安全分类器（S10；本模块只读消费：run_command 的 read-only/ask/deny 三判级矩阵输入）
 import { classify, type Verdict } from '../../core/tools/classify.js';
 import type { WorkflowConfig } from '../../shared/workflow.js';
 import { clampMaxParallel, DEFAULT_SUBAGENTS_ENABLED } from '../../shared/workflow.js';
@@ -108,14 +109,17 @@ import { parseMethodologyMap, parseSkillMethodologyValue } from '../../shared/me
 import { assertValidSessionId } from '../../core/session/base.js';
 import { SessionExistsError, SessionNotFoundError } from '../../core/session/errors.js';
 import type { SessionStore } from '../../core/session/index.js';
+import type { DiscoverWindowResult } from '../../core/llm/index.js';
 import type { ReasoningEffort, StreamSnapshot } from '../../shared/llm-types.js';
 import type {
   EventKind,
   SessionEvent,
   SessionEventInput,
   ToolCall,
+  UserImage,
 } from '../../shared/session-types.js';
 import {
+  SESSION_CORRUPTED_TITLE,
   deriveTitle,
   pingFrame,
   serializeEvent,
@@ -124,12 +128,21 @@ import {
 } from './emit.js';
 // /api/mcp GET 响应脱敏（Authorization 头掩码；纯函数，见模块头）
 import { maskMcpArgs } from './mcp-mask.js';
+// 内容寻址附件存储（ADR-0015 dsh 管线落地：POST /api/attachments 上传 / raw 读回 /
+// 会话限额 / DELETE 引用扫描联动）
+import {
+  AttachmentStore,
+  ATTACH_LIMITS,
+  AttachmentStoreError,
+  isAttachmentRef,
+} from './attachments.js';
+import type { AttachmentUploadInput } from './attachments.js';
 // 掩码单一实现（≤12 字符全掩；>12 显首尾 4）：shared/masking 单一来源
 // （层间倒置修复——service 不再向上（cli）依赖；cli/config 留 re-export）
 import { maskApiKey } from '../../shared/masking.js';
 // 装配入口（S14 CLI 从本模块单点导入：assembleDeps + createDevmateServer）
-export { assembleDeps, dedupeKeepOrder } from './deps.js';
-import { dedupeKeepOrder } from './deps.js';
+export { assembleDeps, dedupeKeepOrder, isCorruptedSession } from './deps.js';
+import { dedupeKeepOrder, isCorruptedSession } from './deps.js';
 export type { DevmateConfig } from './deps.js';
 // 掩码单一实现的再导出（历史消费者路径兼容；实现只在 shared/masking）
 export { maskApiKey };
@@ -139,11 +152,12 @@ export { maskApiKey };
 // ---------------------------------------------------------------------------
 
 /**
- * dsh 式权限预设（CTO 语义定案；settings 持久化，缺省 'workspace-write'）：
+ * dsh 式权限预设（CTO 语义定案 → 全同 dsh 实测；settings 持久化，缺省 'workspace-write'）：
  * - read-only（仅读）：fs 读类与只读命令放行；fs 写/编辑与 ask/deny 级命令 → ask（弹窗兜底）；
- * - workspace-write（默认，自动（工作区写））：fs 全类放行；只读命令放行；ask 级 → ask；
- *   deny 级（rm -rf 等不可逆）→ 不弹窗直接拒绝（permission-denied 回注 = 普通工具失败，模型继续）；
- * - full-access（全访问）：全放行（含 deny 级——一次性风险确认门由前端负责，后端只记录
+ * - workspace-write（默认，自动（工作区写））：fs 全类放行；命令（含 classify ask/deny 级——
+ *   rm -rf 等破坏性）全放行零弹窗（dsh 实测语义；DevMate 无 OS 沙箱强制层，选档即接受风险，
+ *   风险声明由前端文案承担——见权限描述「命令直接执行（含破坏性），请确认在信任的工作区」）；
+ * - full-access（全访问）：全放行（一次性风险确认门由前端负责，后端只记录
  *   permissionConfirmedAt，不做强制后端门）。
  */
 export type PermissionPreset = 'read-only' | 'workspace-write' | 'full-access';
@@ -169,6 +183,15 @@ export interface UiSettings {
   reasoning?: ReasoningEffort;
   /** 上下文窗口覆盖初值（缺省 = 供应商 preset 估算；测试/假 deps 可不给）。 */
   windowTokens?: number;
+  /**
+   * 窗口覆盖是否**用户显式**设定（三源取窗优先级：用户覆盖 > 网关探测 > preset；
+   * assembleDeps 按 config.windowTokens 是否给定播种——服务端据此把 preset 胚与
+   * 用户覆盖区分开，探测结果只在无显式覆盖时胜出）。 */
+  windowTokensExplicit?: boolean;
+  /** 请求侧输入上限初值（A 档；缺省不播种 = 未设（不发送/厂商默认））。 */
+  maxInputTokens?: number;
+  /** 请求侧输出上限初值（A 档；缺省不播种 = 未设（DEFAULT_MAX_TOKENS 估价/不发送））。 */
+  maxOutputTokens?: number;
   /** 权限预设初值（缺省 'workspace-write'——CTO 裁定；与 reasoning 同机制）。 */
   permission?: PermissionPreset;
   /** full-access 风险确认记录（epoch ms；前端二次确认后写入——纯记录、不强制）。 */
@@ -187,6 +210,10 @@ export interface SettingsSnapshot {
   reasoning?: ReasoningEffort;
   /** 上下文窗口覆盖（同 reasoning 的触碰语义）。 */
   windowTokens?: number;
+  /** 请求侧输入上限（A 档；同触碰语义——未触碰不携带，CLI 透传不覆盖）。 */
+  maxInputTokens?: number;
+  /** 请求侧输出上限（A 档；同触碰语义）。 */
+  maxOutputTokens?: number;
   /** 权限预设（同触碰语义）。 */
   permission?: PermissionPreset;
   /** full-access 风险确认记录（同触碰语义）。 */
@@ -210,6 +237,12 @@ export interface SessionSummary {
   stepCount?: number;
   /** 会话数超限提示标记（服务端在 GET /api/sessions 注入：最旧 10 个空闲会话；只提示不自动删）。 */
   compact?: boolean;
+  /**
+   * 全损坏会话标记（VT-8）：文件不可解析行占比 > SESSION_CORRUPTION_RATIO → true——
+   * 列表项按「（会话损坏）」标题 + 本标记展示，不冒充「（空会话）」（正常崩溃的
+   * 「完整行+截断尾行」远超阈值下——不误标）。
+   */
+  corrupted?: boolean;
   /**
    * 会话所属项目文件夹（A 档：首条 session-workspace meta 的 workspaceRoot；
    * 旧会话/无 meta → null——前端显示「未知项目」；lister 注入的数据源负责填充）。
@@ -283,6 +316,17 @@ export interface DevmateServerDeps {
   createLlm?: (settings: { baseUrl: string; apiKey: string | undefined }) => LlmAdapter;
   /** 每 run 重建摘要器（同一 llm；settings.model 变更即生效）；缺省用 runOptions.summarizer。 */
   createSummarizer?: (llm: LlmAdapter, model: string) => ConversationSummarizer;
+  /**
+   * 网关窗口探测结果读取器（三源取窗 · 网关层；assembleDeps 后台探测后回填——
+   * 未探测/未完成/关闭 → null；缺省 undefined = 不探测，按「覆盖 > preset」兜底）。
+   */
+  windowDiscovered?: () => DiscoverWindowResult | null;
+  /** 设置变更重探（POST /api/settings 触碰 baseUrl/apiKey/model 后服务端调用；未注入 → 不重探）。 */
+  probeWindow?: (params: {
+    baseUrl: string;
+    apiKey: string | undefined;
+    model: string;
+  }) => Promise<DiscoverWindowResult>;
   /** 设置持久化回调（POST /api/settings 应用后调用；CLI 传 config.ts 的 saveConfig）。 */
   persistSettings?: (settings: SettingsSnapshot) => void | Promise<void>;
   /** 静态资源根；缺省 = 本模块相对路径的 ../web（src/ui/web；打包后 dist/ui/web 由 S14 处理）。 */
@@ -295,6 +339,13 @@ export interface DevmateServerDeps {
   sessionCap?: number;
   /** 会话删除联动（DELETE /api/sessions/:id）：删除持久化文件 + 释放该会话 shell 等资源（幂等）。 */
   disposeSession?: (sessionId: string) => Promise<void> | void;
+  /**
+   * 内容寻址附件存储（ADR-0015；dsh 管线落地）。缺省 = 按 attachmentsDir 自建
+   * （未注入时的兜底——真实装配 assembleDeps 恒注入 <sessionsDir>/attachments 的实例）。
+   */
+  attachments?: AttachmentStore;
+  /** 附件目录（仅 attachments 未注入时用于自建；缺省 ~/.devmate/sessions/attachments）。 */
+  attachmentsDir?: string;
   /** 空闲 shell 释放：服务端每 idleSweepMs 调 disposeIdleShells(Date.now(), activeRunSessions)；
    * 实现按 idleShellTtlMs 判超时且**跳过活跃 run 会话**（TTL 误杀修复——运行中 shell 不回收）。 */
   disposeIdleShells?: (now: number, activeSessionIds?: ReadonlySet<string>) => Promise<void> | void;
@@ -310,7 +361,7 @@ export interface DevmateServerDeps {
   saveSkillsConfig?: (skills: Record<string, boolean>) => void | Promise<void>;
   /** Skills 开关初值（socket 播种：旧开关经 CLI attach 注入，构造期种子；缺省 {} = 全开）。 */
   skillsRecord?: Record<string, boolean>;
-  /** 工作流配置初值（缺省 {subagentsEnabled:true, maxParallel:2}；maxParallel 夹紧 1-4）。 */
+  /** 工作流配置初值（缺省 {subagentsEnabled:true, maxParallel:2}；maxParallel 归一 0-8——0 = 无上限）。 */
   workflow?: { subagentsEnabled?: boolean; maxParallel?: number };
   /** 工作流配置持久化（CLI 注入 saveConfig 包装；无则仅内存）。 */
   saveWorkflow?: (workflow: {
@@ -661,6 +712,10 @@ function observeStore(inner: SessionStore, ctxFor: (id: string) => SessionCtx): 
           data: {
             text: wide.payload.content,
             ...(wide.meta?.system === true ? { system: true } : {}),
+            // 多模态（ADR-0015）：images 与存储 payload 同形（dataURL 图，回放直接渲染）
+            ...(wide.payload.images !== undefined && wide.payload.images.length > 0
+              ? { images: wide.payload.images }
+              : {}),
           },
         });
         return saved;
@@ -814,6 +869,8 @@ export function classifyPermissionCall(call: ToolCall): PermissionCallClass {
       return {
         kind: 'shell',
         verdict: classification.verdict,
+        // reasons：classify 拒因（原 deny 直拒文案消费方已随 deny 路径删除；保留以供
+        // 未来弹窗/提示表述引用，并维持 classifyPermissionCall 形状稳定）
         reasons: classification.reasons ?? [],
       };
     }
@@ -841,21 +898,25 @@ function shellCommandOf(rawArguments: string): string | undefined {
   return typeof command === 'string' && command !== '' ? command : undefined;
 }
 
-/** 矩阵单格判定结果：'allow'（放行不弹窗）/ 'ask'（approval-request）/ deny（直拒回注）。 */
-export type PermissionDecision = 'allow' | 'ask' | { deny: true; reason: string };
+/** 矩阵单格判定结果：'allow'（放行不弹窗）/ 'ask'（approval-request）。deny 直拒路径已删除。 */
+export type PermissionDecision = 'allow' | 'ask';
 
 /**
- * 权限判定矩阵（CTO 语义定案，逐格）：
- * | 类别 \ 预设           | read-only | workspace-write（默认） | full-access |
+ * 权限判定矩阵（CTO 定案 → 全同 dsh 语义，逐格）：
+ * | 类别 \ 预设            | read-only | workspace-write（默认） | full-access |
  * | fs 读（read/list/glob/grep） | allow | allow | allow |
  * | fs 写/编辑（write_file/edit_file）| ask | allow | allow |
  * | shell classify=read-only | allow | allow | allow |
- * | shell classify=ask   | ask | ask | allow |
- * | shell classify=deny（rm -rf 等） | ask | deny（不弹窗直接拒） | allow |
- * | 矩阵外普通工具        | allow | allow | allow |
- * 说明：deny 直拒（permission-denied 回注）只在 workspace-write 档保留——DevMate 无沙箱
- * 执行层，这正是模型唯一可见的红色护栏；full-access = 用户经一次性风险确认后接受无障碍执行；
- * read-only 档 deny 级命令走 ask（无执行层拦不下，必须问询兜底）。
+ * | shell classify=ask（未知命令等） | ask | allow | allow |
+ * | shell classify=deny（rm -rf 等） | ask | allow | allow |
+ * | 矩阵外普通工具         | allow | allow | allow |
+ * 语义要点（= dsh 实测零弹窗对照）：approval-request 只在 read-only 档产生（fs 写/编辑与
+ * ask/deny 级命令——问询兜底）；workspace-write（默认）与 full-access 档命令全放行直接执行
+ * （含破坏性——DevMate 无 OS 沙箱强制层，选档即接受；风险声明由前端权限描述承担）。
+ * classify 三判级仍整体消费：read-only 档按「只读放行 / ask 与 deny 一律 ask」判定；
+ * workspace/full 档不采用 ask/deny 语义（只读命令除外——三档均放行）。
+ * deny 直拒（permissionDeniedMessage / errorType='permission-denied' 回注）路径已删除：
+ * loop 侧的类型与回注形态保留兼容（不再触发）。
  */
 export function decidePermission(permission: PermissionPreset, call: ToolCall): PermissionDecision {
   const cls = classifyPermissionCall(call);
@@ -866,28 +927,10 @@ export function decidePermission(permission: PermissionPreset, call: ToolCall): 
     case 'fs-write':
       return permission === 'read-only' ? 'ask' : 'allow';
     case 'shell':
-      switch (cls.verdict) {
-        case 'read-only':
-          return 'allow';
-        case 'ask':
-          return permission === 'full-access' ? 'allow' : 'ask';
-        case 'deny':
-          if (permission === 'read-only') return 'ask';
-          if (permission === 'workspace-write') {
-            return { deny: true, reason: permissionDeniedMessage(permission, cls.reasons) };
-          }
-          return 'allow';
-      }
+      // classify 三判级整体消费；ask/deny 语义只在 read-only 档生效，workspace/full 忽略
+      if (cls.verdict === 'read-only') return 'allow';
+      return permission === 'read-only' ? 'ask' : 'allow';
   }
-}
-
-/** deny 直拒的唯一拒因文案（dsh marker 风格 + classify 拒因；单一实现，测试逐字断言）。 */
-export function permissionDeniedMessage(
-  permission: PermissionPreset,
-  reasons: readonly string[],
-): string {
-  const details = reasons.length > 0 ? `：${reasons.join('；')}` : '';
-  return `[permission: 命令被安全策略拒绝 under ${permission} mode]${details}`;
 }
 
 /** approver 决策函数（依赖注入形态；decidePermission 的 sessionId 无关包装）。 */
@@ -902,11 +945,8 @@ function makeApprover(ctx: SessionCtx, decide: PermissionDecider): Approver {
     });
     const decision = decide(call);
     if (decision === 'allow') return 'allow';
-    if (typeof decision === 'object') {
-      // deny 路径：不产生 approval-request（纯工具节点）——权限拒绝 = 普通工具失败消息，
-      // 回注 error.type='permission-denied'，模型继续（CTO 语义定案 #3/#6）
-      return { deny: true, reason: decision.reason, errorType: 'permission-denied' };
-    }
+    // ask 路径：approval-request（唯一审批面）。deny 直拒路径已删除（权限矩阵无 deny 项；
+    // errorType='permission-denied' 不再产生——loop 类型保留兼容，见 core/loop/types.ts）。
     ctx.broker.push({
       event: 'approval-request',
       data: { toolCallId: call.id, name: call.name, arguments: call.arguments },
@@ -988,10 +1028,14 @@ async function sessionDetailFrames(
         return [
           {
             event: 'session-user',
-            // meta.system=true（评审哨兵）→ system:true（与在线流观察器同规）
+            // meta.system=true（评审哨兵）→ system:true（与在线流观察器同规）；
+            // images 与存储 payload 同形（ADR-0015：历史回放渲染图像卡）
             data: {
               text: ev.payload.content,
               ...(ev.meta?.system === true ? { system: true } : {}),
+              ...(ev.payload.images !== undefined && ev.payload.images.length > 0
+                ? { images: ev.payload.images }
+                : {}),
             },
           },
         ];
@@ -1183,6 +1227,14 @@ function defaultUserSkillsDir(): string {
   return join(homedir(), '.devmate', 'skills');
 }
 
+/**
+ * 缺省附件目录（~/.devmate/sessions/attachments；deps 未注入 AttachmentStore 时的兜底——
+ * 真实装配（assembleDeps）恒注入 <sessionsDir>/attachments 的 store，用户会话根随之）。
+ */
+function defaultAttachmentsDir(): string {
+  return join(homedir(), '.devmate', 'sessions', 'attachments');
+}
+
 /** 用户技能 id 的合法域（slug 化后严格 [a-z0-9-]——防路径逃逸的判定根：id 即目录名）。 */
 const USER_SKILL_ID_RE = /^[a-z0-9-]+$/;
 
@@ -1343,14 +1395,15 @@ function sendError(res: ServerResponse, status: number, message: string): void {
 
 async function readJson(
   req: IncomingMessage,
-  options: { allowEmpty?: boolean } = {},
+  options: { allowEmpty?: boolean; limit?: number } = {},
 ): Promise<unknown> {
+  const limit = options.limit ?? JSON_BODY_LIMIT;
   const chunks: Buffer[] = [];
   let total = 0;
   for await (const chunk of req) {
     const buffer = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
     total += buffer.length;
-    if (total > JSON_BODY_LIMIT) {
+    if (total > limit) {
       throw new HttpError(413, 'request body too large');
     }
     chunks.push(buffer);
@@ -1370,6 +1423,69 @@ async function readJson(
 
 function asString(value: unknown): string | undefined {
   return typeof value === 'string' ? value : undefined;
+}
+
+// ---------------------------------------------------------------------------
+// 多模态图片（ADR-0015 · dsh 管线落地）：/api/chat 上行 images 校验（纯函数）。
+// 形状 = session payload 的 UserImage——**ref 形**（内容寻址附件引用 sha256/<sha>.<ext>，
+// 图片字节在 <sessionsDir>/attachments/；事件/上行 slim——dataURL 不进会话文件）或
+// **url 形**（旧 dataURL 直存——向后兼容旧客户端；读侧直通）。宽高由客户端测量传入，
+// 服务端只校验正整数（token 估算面）。限额（dsh 三数）：20 图/消息（413 超限先行——
+// 有别于形状非法 400）；单图 20MiB/会话累计 200MiB 由 POST /api/attachments 强制。
+// 与前端上限镜像（src/ui/web/attachments.js 的 ATTACH_LIMITS——浏览器零构建
+// 不能 import .ts，展示层只读镜像，权威来源见 ADR-0015）。
+// ---------------------------------------------------------------------------
+
+/** 旧 url 形单图 dataURL 字符上限（旧协议 5MiB 文件 ≈ 6.99MiB base64 + 前缀 ≈ 7MiB；
+ *  新协议走 /api/attachments 的 20MiB 字节上限——本值只约束 legacy 直通）。 */
+const MAX_LEGACY_IMAGE_DATAURL_CHARS = 8 * 1024 * 1024;
+
+/**
+ * 解析并校验 images 字段（缺省 undefined → 无图）；形状非法 → 400；数量超限（>20）→ 413
+ * （dsh 上限；「超限 413 带原因码」——先于形状校验吞掉大请求）。
+ * 只在「图片消息」存在时校验 —— text 恒可为空（图消息的纯图形态）。
+ */
+function parseChatImages(images: unknown): UserImage[] | undefined {
+  if (images === undefined) return undefined;
+  if (!Array.isArray(images)) throw new HttpError(400, 'images must be an array');
+  if (images.length === 0) return undefined;
+  if (images.length > ATTACH_LIMITS.maxCount) {
+    throw new HttpError(
+      413,
+      `images must have at most ${ATTACH_LIMITS.maxCount} entries (image-count-limit)`,
+    );
+  }
+  const out: UserImage[] = [];
+  for (const img of images) {
+    if (typeof img !== 'object' || img === null) {
+      throw new HttpError(400, 'images entries must be objects {ref|url,width?,height?}');
+    }
+    const entry = img as Record<string, unknown>;
+    const ref = entry.ref;
+    const url = entry.url;
+    let image: UserImage;
+    if (isAttachmentRef(ref)) {
+      image = { ref };
+    } else if (
+      typeof url === 'string' &&
+      url.startsWith('data:image/') &&
+      url.length <= MAX_LEGACY_IMAGE_DATAURL_CHARS
+    ) {
+      image = { url };
+    } else {
+      throw new HttpError(400, 'images entries must be sha256 refs or data:image/... dataURLs');
+    }
+    for (const dim of ['width', 'height'] as const) {
+      const value = entry[dim];
+      if (value === undefined) continue;
+      if (typeof value !== 'number' || !Number.isInteger(value) || value < 1) {
+        throw new HttpError(400, `images.${dim} must be a positive integer`);
+      }
+      image[dim] = value;
+    }
+    out.push(image);
+  }
+  return out;
 }
 
 /** 错误码提取（fs 错误的 code 字段；非 fs 错误 → 'unknown'）。 */
@@ -1405,6 +1521,36 @@ function decodeWorkspaceRoot(raw: string): string {
 export function normalizeBrowseBase(raw: string | null, home: string = homedir()): string {
   if (raw === null || raw === '') return home;
   return normalize(isAbsolute(raw) ? raw : join(home, raw));
+}
+
+/**
+ * 工作区根的 canonical 形（VT-5）：存在 → realpath（消尾斜杠/软链解析——与注册表
+ * POST /api/workspaces 的存储口径一致）；不存在 → normalize（消尾斜杠/重复分隔符）。
+ * 会话根参数与注册表条目都经本函数归一后比较：`/tmp/x/` 与 `/tmp/x` 等效
+ * （UI browse 返回带尾斜杠路径时，已注册目录可以正常建会话——字面匹配误拒修复）。
+ */
+export async function canonicalizeWorkspaceRoot(raw: string): Promise<string> {
+  try {
+    return await realpath(raw);
+  } catch {
+    return normalize(raw);
+  }
+}
+
+/**
+ * 注册表成员判定（VT-5）：候选根 canonical 化后与注册表逐条比较；存量条目若非
+ * canonical 形（旧 config 字面值）也回退朗读一遍（两端同口径）。
+ */
+export async function workspaceRegisteredIn(
+  roots: readonly string[],
+  raw: string,
+): Promise<boolean> {
+  const canonical = await canonicalizeWorkspaceRoot(raw);
+  for (const entry of roots) {
+    if (entry === canonical) return true;
+    if ((await canonicalizeWorkspaceRoot(entry)) === canonical) return true;
+  }
+  return false;
 }
 
 const MIME: Record<string, string> = {
@@ -1464,6 +1610,15 @@ export function createDevmateServer(deps: DevmateServerDeps): DevmateServer {
     }
     return ctx;
   };
+
+  // 内容寻址附件存储（ADR-0015）：deps 注入优先（真实装配 = assembleDeps 的
+  // <sessionsDir>/attachments）；否则按 attachmentsDir（未注入的兜底）。
+  const attachmentStore =
+    deps.attachments ?? new AttachmentStore(deps.attachmentsDir ?? defaultAttachmentsDir());
+
+  // 附件 ref → dataURL 展开接缝（ADR-0015 请求时展开：读文件 + dataURL 组装；
+  // ref 缺失 → null = 该图降级文本提示，绝不 400）——注入 runOptions 进投影层。
+  const attachmentResolver = (ref: string): Promise<string | null> => attachmentStore.resolve(ref);
 
   // per-session 串行化（promise 链）：DELETE 全文与 POST /api/chat 的「检查+append」段
   // 互斥——DELETE×重开竞态修复（慢 dispose 放大窗口中 rm 不再落在新 run 脚下）。
@@ -1551,6 +1706,10 @@ export function createDevmateServer(deps: DevmateServerDeps): DevmateServer {
     reasoning: ReasoningEffort;
     /** 上下文窗口覆盖（C 档；未提供 = 未知（不传 runOptions，压缩不触发）。 */
     windowTokens?: number;
+    /** 请求侧输入上限（A 档；未提供 = 不发送/厂商默认）。 */
+    maxInputTokens?: number;
+    /** 请求侧输出上限（A 档；未提供 = runOptions.maxTokens 缺省（DEFAULT_MAX_TOKENS 估价/不发送））。 */
+    maxOutputTokens?: number;
     /** 权限预设（权限预设定案：缺省 'workspace-write'；POST /api/settings 即时生效）。 */
     permission: PermissionPreset;
     /** full-access 风险确认记录（epoch ms；前端风险门后写入——纯记录、不强制）。 */
@@ -1571,10 +1730,22 @@ export function createDevmateServer(deps: DevmateServerDeps): DevmateServer {
     ...(deps.settings?.windowTokens !== undefined
       ? { windowTokens: deps.settings.windowTokens }
       : {}),
+    ...(deps.settings?.maxInputTokens !== undefined
+      ? { maxInputTokens: deps.settings.maxInputTokens }
+      : {}),
+    ...(deps.settings?.maxOutputTokens !== undefined
+      ? { maxOutputTokens: deps.settings.maxOutputTokens }
+      : {}),
     ...(deps.settings?.permissionConfirmedAt !== undefined
       ? { permissionConfirmedAt: deps.settings.permissionConfirmedAt }
       : {}),
   };
+  /**
+   * 窗口是否用户显式覆盖（三源取窗）。初值 = deps.settings.windowTokensExplicit
+   * （assembleDeps 按 config.windowTokens 是否存在播种——preset 胚不算显式）；
+   * POST /api/settings 触碰 windowTokens 后恒 true（显式设置即锁定，探测不再顶替）。
+   */
+  let explicitWindowTokens = deps.settings?.windowTokensExplicit === true;
 
   /** 评审哨兵门（R2-S2）语义版装配：hasSubstantiveWork/hasReviewRun 由 ctx 观察器记帐的
    * RunStats 判定（纯函数 loop/types）；flag 为会话级一次性（注入即置位——护栏即一次）。 */
@@ -1593,7 +1764,7 @@ export function createDevmateServer(deps: DevmateServerDeps): DevmateServer {
     };
   }
 
-  function startRun(sessionId: string, text: string): void {
+  function startRun(sessionId: string, text: string, images?: UserImage[]): void {
     const ctx = ctxFor(sessionId);
     const controller = new AbortController();
     ctx.controller = controller;
@@ -1608,9 +1779,23 @@ export function createDevmateServer(deps: DevmateServerDeps): DevmateServer {
             ? deps.createLlm({ baseUrl: current.baseUrl, apiKey: current.apiKey })
             : deps.llm;
         const runOptions: Partial<RunOptions> = { ...deps.runOptions };
-        // C 档：设置侧思考强度 / 窗口覆盖每次 run 现读（POST /api/settings 即时生效）
+        // C 档：设置侧思考强度 / 三源窗口（覆盖 > 网关探测 > preset）每次 run 现读
         runOptions.reasoning = current.reasoning;
-        if (current.windowTokens !== undefined) runOptions.windowTokens = current.windowTokens;
+        const windowDecision = effectiveWindow();
+        if (windowDecision.window !== undefined) runOptions.windowTokens = windowDecision.window;
+        // A 档：输入/输出上限——每次 run 现读（POST /api/settings 即时生效）；
+        // 未设置 → 回到缺省（输出：闸门 A 按 DEFAULT_MAX_TOKENS 估价且请求不发送 max_tokens；
+        // 输入：不发送/厂商默认）。「最小契约」：maxInputTokens 不参与窗口预算结算。
+        if (current.maxOutputTokens !== undefined) {
+          runOptions.maxTokens = current.maxOutputTokens;
+        } else {
+          delete runOptions.maxTokens;
+        }
+        if (current.maxInputTokens !== undefined) {
+          runOptions.maxInputTokens = current.maxInputTokens;
+        } else {
+          delete runOptions.maxInputTokens;
+        }
         // R2-S1：方法论前置门按开关传递——false → 删除 methodology 键（门不拦）；
         // true 时装配层已注入（gate 只含 route/状态观察，索引内容服务端现读）。
         if (current.methodFirst === false) delete runOptions.methodology;
@@ -1624,6 +1809,9 @@ export function createDevmateServer(deps: DevmateServerDeps): DevmateServer {
         if (deps.createSummarizer !== undefined && runOptions.summarizer !== undefined) {
           runOptions.summarizer = deps.createSummarizer(llm, current.model);
         }
+        // 附件 ref 展开（ADR-0015）：服务端 resolver（读附件文件 + dataURL 组装）——
+        // 每次 run 注入（与 llm 同频重建；缺失 ref → 投影层降级文本提示）
+        runOptions.attachResolver = attachmentResolver;
         if (deps.composeSystemPrompt !== undefined) {
           // 系统提示每次运行前合成（基础 + 技能清单节 + 路由节 + 子代理节 + 任务分解节 +
           // 收尾评审节）：技能开关/workflow 配置变更即时作用（晚绑定回填已附接）；
@@ -1643,7 +1831,11 @@ export function createDevmateServer(deps: DevmateServerDeps): DevmateServer {
             ? await deps.composeRunTools(baseTools, sessionId)
             : baseTools;
         result = await run(
-          { sessionId, task: text },
+          {
+            sessionId,
+            task: text,
+            ...(images !== undefined && images.length > 0 ? { images } : {}),
+          },
           {
             ...runOptions,
             store: observedStore,
@@ -1689,6 +1881,86 @@ export function createDevmateServer(deps: DevmateServerDeps): DevmateServer {
     })();
   }
 
+  // -------------------------------------------------------------------------
+  // 内容寻址附件（ADR-0015 · dsh 管线落地）：POST /api/attachments 上传 +
+  // GET /api/attachments/<ref> 读回（同源展示面）
+  // -------------------------------------------------------------------------
+
+  /**
+   * POST /api/attachments：{sessionId, dataUrl, width?, height?}（dataURL 形）或
+   * {sessionId, data, mediaType, width?, height?}（纯 base64+类型形——两种都兼容）。
+   * → {ref:"sha256/<sha>.<ext>", width?, height?}（宽高由客户端测量传入；服务端只校验
+   * 正整数——token 估算面）。限额（dsh 三数；超 413 带原因码）：单图 ≤20MiB →
+   * attach-too-large；单会话累计 ≤200MiB → attach-session-quota。sessionId 必填
+   * （单会话累计记账键；与 /api/chat 的会话同键——客户端在首条消息前即生成）。
+   */
+  async function handleAttachmentsUpload(
+    req: IncomingMessage,
+    res: ServerResponse,
+  ): Promise<void> {
+    const body = await readJson(req, { limit: ATTACH_LIMITS.maxUploadBodyBytes });
+    if (typeof body !== 'object' || body === null) {
+      throw new HttpError(400, 'request body must be a JSON object');
+    }
+    const record = body as Record<string, unknown>;
+    const sessionId = asString(record.sessionId);
+    if (sessionId === undefined || sessionId === '') {
+      throw new HttpError(400, 'sessionId is required (attachment accounting key)');
+    }
+    try {
+      assertValidSessionId(sessionId);
+    } catch {
+      throw new HttpError(400, 'invalid session id');
+    }
+    const input: AttachmentUploadInput = { sessionId };
+    const dataUrl = asString(record.dataUrl);
+    const data = asString(record.data);
+    const mediaType = asString(record.mediaType);
+    if (dataUrl !== undefined) input.dataUrl = dataUrl;
+    if (data !== undefined) input.data = data;
+    if (mediaType !== undefined) input.mediaType = mediaType;
+    for (const dim of ['width', 'height'] as const) {
+      const value = record[dim];
+      if (value === undefined) continue;
+      if (typeof value !== 'number' || !Number.isInteger(value) || value < 1) {
+        throw new HttpError(400, `${dim} must be a positive integer`);
+      }
+      input[dim] = value;
+    }
+    if (
+      input.dataUrl === undefined &&
+      (input.data === undefined || input.mediaType === undefined)
+    ) {
+      throw new HttpError(400, 'body must be {sessionId, dataUrl, ...} or {sessionId, data, mediaType, ...}');
+    }
+    try {
+      const attached = await attachmentStore.receive(input);
+      sendJson(res, 200, attached);
+    } catch (err) {
+      if (err instanceof AttachmentStoreError) {
+        // 413 带原因码（code）：超限的错误形状与 4xx 形状校验并行（{error, code}）
+        sendJson(res, err.status, { error: err.message, code: err.code });
+        return;
+      }
+      throw err;
+    }
+  }
+
+  /** GET /api/attachments/<ref>（ref = sha256/<sha>.<ext>）：原始图像字节——UI 侧
+   *  渲染 img.src = /api/attachments/<ref>（ref 事件/帧的展示面；旧 dataURL 事件不经此面）。
+   *  内容寻址：sha256 恒等 → immutable 永久缓存。缺失/非法 → 404。 */
+  async function handleAttachmentsRaw(res: ServerResponse, rawRef: string): Promise<void> {
+    if (!isAttachmentRef(rawRef)) throw new HttpError(404, 'attachment not found');
+    const file = await attachmentStore.raw(rawRef);
+    if (file === null) throw new HttpError(404, 'attachment not found');
+    res.writeHead(200, {
+      'content-type': file.mediaType,
+      'content-length': file.bytes.length,
+      'cache-control': 'public, max-age=31536000, immutable',
+    });
+    res.end(file.bytes);
+  }
+
   async function handleChat(req: IncomingMessage, res: ServerResponse): Promise<void> {
     // 内存防线停机档（≥2GB）：拒绝新 run 启动（已有 run 不受影响；恢复 <1.2GB 自动解锁）
     if (guard !== null && !guard.runAllowed) {
@@ -1700,8 +1972,14 @@ export function createDevmateServer(deps: DevmateServerDeps): DevmateServer {
       throw new HttpError(400, 'request body must be a JSON object');
     }
     const text = asString((body as Record<string, unknown>).text);
-    if (text === undefined || text.trim() === '') {
-      throw new HttpError(400, 'text is required (non-empty string)');
+    // 多模态（ADR-0015）：纯文本仍必须非空；带 images 的图消息允许空文本
+    // （纯图形态：用户只附一张图 + 默认文案由前端保证——服务端只验证形状）。
+    const images = parseChatImages((body as Record<string, unknown>).images);
+    if (
+      (text === undefined || text.trim() === '') &&
+      (images === undefined || images.length === 0)
+    ) {
+      throw new HttpError(400, 'text is required (non-empty string) or images must be provided');
     }
     const supplied = asString((body as Record<string, unknown>).sessionId);
     const sessionId = supplied !== undefined && supplied !== '' ? supplied : `s-${randomUUID()}`;
@@ -1725,17 +2003,20 @@ export function createDevmateServer(deps: DevmateServerDeps): DevmateServer {
       // 「检查+append」段与 DELETE 的完整流程按会话串行化（并发删除不再落在 run 脚下）
       try {
         if (!(await deps.store.exists(sessionId))) {
-          await deps.store.create(sessionId);
-          // A 档：会话按项目文件夹分组——首建即落 workspace meta（旧会话/resume 无此事件）。
-          // 多工作区：workspaceRoot 参数优先（须 ∈ 注册表——未注册 400 workspace-not-registered；
-          // 参数只作用于首建，resume 忽略）；缺省 = deps.workspaceRoot（默认根）。
+          // VT-4 修复：workspaceRoot 注册表校验置于会话文件创建**之前**——未注册根
+          // 400 workspace-not-registered 且零持久副作用（不残留空会话文件/列表项）。
+          // 多工作区：workspaceRoot 参数只作用于首建（resume 忽略）；缺省 = 默认根。
+          // VT-5：注册表与参数都经 canonical 化比较（`/tmp/x/` ≡ `/tmp/x`——UI browse
+          // 返回带尾斜杠路径也能为已注册目录建会话）；meta 落 canonical 形。
           let root = deps.workspaceRoot;
           if (rawRoot !== undefined && rawRoot !== '') {
-            if (!workspaces.includes(rawRoot)) {
+            if (!(await workspaceRegisteredIn(workspaces, rawRoot))) {
               throw new HttpError(400, 'workspace-not-registered');
             }
-            root = rawRoot;
+            root = await canonicalizeWorkspaceRoot(rawRoot);
           }
+          await deps.store.create(sessionId);
+          // A 档：会话按项目文件夹分组——首建即落 workspace meta（旧会话/resume 无此事件）
           if (root !== undefined) {
             await observedStore.append(sessionId, {
               kind: 'event',
@@ -1743,7 +2024,13 @@ export function createDevmateServer(deps: DevmateServerDeps): DevmateServer {
             });
           }
         }
-        await observedStore.append(sessionId, { kind: 'user', payload: { content: text } });
+        await observedStore.append(sessionId, {
+          kind: 'user',
+          payload: {
+            content: text ?? '',
+            ...(images !== undefined && images.length > 0 ? { images } : {}),
+          },
+        });
       } catch (err) {
         ctx.active = false;
         if (err instanceof SessionExistsError || err instanceof SessionNotFoundError) {
@@ -1752,7 +2039,7 @@ export function createDevmateServer(deps: DevmateServerDeps): DevmateServer {
         throw err;
       }
     });
-    startRun(sessionId, text);
+    startRun(sessionId, text ?? '', images);
     sendJson(res, 200, { sessionId });
   }
 
@@ -1873,8 +2160,17 @@ export function createDevmateServer(deps: DevmateServerDeps): DevmateServer {
     if (!(await sessionExists(sessionId))) {
       throw new HttpError(404, `session not found: ${sessionId}`);
     }
+    // VT-8：全损坏（不可解析行 > 阈值）→ 标题「（会话损坏）」+ corrupted 标记——
+    // 与列表同口径（坏行被逐行跳过而 events 空时，不再冒充「（空会话）」）。
+    const corrupted = await isCorruptedSession(deps.store, sessionId);
     const { title, workspaceRoot, frames } = await sessionDetailFrames(deps.store, sessionId);
-    sendJson(res, 200, { sessionId, title, workspaceRoot, events: frames });
+    sendJson(res, 200, {
+      sessionId,
+      title: corrupted ? SESSION_CORRUPTED_TITLE : title,
+      workspaceRoot,
+      events: frames,
+      ...(corrupted ? { corrupted: true } : {}),
+    });
   }
 
   async function handleCreateSession(req: IncomingMessage, res: ServerResponse): Promise<void> {
@@ -1893,16 +2189,18 @@ export function createDevmateServer(deps: DevmateServerDeps): DevmateServer {
     }
     // 多工作区：workspaceRoot 参数（须 ∈ 注册表——未注册 400 workspace-not-registered；
     // POST /api/sessions 恒为新建，参数必然消费）；缺省 = deps.workspaceRoot（默认根）
+    // VT-5：注册表与参数均按 canonical 化比较（`/tmp/x/` ≡ `/tmp/x`——字面匹配误拒修复）；
+    // meta 落 canonical 形（与注册表存储口径一致）。
     const rawRoot = (body as Record<string, unknown>).workspaceRoot;
     if (rawRoot !== undefined && typeof rawRoot !== 'string') {
       throw new HttpError(400, 'workspaceRoot must be a string');
     }
     let root = deps.workspaceRoot;
     if (rawRoot !== undefined && rawRoot !== '') {
-      if (!workspaces.includes(rawRoot)) {
+      if (!(await workspaceRegisteredIn(workspaces, rawRoot))) {
         throw new HttpError(400, 'workspace-not-registered');
       }
-      root = rawRoot;
+      root = await canonicalizeWorkspaceRoot(rawRoot);
     }
     const sessionId = `s-${randomUUID()}`;
     ctxFor(sessionId);
@@ -2043,6 +2341,9 @@ export function createDevmateServer(deps: DevmateServerDeps): DevmateServer {
       }
       // 会话文件 + 该会话 shell 等资源联动（deps 实现；幂等——重复 DELETE 全走 404）
       if (deps.disposeSession !== undefined) await deps.disposeSession(sessionId);
+      // 附件引用扫描联动删除（ADR-0015）：本会话 manifest 引用的附件文件仅在
+      // 无其它会话引用时删除（内容寻址共享——同字节一文件；幂等）
+      await attachmentStore.deleteSession(sessionId);
     });
     // 成功路径断环：删除后该 id 的 per-session 串行化链随之清零（失效的历史承诺不再
     // 悬挂——同 id 重建从全新链开始；404/409 失败路径不删除，链保留给后续重试）。
@@ -2372,7 +2673,7 @@ export function createDevmateServer(deps: DevmateServerDeps): DevmateServer {
   }
 
   // -- 工作流（A2）与 MCP（A3）：均为配置层（子代理/MCP 实际执行属 P2，端点上只有配置） --
-  // maxParallel 夹紧 1-4（单一来源：shared/workflow 的 clampMaxParallel——三处副本已收敛）
+  // maxParallel 归一到 0-8（0 = 无上限；单一来源：shared/workflow 的 clampMaxParallel）
   const workflowState = {
     subagentsEnabled: deps.workflow?.subagentsEnabled ?? DEFAULT_SUBAGENTS_ENABLED,
     maxParallel: clampMaxParallel(deps.workflow?.maxParallel),
@@ -2470,14 +2771,16 @@ export function createDevmateServer(deps: DevmateServerDeps): DevmateServer {
       throw new HttpError(400, 'subagentsEnabled must be a boolean');
     }
     if (maxParallel !== undefined) {
-      // 1-4 档位硬限（整数；数字 2.0 视为整数 2——Number.isInteger 语义）
+      // 0-8 档位硬限（整数；数字 2.0 视为整数 2——Number.isInteger 语义）。
+      // 0 = 无上限（允许）；<0 / >8 / 非整 → 400（与 clampMaxParallel 的初值归一解耦：
+      // 初值坏值静默归一，POST 显式写入严格校验）。
       if (
         typeof maxParallel !== 'number' ||
         !Number.isInteger(maxParallel) ||
-        maxParallel < 1 ||
-        maxParallel > 4
+        maxParallel < 0 ||
+        maxParallel > 8
       ) {
-        throw new HttpError(400, 'maxParallel must be an integer in 1-4');
+        throw new HttpError(400, 'maxParallel must be an integer in 0-8');
       }
     }
     if (subagents === undefined && maxParallel === undefined) {
@@ -2618,12 +2921,39 @@ export function createDevmateServer(deps: DevmateServerDeps): DevmateServer {
     sendJson(res, 200, stats);
   }
 
+  /**
+   * 上下文窗口取窗（三源）：用户显式覆盖 > 网关探测（source:'gateway'）> preset 估算。
+   * 探测读取器现读（后台完成前 → null——回退 preset 胚）；detail 注明来源，进
+   * GET /api/settings 的 windowDetail；探测失败静默（不惊扰 stats）。
+   * 模型名尾标注解析层已取消（2026-08-30 用户裁定）：窗口来源仅三源，模型名中的
+   * `[N]m`/`[N]k` 不再解析（发送净化在 provider-adapter，不在本层）。
+   */
+  function effectiveWindow(): { window?: number; detail?: string } {
+    if (explicitWindowTokens && current.windowTokens !== undefined) {
+      return { window: current.windowTokens, detail: '用户显式覆盖（settings.windowTokens）' };
+    }
+    const discovered = deps.windowDiscovered !== undefined ? deps.windowDiscovered() : null;
+    if (discovered !== null && discovered.window !== null) {
+      return {
+        window: discovered.window,
+        detail: `网关 /models 探测：${discovered.detail ?? '未知来源'}`,
+      };
+    }
+    if (current.windowTokens !== undefined) {
+      return { window: current.windowTokens, detail: '供应商 preset 估算（可在设置覆盖）' };
+    }
+    return {};
+  }
+
   function settingsResponse(): {
     baseUrl: string;
     model: string;
     apiKey?: string;
     reasoning: ReasoningEffort;
     window?: number;
+    windowDetail?: string;
+    maxInputTokens?: number;
+    maxOutputTokens?: number;
     permission: PermissionPreset;
     permissionConfirmedAt?: number;
     methodFirst: boolean;
@@ -2635,6 +2965,9 @@ export function createDevmateServer(deps: DevmateServerDeps): DevmateServer {
       apiKey?: string;
       reasoning: ReasoningEffort;
       window?: number;
+      windowDetail?: string;
+      maxInputTokens?: number;
+      maxOutputTokens?: number;
       permission: PermissionPreset;
       permissionConfirmedAt?: number;
       methodFirst: boolean;
@@ -2651,8 +2984,13 @@ export function createDevmateServer(deps: DevmateServerDeps): DevmateServer {
       const masked = maskApiKey(current.apiKey);
       if (masked !== undefined) response.apiKey = masked;
     }
-    // C 档：窗口覆盖（预设估算在 deps 装配层播种；未知 → 不带键，前端回退内置估算）
-    if (current.windowTokens !== undefined) response.window = current.windowTokens;
+    // A 档：输入/输出上限——只回显「已设置」的值（未设不带键；前端输入框留空）
+    if (current.maxInputTokens !== undefined) response.maxInputTokens = current.maxInputTokens;
+    if (current.maxOutputTokens !== undefined) response.maxOutputTokens = current.maxOutputTokens;
+    // 窗口（取窗：用户覆盖 > 网关探测 > preset；无任何源 → 不带键，前端回退内置估算）
+    const windowSource = effectiveWindow();
+    if (windowSource.window !== undefined) response.window = windowSource.window;
+    if (windowSource.detail !== undefined) response.windowDetail = windowSource.detail;
     // full-access 风险确认记录（无记录不带键——前端只在 full-access 且已确认时展示）
     if (current.permissionConfirmedAt !== undefined) {
       response.permissionConfirmedAt = current.permissionConfirmedAt;
@@ -2704,6 +3042,32 @@ export function createDevmateServer(deps: DevmateServerDeps): DevmateServer {
       }
       windowTokens = rawWindowTokens;
     }
+    // A 档：输入/输出上限（严格正整数；未提供 = 不触碰（保持现值）
+    // ——「未设不传」：GET 只在设置了才带键，前端空输入 = 不发送）。
+    const rawMaxInputTokens = record.maxInputTokens;
+    let maxInputTokens: number | undefined;
+    if (rawMaxInputTokens !== undefined) {
+      if (
+        typeof rawMaxInputTokens !== 'number' ||
+        !Number.isInteger(rawMaxInputTokens) ||
+        rawMaxInputTokens < 1
+      ) {
+        throw new HttpError(400, 'maxInputTokens must be a positive integer');
+      }
+      maxInputTokens = rawMaxInputTokens;
+    }
+    const rawMaxOutputTokens = record.maxOutputTokens;
+    let maxOutputTokens: number | undefined;
+    if (rawMaxOutputTokens !== undefined) {
+      if (
+        typeof rawMaxOutputTokens !== 'number' ||
+        !Number.isInteger(rawMaxOutputTokens) ||
+        rawMaxOutputTokens < 1
+      ) {
+        throw new HttpError(400, 'maxOutputTokens must be a positive integer');
+      }
+      maxOutputTokens = rawMaxOutputTokens;
+    }
     const rawPermission = record.permission;
     let permission: PermissionPreset | undefined;
     if (rawPermission !== undefined) {
@@ -2741,6 +3105,8 @@ export function createDevmateServer(deps: DevmateServerDeps): DevmateServer {
       apiKey === undefined &&
       reasoning === undefined &&
       rawWindowTokens === undefined &&
+      rawMaxInputTokens === undefined &&
+      rawMaxOutputTokens === undefined &&
       rawPermission === undefined &&
       rawConfirmedAt === undefined &&
       rawMethodFirst === undefined &&
@@ -2752,6 +3118,8 @@ export function createDevmateServer(deps: DevmateServerDeps): DevmateServer {
     const touched: {
       reasoning?: boolean;
       windowTokens?: boolean;
+      maxInputTokens?: boolean;
+      maxOutputTokens?: boolean;
       permission?: boolean;
       permissionConfirmedAt?: boolean;
       methodFirst?: boolean;
@@ -2773,7 +3141,16 @@ export function createDevmateServer(deps: DevmateServerDeps): DevmateServer {
     }
     if (windowTokens !== undefined) {
       current.windowTokens = windowTokens;
+      explicitWindowTokens = true; // 显式设置即锁定（三源取窗：覆盖最高——探测不再顶替）
       touched.windowTokens = true;
+    }
+    if (maxInputTokens !== undefined) {
+      current.maxInputTokens = maxInputTokens;
+      touched.maxInputTokens = true;
+    }
+    if (maxOutputTokens !== undefined) {
+      current.maxOutputTokens = maxOutputTokens;
+      touched.maxOutputTokens = true;
     }
     if (permission !== undefined) {
       current.permission = permission;
@@ -2806,6 +3183,12 @@ export function createDevmateServer(deps: DevmateServerDeps): DevmateServer {
       if (current.apiKey !== undefined) snapshot.apiKey = current.apiKey;
       if (touched.reasoning === true) snapshot.reasoning = current.reasoning;
       if (touched.windowTokens === true) snapshot.windowTokens = current.windowTokens as number;
+      if (touched.maxInputTokens === true) {
+        snapshot.maxInputTokens = current.maxInputTokens as number;
+      }
+      if (touched.maxOutputTokens === true) {
+        snapshot.maxOutputTokens = current.maxOutputTokens as number;
+      }
       if (touched.permission === true) snapshot.permission = current.permission;
       if (touched.permissionConfirmedAt === true) {
         snapshot.permissionConfirmedAt = current.permissionConfirmedAt as number;
@@ -2813,6 +3196,18 @@ export function createDevmateServer(deps: DevmateServerDeps): DevmateServer {
       if (touched.methodFirst === true) snapshot.methodFirst = current.methodFirst;
       if (touched.reviewMode === true) snapshot.reviewMode = current.reviewMode;
       await deps.persistSettings(snapshot);
+    }
+    // 网关源重探：baseUrl/apiKey/model 变更后以新端点后台重探（不阻塞响应；
+    // 失败静默回退 preset/覆盖；未注入 probeWindow（关闭/测试 deps）→ 不探索）
+    if (
+      deps.probeWindow !== undefined &&
+      (baseUrl !== undefined || model !== undefined || apiKey !== undefined)
+    ) {
+      void deps
+        .probeWindow({ baseUrl: current.baseUrl, apiKey: current.apiKey, model: current.model })
+        .catch(() => {
+          // 静默：探测失败 → windowDiscovered 保持旧值/回退 preset（不惊扰）
+        });
     }
     sendJson(res, 200, settingsResponse());
   }
@@ -2945,6 +3340,12 @@ export function createDevmateServer(deps: DevmateServerDeps): DevmateServer {
       return handleStream(res, sessionId);
     }
     if (method === 'POST' && pathname === '/api/chat') return handleChat(req, res);
+    if (method === 'POST' && pathname === '/api/attachments') {
+      return handleAttachmentsUpload(req, res);
+    }
+    if (method === 'GET' && pathname.startsWith('/api/attachments/')) {
+      return handleAttachmentsRaw(res, pathname.slice('/api/attachments/'.length));
+    }
     if (method === 'POST' && pathname === '/api/approval') return handleApproval(req, res);
     if (method === 'POST' && pathname === '/api/interrupt') {
       const body = (await readJson(req)) as Record<string, unknown>;

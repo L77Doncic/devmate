@@ -32,6 +32,7 @@
 import { LlmError } from '../../shared/llm-types.js';
 import { extractErrorBody, RETRYABLE_STATUS } from './error-parse.js';
 import type {
+  ChatContentPart,
   ChatMessage,
   ChatRequest,
   ChatTool,
@@ -42,6 +43,29 @@ import type {
 /** 五家供应商 ID（ADR-0002 选型；新供应商接入 = 新增 id + preset）。 */
 export const PROVIDER_IDS = ['openai', 'deepseek', 'dashscope', 'glm', 'kimi'] as const;
 export type ProviderId = (typeof PROVIDER_IDS)[number];
+
+/**
+ * 模型名尾部 UI 标记后缀语法：`[N]m`（N 百万）/ `[N]k`（N 千），大小写宽容，仅当
+ * 出现在模型名**末尾**。单一权威来源：sanitizeProviderModel（发送前剥离）——窗口
+ * 标注层已于 2026-08-30 用户裁定取消，本语法仅保留用于发送净化。
+ */
+export const MODEL_WINDOW_HINT_RE: RegExp = /\[([0-9]+(?:\.[0-9]+)?)([kKmM])\]$/;
+
+/**
+ * 模型名后缀净化（纯函数）：末尾的 `[N]m`/`[N]k`（大小写宽容，可多个连续）是 UI
+ * 标记后缀而非供应商模型 ID 的一部分——带后缀直发网关会 400（供应商无此模型名
+ * 形态，如 DeepSeek 直发 `deepseek-v4-flash[1m]`）。尾部逐层剥离
+ * （`my/model[1m][2m]` → `my/model`）；非尾部保留（`my/model-1m-v2`、
+ * `my[m]model[1m]` → `my[m]model`——只剥到尾后，其余逐字）。
+ */
+export function sanitizeProviderModel(model: string): string {
+  let out = model;
+  for (;;) {
+    const next = out.replace(MODEL_WINDOW_HINT_RE, '');
+    if (next === out) return out;
+    out = next;
+  }
+}
 
 /**
  * reasoning_content 历史回传策略（API-SPEC §3.3 / CONTEXT「Reasoning Content 策略」）：
@@ -124,8 +148,24 @@ export interface ProviderPreset {
   readonly enableThinking?: boolean;
   /** Qwen 思考预算 1–32768（默认 4000，笔记 §2，走 extra_body）。 */
   readonly thinkingBudget?: number;
-  /** Qwen 输入上限（笔记 §1，走 extra_body）。 */
+  /** Qwen 输入上限预设默认（笔记 §1，走 extra_body）。 */
   readonly maxInputTokens?: number;
+  /**
+   * 请求侧 max_input_tokens 的 wire 载体（A 档；settings.maxInputTokens）：
+   * 'max_input_tokens' = DashScope/Qwen 专属字段（笔记 §1：走 extra_body）——本家支持，
+   * 未声明（*不发送该字段*）的供应商在适配层剔除并要求客户端见 meta（deepseek-vision.md §8：
+   * DeepSeek 官方无该参数——未证实，绝不发）。undefined = 不接受该参数。
+   */
+  readonly maxInputTokensField?: 'max_input_tokens';
+  /**
+   * 图像理解（ADR-0015）能力标记：供应商拥有接受图片的 vision 模型时 true
+   * （deepseek-vision.md §7/§4-2：仅 deepseek-v4-flash-vision-exp 接受图片；其余模型
+   * 官方返回 400 "This model does not support image"——本地预案在适配层先降级，绝不 400）。
+   * 缺省 false = 无 vision 面 → 任何带图消息在适配层降级为纯文本（不崩溃）。
+   * 注意：**该标记是供应商级**；模型级裁决 = visionModelsPatternOf 再匹配（只在
+   * `-vision-` 命名的模型上放行——官方文档「仅视觉模型接受图片」）。
+   */
+  readonly vision?: boolean;
   /** max_tokens 的 wire 名（§5.2 行 2：OpenAI/Kimi 已弃用 → max_completion_tokens）。 */
   readonly maxTokensField: 'max_tokens' | 'max_completion_tokens';
   /**
@@ -156,9 +196,14 @@ export interface WireRequest {
   readonly extraBody?: Record<string, unknown>;
   /**
    * 观测通道（ADR-0002「adapter 决策白的、可观测」）：记录本请求被剔除的采样参数
-   * （wire 键名，如 Kimi temperature/top_p；剔除才记录，无剔除不带）。
+   * （wire 键名，如 Kimi temperature/top_p；剔除才记录，无剔除不带）与
+   * 被降级的图片数（ADR-0015：非 vision 模型/供应商的带图消息——图片不发送，
+   * 消息降级为文本 + 系统说明；降级才记录，无降级不带）。
    */
-  readonly meta?: { readonly strippedParams: readonly string[] };
+  readonly meta?: {
+    readonly strippedParams?: readonly string[];
+    readonly degradedImages?: number;
+  };
 }
 
 /** 归一 finish_reason 词表（§4.4）：'aborted' 为一切提前终止/异常中断（含 GLM network_error/DeepSeek insufficient_system_resource）。 */
@@ -185,9 +230,21 @@ export function buildRequest(unified: ChatRequest, provider: ProviderPreset): Wi
   }
   const policy = reasoningPolicyOf(provider);
 
+  // 模型名净化（B 档）：尾标 `[N]m`/`[N]k` 是 UI 标记后缀不是供应商模型 ID —— 发送值
+  // 剥离后再发（如 DeepSeek 直发 `deepseek-v4-flash[1m]` → 400；净化后 200）。
+  // 注意：只净化**发送值**；unified.model 原样保留（窗口标注层已取消——2026-08-30
+  // 用户裁定；窗口来源 = 显式 windowTokens/网关探测/preset，不在本层）。
+  // 图像多模态（ADR-0015）：vision 是否放行 = 供应商级（preset.vision）∧ 模型级
+  // （官方仅 `-vision-` 命名模型接受图片；模型名经净化后判定）。非放行模型收到带图
+  // 消息一律降级为纯文本 + 系统说明（官方做法是 400 "This model does not support image"——
+  // 本地预案先降级，绝不 400、绝不崩），图像数记入 meta.droppedImages（可观测）。
+  const visionModel =
+    provider.vision !== true ? false : /vision/i.test(sanitizeProviderModel(unified.model));
+  const degradedImages = countImagesNotAllowed(unified.messages, visionModel);
+
   const body: Record<string, unknown> = {
-    model: unified.model,
-    messages: unified.messages.map((m) => toWireMessage(m, policy)),
+    model: sanitizeProviderModel(unified.model),
+    messages: unified.messages.map((m) => toWireMessage(m, policy, visionModel)),
     stream: true, // S1 契约：所有 agent 请求固定流式（§1.5）
   };
   if (unified.tools !== undefined) body.tools = toWireTools(unified.tools, provider);
@@ -199,6 +256,7 @@ export function buildRequest(unified: ChatRequest, provider: ProviderPreset): Wi
     body.parallel_tool_calls = unified.parallelToolCalls;
   }
   const strippedParams: string[] = [];
+  const extraBody: Record<string, unknown> = {};
   if (unified.temperature !== undefined) {
     if (excludedKeys.has('temperature')) strippedParams.push('temperature');
     else body.temperature = unified.temperature;
@@ -208,6 +266,15 @@ export function buildRequest(unified: ChatRequest, provider: ProviderPreset): Wi
     else body.top_p = unified.topP;
   }
   if (unified.maxTokens !== undefined) body[provider.maxTokensField] = unified.maxTokens;
+  // A 档：请求侧输入上限只在白名单供应商发送（deepseek-vision.md §8：DeepSeek 官方
+  // 无 max_input_tokens——未证实绝不发；仅 DashScope/Qwen 走 extra_body）。
+  if (unified.maxInputTokens !== undefined) {
+    if (provider.maxInputTokensField !== undefined) {
+      extraBody.max_input_tokens = unified.maxInputTokens;
+    } else {
+      strippedParams.push('max_input_tokens');
+    }
+  }
   if (unified.stop !== undefined) body.stop = [...unified.stop];
   if (unified.streamOptions !== undefined) {
     body.stream_options = { include_usage: unified.streamOptions.includeUsage === true };
@@ -229,7 +296,6 @@ export function buildRequest(unified: ChatRequest, provider: ProviderPreset): Wi
   }
   if (provider.clearThinking !== undefined) body.clear_thinking = provider.clearThinking; // §3.3
 
-  const extraBody: Record<string, unknown> = {};
   if (provider.enableThinking !== undefined) extraBody.enable_thinking = provider.enableThinking;
   if (provider.thinkingBudget !== undefined) extraBody.thinking_budget = provider.thinkingBudget;
   if (provider.maxInputTokens !== undefined) extraBody.max_input_tokens = provider.maxInputTokens;
@@ -238,7 +304,14 @@ export function buildRequest(unified: ChatRequest, provider: ProviderPreset): Wi
     baseUrl: provider.baseUrl,
     body,
     ...(Object.keys(extraBody).length > 0 ? { extraBody } : {}),
-    ...(strippedParams.length > 0 ? { meta: { strippedParams } } : {}),
+    ...(strippedParams.length > 0 || degradedImages > 0
+      ? {
+          meta: {
+            ...(strippedParams.length > 0 ? { strippedParams } : {}),
+            ...(degradedImages > 0 ? { degradedImages } : {}),
+          },
+        }
+      : {}),
   };
 }
 
@@ -308,12 +381,35 @@ function normalizeReasoningValue(value: string | undefined): string | undefined 
   return value; // 保留策略下原样透传（DeepSeek/Kimi 要求完整未修改）
 }
 
-function toWireMessage(message: ChatMessage, policy: ReasoningPolicy): Record<string, unknown> {
+function toWireMessage(
+  message: ChatMessage,
+  policy: ReasoningPolicy,
+  visionModel: boolean,
+): Record<string, unknown> {
   switch (message.role) {
     case 'system':
       return { role: 'system', content: message.content };
-    case 'user':
-      return { role: 'user', content: message.content };
+    case 'user': {
+      if (typeof message.content === 'string') {
+        return { role: 'user', content: message.content };
+      }
+      // 多模态块（ADR-0015）：vision 放行 → 块数组原样序列化（text/image_url 与
+      // deepseek-vision.md §1 官方形状逐字一致）；不放行 → 降级为纯文本+系统说明。
+      const text = textOfParts(message.content);
+      if (!visionModel) {
+        return {
+          role: 'user',
+          content: degradedImageText(text, countImagesOf(message.content)),
+        };
+      }
+      const wireParts: unknown[] = [];
+      if (text !== '') wireParts.push({ type: 'text', text });
+      for (const part of message.content) {
+        if (part.type !== 'image_url') continue;
+        wireParts.push({ type: 'image_url', image_url: { url: part.image_url.url } });
+      }
+      return { role: 'user', content: wireParts };
+    }
     case 'assistant': {
       const wire: Record<string, unknown> = {
         role: 'assistant',
@@ -423,4 +519,49 @@ function ruleMatches(rule: RetryableRule, code: string): boolean {
       return Number.isFinite(n) && n >= rule.from && n <= rule.to;
     }
   }
+}
+
+// ---------------------------------------------------------------------------
+// 多模态辅助（ADR-0015；纯函数）
+// ---------------------------------------------------------------------------
+
+/**
+ * 降级注记文案（非 vision 模型的带图消息：图像未发送，模型只收到文本 ——
+ * 系统说明给模型一个「图像没进来」的事实，避免模型凭空想象图内容）。
+ */
+export const DEGRADED_IMAGE_NOTE =
+  '（图像未能处理：当前模型不支持图像输入，以下内容不含图片信息。）';
+
+/** 块数组中 text 块文本拼接（逐块；仅文本块参与）。 */
+function textOfParts(parts: readonly ChatContentPart[]): string {
+  let out = '';
+  for (const p of parts) {
+    if (p.type === 'text') out += p.text;
+  }
+  return out;
+}
+
+/** 块数组中图片块个数（降级注记/meta 计数共用）。 */
+function countImagesOf(parts: readonly ChatContentPart[]): number {
+  let n = 0;
+  for (const p of parts) {
+    if (p.type === 'image_url') n += 1;
+  }
+  return n;
+}
+
+/** 带图消息总数（非放行裁决用；消息 content 为纯字符串无图）。 */
+function countImagesNotAllowed(messages: readonly ChatMessage[], visionModel: boolean): number {
+  if (visionModel) return 0;
+  let n = 0;
+  for (const m of messages) {
+    if (m.role === 'user' && typeof m.content !== 'string') n += countImagesOf(m.content);
+  }
+  return n;
+}
+
+/** 降级消息正文：原文本（原文保留）+ 注记（附该消息图片数）。 */
+function degradedImageText(text: string, imageCount: number): string {
+  const note = `\n${DEGRADED_IMAGE_NOTE}（${imageCount} 张图）`;
+  return text === '' ? note.trim() : text + note;
 }

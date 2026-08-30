@@ -27,6 +27,7 @@
   },
   "scripts": {
     "build": "tsc -p tsconfig.json && node scripts/copy-web.mjs && node scripts/copy-skills.mjs",
+    "check:dist": "node scripts/check-dist-sync.mjs",
     "dev": "tsc -w",
     "test": "vitest run",
     "test:watch": "vitest",

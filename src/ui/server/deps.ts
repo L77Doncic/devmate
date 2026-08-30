@@ -38,15 +38,26 @@ import { estimateTokens, extractSummaryContent } from '../../core/context/index.
 import type { ReasoningEffort } from '../../shared/llm-types.js';
 import { createJail } from '../../core/jail/index.js';
 import type { Jail } from '../../core/jail/index.js';
-import { LlmClient, getProviderPreset, defaultProviderPreset } from '../../core/llm/index.js';
-import type { ProviderId, ProviderPreset } from '../../core/llm/index.js';
+import {
+  LlmClient,
+  discoverWindow,
+  getProviderPreset,
+  defaultProviderPreset,
+} from '../../core/llm/index.js';
+import type { DiscoverWindowResult, ProviderId, ProviderPreset } from '../../core/llm/index.js';
+// 内容寻址附件存储（ADR-0015）：assembleDeps 注入 <sessionsDir>/attachments 的实例
+import { AttachmentStore } from './attachments.js';
 import { wiredLlmAdapter } from '../../core/loop/index.js';
 import type { LlmAdapter, RunOptions, ToolRegistry } from '../../core/loop/index.js';
 import { defineRegistry } from '../../core/loop/index.js';
 import { unknownToolResult } from '../../core/loop/tools.js';
 import { createSubagentPool } from '../../core/loop/subagent.js';
 import type { SubagentPool, SubagentResult } from '../../core/loop/subagent.js';
-import { clampMaxParallel, DEFAULT_SUBAGENTS_ENABLED } from '../../shared/workflow.js';
+import {
+  clampMaxParallel,
+  DEFAULT_SUBAGENTS_ENABLED,
+  maxParallelCapText,
+} from '../../shared/workflow.js';
 import type { WorkflowConfig } from '../../shared/workflow.js';
 import { JsonlFileAdapter } from '../../core/session/index.js';
 import type { SessionStore } from '../../core/session/index.js';
@@ -68,7 +79,12 @@ import type {
   MethodologyIndex,
   SkillMethodology,
 } from '../../shared/methodology.js';
-import { deriveTitle, sessionWorkspaceOf } from './emit.js';
+import {
+  SESSION_CORRUPTED_TITLE,
+  SESSION_CORRUPTION_RATIO,
+  deriveTitle,
+  sessionWorkspaceOf,
+} from './emit.js';
 import type {
   DevmateServerDeps,
   McpServerConfig,
@@ -97,6 +113,10 @@ export interface DevmateConfig {
   costLimitUsd?: number | undefined;
   maxSteps?: number | undefined;
   windowTokens?: number | undefined;
+  /** 请求侧输入上限初值（A 档；缺省不发送/厂商默认；settings 可改）。 */
+  maxInputTokens?: number | undefined;
+  /** 请求侧输出上限初值（A 档；缺省 = DEFAULT_MAX_TOKENS 估价/不发送；settings 可改）。 */
+  maxOutputTokens?: number | undefined;
   /** 思考强度初值（缺省 'medium'——CTO 裁定；设置页可改，persist 走 settings）。 */
   reasoning?: ReasoningEffort | undefined;
   /** 权限预设初值（缺省 'workspace-write'——CTO 裁定；设置页可改，persist 走 settings）。 */
@@ -109,10 +129,15 @@ export interface DevmateConfig {
   idleShellTtlMs?: number | undefined;
   /** Skills 资产目录（缺省 resolve(process.cwd(), 'dist/assets/skills')；不存在 → 空列表）。 */
   skillsDir?: string | undefined;
-  /** 工作流配置初值（缺省 {subagentsEnabled:true, maxParallel:2}；maxParallel 夹紧 1-4）。 */
+  /** 工作流配置初值（缺省 {subagentsEnabled:true, maxParallel:2}；maxParallel 归一 0-8——0 = 无上限）。 */
   workflow?: { subagentsEnabled?: boolean; maxParallel?: number } | undefined;
   /** MCP 服务器配置初值（CLI 从 ~/.devmate/config.json 的 mcp 节注入；缺省空表）。 */
   mcpServers?: McpServerConfig[] | undefined;
+  /**
+   * 网关窗口探测（三源取窗 · 网关层）开关与测试接缝：false = 关闭（有 apiKey 也不探测）；
+   * {fetchImpl?, timeoutMs?} 注入假 fetch/快超时（测试——禁止外部网络）；缺省 = 开——
+   * 仅当 apiKey 存在时**后台**探测一次（不阻塞启动；失败静默 → 服务端按 preset 兜底）。 */
+  windowDiscovery?: { fetchImpl?: typeof fetch; timeoutMs?: number } | false | undefined;
   /** 测试接缝：替换 connectMcpServer 的连接实现（真实装配不传；假连接固定工具面）。 */
   mcpConnect?: ((spec: McpServerConfig) => Promise<McpClient | null>) | undefined;
   /** 方法论前置门（R2-S1）初值：缺省 true；false = 不注入 RunOptions.methodology（关掉前置门）。 */
@@ -185,7 +210,23 @@ export function createSessionToolsFactory(options: {
   const idleShellTtlMs = options.idleShellTtlMs ?? DEFAULT_IDLE_SHELL_TTL_MS;
   // use_skill / spawn_subagent：无会话态共享一组（索引执行期现读、池级单例——开关即时生效）
   const skillTool = createSkillTool({ index: options.skillsIndex ?? (() => null) });
-  const subagentTool = createSubagentTool({ pool: options.subagentPool ?? disabledPool() });
+  // B-1 借鉴①：spawn_subagent 的 skillContent 复用技能索引晚绑定引用（同 use_skill 源）——
+  // 开关纪律与 use_skill 同源（list() 的 enabled）：disabled/未知 id → null →
+  // 子代理零注入普通模式（工具层兜底，不硬失败）；索引未回填 → 同样 null。
+  const subagentTool = createSubagentTool({
+    pool: options.subagentPool ?? disabledPool(),
+    skillContent: async (id) => {
+      const index = options.skillsIndex?.();
+      if (index === null || index === undefined) return null;
+      try {
+        const entry = (await index.list()).find((skill) => skill.id === id);
+        if (entry === undefined || !entry.enabled) return null;
+      } catch {
+        return null; // 索引读取故障按零注入收敛
+      }
+      return await index.content(id);
+    },
+  });
   const shells = new Map<string, PersistentShell>();
   const sessionBuilds = new Map<string, Promise<ToolRegistry>>();
   /** 持久会话根 → 监狱 + shell 初值 cwd（canonical；多次构建共享——同一根多会话同监狱）。 */
@@ -336,6 +377,8 @@ interface SessionBuild {
  * <dir>/<id>.jsonl 逐个扫描；标题 = 首条 user 事件前 40 字符（deriveTitle；中文按字符）或
  * （空会话）；createdAtMs/lastEventMs 来自事件 ts，空文件回退 mtime；单会话读取失败跳过
  * 不拖垮整表（容错读与 JsonlFileAdapter 同口径）。
+ * 损坏语义（VT-8）：全损坏（不可解析行占比 > SESSION_CORRUPTION_RATIO，fileHealthFor 判定）
+ * → 标题「（会话损坏）」+ corrupted:true——不冒充「（空会话）」。
  */
 export function makeSessionLister(options: { store: SessionStore; dir: string }): SessionLister {
   return async (): Promise<SessionSummary[]> => {
@@ -366,6 +409,13 @@ export function makeSessionLister(options: { store: SessionStore; dir: string })
       let stepCount = 0;
       // A 档：会话所属项目文件夹（首条 session-workspace meta；旧会话/畸形 → null）
       let workspaceRoot: string | null = null;
+      // VT-8：全损坏判定（不作弊——坏行被 events() 跳过时列表曾把它当（空会话）展示）
+      let corrupted = false;
+      try {
+        corrupted = await isCorruptedSession(options.store, sessionId);
+      } catch {
+        corrupted = false; // 健康统计失败不阻断列表
+      }
       try {
         for await (const ev of options.store.events(sessionId)) {
           if (workspaceRoot === null) workspaceRoot = sessionWorkspaceOf(ev);
@@ -379,15 +429,24 @@ export function makeSessionLister(options: { store: SessionStore; dir: string })
       }
       summaries.push({
         sessionId,
-        title: deriveTitle(firstUser),
+        title: corrupted ? SESSION_CORRUPTED_TITLE : deriveTitle(firstUser),
         createdAtMs: createdAtMs !== 0 ? createdAtMs : statMs,
         lastEventMs: lastEventMs !== 0 ? lastEventMs : statMs,
         stepCount,
         workspaceRoot,
+        ...(corrupted ? { corrupted: true } : {}),
       });
     }
     return summaries;
   };
+}
+
+/** 全损坏判定（VT-8）：fileHealthFor 可用且「总行数>0 且不可解析占比 > 阈值」；不可用 → false。 */
+export async function isCorruptedSession(store: SessionStore, sessionId: string): Promise<boolean> {
+  if (store.fileHealthFor === undefined) return false;
+  const health = await store.fileHealthFor(sessionId);
+  if (health === null || health.totalLines === 0) return false;
+  return (health.totalLines - health.parseableLines) / health.totalLines > SESSION_CORRUPTION_RATIO;
 }
 
 /** 与 run 同一 llm 的摘要器：五段式指令 → 纯文本回包 → <summary> 抽取。 */
@@ -866,8 +925,9 @@ function assembleSystemPrompt(
   const routeSection = methodologyRouteSection(routeLines);
   if (routeSection !== '') sections.push(routeSection);
   if (workflow.subagentsEnabled) {
+    // maxParallel=0 = 无上限：显示「无上限」而非误导性的 0（maxParallelCapText 单一来源）
     sections.push(
-      `## 子代理\n对于可独立处理的子任务，可调用 spawn_subagent（并行上限 ${workflow.maxParallel}）` +
+      `## 子代理\n对于可独立处理的子任务，可调用 spawn_subagent（并行上限 ${maxParallelCapText(workflow.maxParallel)}）` +
         `以隔离上下文；报告最多 4k 字符。`,
     );
   }
@@ -947,6 +1007,10 @@ export async function assembleDeps(config: DevmateConfig): Promise<DevmateServer
 
   const store = new JsonlFileAdapter({ dir: sessionsDir });
 
+  // 内容寻址附件存储（ADR-0015）：<sessionsDir>/attachments（目录 0700/文件 0600）——
+  // 事件/帧只存 ref，图片字节在附件目录；服务端经注入的 resolver 请求时展开
+  const attachments = new AttachmentStore(join(sessionsDir, 'attachments'));
+
   // Workflow 晚绑定接缝：服务端启动时经 attach 回填（读取器/索引实现）——技能开关与
   // 工作流配置（POST /api/skills|workflow）在服务端变更，工具/池/提示词合成经此现读。
   const skillsRef: { index: SkillsIndex | null } = { index: null };
@@ -974,6 +1038,46 @@ export async function assembleDeps(config: DevmateConfig): Promise<DevmateServer
     baseUrl: config.baseUrl ?? provider.baseUrl,
     apiKey: config.apiKey,
   });
+
+  // 三源取窗 · 网关层：装配后**可选后台**探测 GET {baseUrl}/models（不阻塞启动；
+  // 无 apiKey → 不发请求（本地端点）；任何失败静默 → windowRef 恒 null，服务端窗口
+  // 回退预设/覆盖——不惊扰 stats、不拖住进程退出（探测 timer 已 unref）。
+  const windowRef: { result: DiscoverWindowResult | null } = { result: null };
+  const discoveryOff = config.windowDiscovery === false;
+  const discoveryOpts =
+    config.windowDiscovery !== false && typeof config.windowDiscovery === 'object'
+      ? config.windowDiscovery
+      : null;
+  if (!discoveryOff && config.apiKey !== undefined) {
+    void discoverWindow({
+      baseUrl: config.baseUrl ?? provider.baseUrl,
+      apiKey: config.apiKey,
+      model: config.model,
+      ...(discoveryOpts?.fetchImpl !== undefined ? { fetchImpl: discoveryOpts.fetchImpl } : {}),
+      ...(discoveryOpts?.timeoutMs !== undefined ? { timeoutMs: discoveryOpts.timeoutMs } : {}),
+    })
+      .then((result) => {
+        windowRef.result = result;
+      })
+      .catch(() => {
+        // 双保险：discoverWindow 自身静默收敛（契约不抛）；到达即失败（不惊扰）
+      });
+  }
+  /** 设置变更后的重探（POST /api/settings 触碰 baseUrl/apiKey/model 时服务端调用；
+   *  注入接缝（fetchImpl/timeoutMs）同源；关闭时服务端拿不到 → 不再探索）。 */
+  const probeWindow = async (params: {
+    baseUrl: string;
+    apiKey: string | undefined;
+    model: string;
+  }): Promise<DiscoverWindowResult> => {
+    const result = await discoverWindow({
+      ...params,
+      ...(discoveryOpts?.fetchImpl !== undefined ? { fetchImpl: discoveryOpts.fetchImpl } : {}),
+      ...(discoveryOpts?.timeoutMs !== undefined ? { timeoutMs: discoveryOpts.timeoutMs } : {}),
+    });
+    windowRef.result = result;
+    return result;
+  };
 
   // 子代理池：池级单例；config 闭包现读 workflowRef（服务端 attach 后 = 实时配置，
   // 未 attach 回退配置初值）——改 /api/workflow 后后续 spawn 即时生效（动态读取语义）。
@@ -1036,6 +1140,9 @@ export async function assembleDeps(config: DevmateConfig): Promise<DevmateServer
   if (config.costLimitUsd !== undefined) runOptions.costLimitUsd = config.costLimitUsd;
   if (config.maxSteps !== undefined) runOptions.maxSteps = config.maxSteps;
   if (config.windowTokens !== undefined) runOptions.windowTokens = config.windowTokens;
+  // A 档：输出上限播进 runOptions.maxTokens（缺省 = undefined：闸门 A 按 DEFAULT_MAX_TOKENS
+  // 估价且请求不带 max_tokens——厂商默认；settings POST 即时覆盖同键）。
+  if (config.maxOutputTokens !== undefined) runOptions.maxTokens = config.maxOutputTokens;
   if (config.systemPrompt !== undefined) runOptions.systemPrompt = config.systemPrompt;
   if (config.toolTimeoutMs !== undefined) runOptions.toolTimeoutMs = config.toolTimeoutMs;
   // 方法论前置门（R2-S1）：缺省开启（config.methodFirst !== false 才注入）；
@@ -1059,6 +1166,9 @@ export async function assembleDeps(config: DevmateConfig): Promise<DevmateServer
 
   return {
     store,
+    // 内容寻址附件存储（ADR-0015）：<sessionsDir>/attachments（真实装配注入——
+    // 服务端缺省兜底仅服务未注入形态）
+    attachments,
     // A 档：会话首建的 workspaceRoot（服务端写入 session-workspace meta；分组语义单一来源）
     workspaceRoot: config.workspaceRoot,
     // 工作区注册表（多工作区；欠省 [默认根]；去重保序——服务端 POST/DELETE /api/workspaces 增删）
@@ -1134,6 +1244,11 @@ export async function assembleDeps(config: DevmateConfig): Promise<DevmateServer
     createLlm,
     createSummarizer: makeSummarizer,
     model: config.model,
+    // 三源取窗 · 网关层：探测结果读取器（服务端 GET /api/settings 与每次 run 现读；
+    // 未探测/未完成/关闭 → null ——服务端按「覆盖 > preset」兜底）+ 设置变更重探
+    // （POST /api/settings 触碰 baseUrl/apiKey/model 后服务端调用；关闭时不注入）。
+    windowDiscovered: () => windowRef.result,
+    ...(discoveryOff ? {} : { probeWindow }),
     settings: {
       baseUrl: config.baseUrl ?? provider.baseUrl,
       model: config.model,
@@ -1148,12 +1263,19 @@ export async function assembleDeps(config: DevmateConfig): Promise<DevmateServer
       // 评审哨兵初值（R2-S2：缺省开；POST /api/settings 运行时可关——false = 不注入 gate）
       reviewMode: config.reviewMode ?? true,
       ...(config.apiKey !== undefined ? { apiKey: config.apiKey } : {}),
+      // 取窗种子：用户显式覆盖（config.windowTokens）优先，引擎按
+      // 「覆盖 > 网关探测 > preset」合并（服务端现读；模型名尾标注层已取消——
+      // 2026-08-30 用户裁定）；windowTokensExplicit 标记「用户显式」——服务端据此
+      // 与 preset 胚区分（探测结果只在无覆盖时可用）。
       ...(config.windowTokens !== undefined
-        ? { windowTokens: config.windowTokens }
-        : { windowTokens: provider.contextWindowTokens }),
+        ? { windowTokens: config.windowTokens, windowTokensExplicit: true }
+        : { windowTokens: provider.contextWindowTokens, windowTokensExplicit: false }),
       ...(config.permissionConfirmedAt !== undefined
         ? { permissionConfirmedAt: config.permissionConfirmedAt }
         : {}),
+      // A 档：输入/输出上限初值（缺省不播种 = 服务端 post 补丁可见「未设」——不发送）
+      ...(config.maxInputTokens !== undefined ? { maxInputTokens: config.maxInputTokens } : {}),
+      ...(config.maxOutputTokens !== undefined ? { maxOutputTokens: config.maxOutputTokens } : {}),
     },
     runOptions,
   };

@@ -7,7 +7,7 @@
  * payload 字段名全部钉死在 SseEventData 判别联合里，禁止改名/加嵌套/re-encode。
  * 术语遵循 CONTEXT.md：ToolCall（工具调用请求）与 ToolResult（工具执行结果）按调用 ID 配对。
  */
-import type { SessionEvent } from '../../shared/session-types.js';
+import type { SessionEvent, UserImage } from '../../shared/session-types.js';
 
 /** toolCalls 的线上形状（与会话事件 assistant.toolCalls 同构；arguments 为原始 JSON 字符串）。 */
 export interface ToolCallView {
@@ -46,6 +46,12 @@ export const TITLE_MAX_CHARS = 40;
 /** 无 user 事件（空会话）的标题。 */
 export const SESSION_EMPTY_TITLE = '（空会话）';
 
+/** 全损坏会话（不可解析行占比超过阈值）的标题（VT-8：不冒充（空会话））。 */
+export const SESSION_CORRUPTED_TITLE = '（会话损坏）';
+
+/** 损坏判定阈值：不可解析行占比 > 本值 → 标记「（会话损坏）」（正常崩溃的「完整行+截断尾行」远超阈值下）。 */
+export const SESSION_CORRUPTION_RATIO = 0.8;
+
 /** 由第一段 user 事件文本派生态标题；无内容则（空会话）。 */
 export function deriveTitle(firstUserContent: string | undefined): string {
   if (firstUserContent === undefined || firstUserContent === '') return SESSION_EMPTY_TITLE;
@@ -68,7 +74,12 @@ export function deriveTitle(firstUserContent: string | undefined): string {
 export type SseEventData =
   // system?: true = 系统样式用户消息（R2-S2 评审哨兵：事件 meta.system=true 映射——
   // 前端显示为浅色系统 chip；缺省不携带——普通用户消息协议不变）。
-  | { event: 'session-user'; data: { text: string; system?: boolean } }
+  // images?: 多模态图片（ADR-0015：与会话 user payload 同形——dataURL 图 + 可选宽高；
+  // 在线流与历史回放同一形状，前端直接渲染）。
+  | {
+      event: 'session-user';
+      data: { text: string; system?: boolean; images?: UserImage[] };
+    }
   | { event: 'assistant-delta'; data: { text: string } }
   | { event: 'reasoning'; data: { text: string } }
   | { event: 'assistant-done'; data: { content: string; toolCalls: ToolCallView[] } }

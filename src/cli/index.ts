@@ -66,8 +66,41 @@ export async function main(argv: string[], io: CliIo): Promise<number> {
   return 1;
 }
 
+/** 信号注册接缝（VT-2 修复；测试注入假实现，不触真实进程）。 */
+export interface SignalIo {
+  once(signal: string, handler: () => void): void;
+  exit(code: number): never;
+}
+
+/**
+ * 优雅关闭信号注册（VT-2 修复 a）：SIGINT（Ctrl-C）与 SIGTERM（kill/port-kill/systemd
+ * stop 等常见运维动作）走**同一**完整关闭回调并退出 0。SIGTERM 是桌面/服务编排终止的
+ * 默认信号——此前只处理 SIGINT，MCP 子进程组（npm→sh→node，命令行含凭据）在父进程
+ * 死亡后成为孤儿常驻。关闭回调内含 server.close → deps.dispose（mcpLauncher.dispose +
+ * 常驻 shell 全清，见 ui/server）；幂等（信号 once）。
+ */
+export function installGracefulSignals(
+  signals: readonly string[],
+  io: SignalIo,
+  shutdown: () => void | Promise<void>,
+): void {
+  for (const signal of signals) {
+    io.once(signal, () => {
+      // 退出码 0 = 主动优雅关闭（不虚报失败；close 抛错也照样退出——清理只可能错过不致命）。
+      void Promise.resolve(shutdown()).then(
+        () => io.exit(0),
+        () => io.exit(0),
+      );
+    });
+  }
+}
+
 /** 生产 RunWebIo：node 资产接线（os/fs/path/child_process）。 */
 function makeWebIo(): RunWebIo {
+  const signalIo: SignalIo = {
+    once: (signal, handler) => process.once(signal, handler),
+    exit: (code) => process.exit(code),
+  };
   return {
     cwd: process.cwd(),
     env: process.env,
@@ -88,11 +121,7 @@ function makeWebIo(): RunWebIo {
     println: (line) => process.stdout.write(`${line}\n`),
     printErr: (line) => process.stderr.write(`${line}\n`),
     setSignalHandler: (cb) => {
-      process.once('SIGINT', () => {
-        // server.close() 只关 HTTP；常驻 shell 是进程内子进程，随本进程退出消亡。
-        // 退出码 0 = 用户主动 Ctrl-C 的优雅关闭。
-        void Promise.resolve(cb()).then(() => process.exit(0));
-      });
+      installGracefulSignals(['SIGINT', 'SIGTERM'], signalIo, cb);
     },
   };
 }
