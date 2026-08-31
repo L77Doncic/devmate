@@ -1,15 +1,15 @@
 # DevMate
 
-**devmate-cli** — 从零实现的 TypeScript 编程智能体：**零框架、零运行时依赖**——兼容任意 OpenAI 兼容的 LLM 端点。
+**@teresal/devmate-cli** — 从零实现的 TypeScript 编程智能体：**零框架、零运行时依赖**——兼容任意 OpenAI 兼容的 LLM 端点。安装后的命令行二进制仍为 `devmate-cli`。
 
 <p align="center">
   <a href="https://github.com/L77Doncic/devmate/actions/workflows/ci.yml"><img src="https://github.com/L77Doncic/devmate/actions/workflows/ci.yml/badge.svg" alt="CI" /></a>
-  <a href="https://www.npmjs.com/package/devmate-cli"><img src="https://img.shields.io/npm/v/devmate-cli.svg" alt="npm version" /></a>
+  <a href="https://www.npmjs.com/package/@teresal/devmate-cli"><img src="https://img.shields.io/npm/v/@teresal/devmate-cli.svg" alt="npm version" /></a>
   <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-blue.svg" alt="MIT License" /></a>
   <a href="https://nodejs.org/"><img src="https://img.shields.io/badge/node-%3E%3D%2020-339933.svg" alt="Node.js &gt;= 20" /></a>
 </p>
 
-DevMate 是一个从零实现、零框架依赖的 TypeScript 编程智能体（npm 包 `devmate-cli`）：用户给出一个编程任务，它在本机工作区里自主读写文件、执行命令、反复调用 OpenAI 兼容的 LLM，直至完成。整个依赖栈的最底层只用 Node 原生能力——原生 `fetch` + 手写 SSE 解析器（见 [docs/adr/0001-zero-dependency-llm-client.md](docs/adr/0001-zero-dependency-llm-client.md)），对标简化版 Claude Code / DeepSeek Harness 式 harness。
+DevMate 是一个从零实现、零框架依赖的 TypeScript 编程智能体（npm 包 `@teresal/devmate-cli`，命令行二进制仍为 `devmate-cli`）：用户给出一个编程任务，它在本机工作区里自主读写文件、执行命令、反复调用 OpenAI 兼容的 LLM，直至完成。整个依赖栈的最底层只用 Node 原生能力——原生 `fetch` + 手写 SSE 解析器（见 [docs/adr/0001-zero-dependency-llm-client.md](docs/adr/0001-zero-dependency-llm-client.md)），对标简化版 Claude Code / DeepSeek Harness 式 harness。
 
 ## 为什么是 DevMate？
 
@@ -128,13 +128,13 @@ flowchart LR
 要求：**Node.js ≥ 20**（含 npm）。无需全局安装：
 
 ```bash
-npx devmate-cli web
+npx @teresal/devmate-cli web
 ```
 
-本地服务绑定 `127.0.0.1` 并自动打开浏览器。在任意项目目录用 `npx devmate-cli web` 启动即可将其设为默认工作区；更多工作区用 hero 或侧栏添加。启动首屏需先**选择或确认工作区**（默认 = 启动目录）：目录弹窗选定或点「使用默认工作区」即解锁输入。换个工作区：
+本地服务绑定 `127.0.0.1` 并自动打开浏览器。在任意项目目录用 `npx @teresal/devmate-cli web` 启动即可将其设为默认工作区；更多工作区用 hero 或侧栏添加。启动首屏需先**选择或确认工作区**（默认 = 启动目录）：目录弹窗选定或点「使用默认工作区」即解锁输入。换个工作区：
 
 ```bash
-npx devmate-cli web --workspace /path/to/your/project --port 7911 --no-open
+npx @teresal/devmate-cli web --workspace /path/to/your/project --port 7911 --no-open
 ```
 
 然后配置密钥——环境变量或 Web 设置页二选一：
@@ -144,13 +144,13 @@ npx devmate-cli web --workspace /path/to/your/project --port 7911 --no-open
 export DEV_MATE_API_KEY=sk-xxxxxxxxxxxxxxxxxxxx
 export DEV_MATE_BASE_URL=https://api.deepseek.com    # 可选（默认 DeepSeek）
 export DEV_MATE_MODEL=deepseek-v4-flash              # 可选
-npx devmate-cli web
+npx @teresal/devmate-cli web
 ```
 
 ```powershell
 # PowerShell
 $env:DEV_MATE_API_KEY = "sk-xxxxxxxxxxxxxxxxxxxx"
-npx devmate-cli web
+npx @teresal/devmate-cli web
 ```
 
 任意 OpenAI 兼容端点都可用（Bearer 认证 + `messages/tools/SSE` 公共主干），换供应商无需换 harness。UI 中「设置 → 模型接口」接受同样的三项，写入 `~/.devmate/config.json`（`0600`，目录 `0700`——密钥永不进仓库；两权限皆 POSIX 语义——Windows 无 POSIX `chmod`，见「安全基线」注记）。

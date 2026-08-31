@@ -1,15 +1,15 @@
 # DevMate
 
-**devmate-cli** — A TypeScript coding agent built from scratch: **zero frameworks, zero runtime dependencies** — compatible with any OpenAI-compatible LLM endpoint.
+**@teresal/devmate-cli** — A TypeScript coding agent built from scratch: **zero frameworks, zero runtime dependencies** — compatible with any OpenAI-compatible LLM endpoint. The installed CLI binary is `devmate-cli`.
 
 <p align="center">
   <a href="https://github.com/L77Doncic/devmate/actions/workflows/ci.yml"><img src="https://github.com/L77Doncic/devmate/actions/workflows/ci.yml/badge.svg" alt="CI" /></a>
-  <a href="https://www.npmjs.com/package/devmate-cli"><img src="https://img.shields.io/npm/v/devmate-cli.svg" alt="npm version" /></a>
+  <a href="https://www.npmjs.com/package/@teresal/devmate-cli"><img src="https://img.shields.io/npm/v/@teresal/devmate-cli.svg" alt="npm version" /></a>
   <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-blue.svg" alt="MIT License" /></a>
   <a href="https://nodejs.org/"><img src="https://img.shields.io/badge/node-%3E%3D%2020-339933.svg" alt="Node.js &gt;= 20" /></a>
 </p>
 
-> **中文摘要**：DevMate 是一个从零实现的 TypeScript 编程智能体（npm 包 `devmate-cli`）——零框架、零运行时依赖，最底层只用 Node 原生能力（原生 `fetch` + 手写 SSE 解析器，见 [docs/adr/0001-zero-dependency-llm-client.md](docs/adr/0001-zero-dependency-llm-client.md)）。你给出一个编程任务，它在你的本机工作区里自主读写文件、执行命令、反复调用 OpenAI 兼容的 LLM，直至完成。它自带零依赖原生 Web UI（双主题、设置页、上下文占用环，视觉复刻 DeepSeek Harness 并已注明出处）、9 个内置工具 + MCP 动态合并的工具面、子代理工作流、18 个内化工程技能、按供应商适配的提示词与推理策略、以及「工作区监狱 + 危险操作审批 + 预算/隔离」三层安全基线。完整中文版见 [README.zh-CN.md](README.zh-CN.md)。
+> **中文摘要**：DevMate 是一个从零实现的 TypeScript 编程智能体（npm 包 `@teresal/devmate-cli`，命令行二进制仍为 `devmate-cli`）——零框架、零运行时依赖，最底层只用 Node 原生能力（原生 `fetch` + 手写 SSE 解析器，见 [docs/adr/0001-zero-dependency-llm-client.md](docs/adr/0001-zero-dependency-llm-client.md)）。你给出一个编程任务，它在你的本机工作区里自主读写文件、执行命令、反复调用 OpenAI 兼容的 LLM，直至完成。它自带零依赖原生 Web UI（双主题、设置页、上下文占用环，视觉复刻 DeepSeek Harness 并已注明出处）、9 个内置工具 + MCP 动态合并的工具面、子代理工作流、18 个内化工程技能、按供应商适配的提示词与推理策略、以及「工作区监狱 + 危险操作审批 + 预算/隔离」三层安全基线。完整中文版见 [README.zh-CN.md](README.zh-CN.md)。
 
 ---
 
@@ -132,13 +132,13 @@ flowchart LR
 Requirements: **Node.js ≥ 20** (npm CLI included). No global install needed:
 
 ```bash
-npx devmate-cli web
+npx @teresal/devmate-cli web
 ```
 
-The local server binds to `127.0.0.1` and opens your browser automatically. Starting `npx devmate-cli web` in any project directory makes that directory the default workspace; add more workspaces from the hero picker or the sidebar. On startup the first screen asks you to **select or confirm a workspace** (default = the startup directory) before composing — choose one from the picker or click "使用默认工作区" to unlock the composer. New project? Point it at a workspace:
+The local server binds to `127.0.0.1` and opens your browser automatically. Starting `npx @teresal/devmate-cli web` in any project directory makes that directory the default workspace; add more workspaces from the hero picker or the sidebar. On startup the first screen asks you to **select or confirm a workspace** (default = the startup directory) before composing — choose one from the picker or click "使用默认工作区" to unlock the composer. New project? Point it at a workspace:
 
 ```bash
-npx devmate-cli web --workspace /path/to/your/project --port 7911 --no-open
+npx @teresal/devmate-cli web --workspace /path/to/your/project --port 7911 --no-open
 ```
 
 Then configure a key — either **environment variables** or the web app's settings page:
@@ -148,13 +148,13 @@ Then configure a key — either **environment variables** or the web app's setti
 export DEV_MATE_API_KEY=sk-xxxxxxxxxxxxxxxxxxxx
 export DEV_MATE_BASE_URL=https://api.deepseek.com    # optional (default: DeepSeek)
 export DEV_MATE_MODEL=deepseek-v4-flash              # optional
-npx devmate-cli web
+npx @teresal/devmate-cli web
 ```
 
 ```powershell
 # PowerShell
 $env:DEV_MATE_API_KEY = "sk-xxxxxxxxxxxxxxxxxxxx"
-npx devmate-cli web
+npx @teresal/devmate-cli web
 ```
 
 Any OpenAI-compatible endpoint works (bearer auth + `messages/tools/SSE`), so switching providers never means switching harness. In the UI, Settings → 模型接口 accepts the same three values and writes them to `~/.devmate/config.json` (`0600`, directory `0700` — keys never enter the repository; both modes are POSIX semantics — Windows has no POSIX `chmod`, see the safety-baseline note).
