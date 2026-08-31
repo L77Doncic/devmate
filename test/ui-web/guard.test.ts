@@ -17,6 +17,7 @@ import {
   compactTokenCount,
   guardPillLabel,
   guardInputError,
+  guardLimitHint,
 } from '../../src/ui/web/guard.js';
 
 /** 存储假件（localStorage-like 内存实现；与 extensions/theme 测试同纪律）。 */
@@ -130,5 +131,25 @@ describe('guardInputError（弹层输入校验：先本地拦，与服务端 400
     expect(guardInputError('12.5')).toBe('上限必须是正整数');
     expect(guardInputError('abc')).toBe('上限必须是正整数');
     expect(guardInputError('1e6')).toBe('上限必须是正整数');
+  });
+});
+
+describe('guardLimitHint（弹层动态提示：护栏上限须高于当前输出上限——评审观察 1 处置）', () => {
+  it('有有效输出上限 → 提示含「输出上限」+ 动态值 + 预检截停说明', () => {
+    const hint = guardLimitHint(384_000);
+    expect(hint).toContain('输出上限');
+    expect(hint).toContain('384000');
+    expect(hint).toContain('预检截停');
+    expect(guardLimitHint(8192)).toContain('8192');
+  });
+  it('拿不到值（null/undefined/字符串/非正整数）→ 方向式兜底文案且不编造数字', () => {
+    const fallback = '当前配置的输出上限';
+    for (const missing of [null, undefined, '384000', 0, -5, 12.5, Number.NaN]) {
+      const hint = guardLimitHint(missing);
+      expect(hint).toContain('输出上限');
+      expect(hint).toContain(fallback);
+      expect(hint).toContain('预检截停');
+      expect(hint).not.toMatch(/[0-9]/); // 不编造缺省假数字（假精度误导）
+    }
   });
 });

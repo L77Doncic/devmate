@@ -99,3 +99,23 @@ export function guardInputError(raw) {
   if (!Number.isSafeInteger(n) || n < 1) return '上限必须是正整数';
   return '';
 }
+
+/**
+ * 弹层动态提示行（评审观察 1 处置，2026-09-01）：护栏上限 vs「当前输出上限」的关系。
+ * 根因：服务端闸门 A 的请求前预判 = 累计 totalTokens + 本轮 prompt 估算 + maxTokens
+ * 输出预留 > 上限 ⇒ 首轮请求前即停机（0 步，「Token 护栏停机」）——护栏上限 ≤ 输出
+ * 上限时按示例（如 200000）设置会「永远停」。提示行把该关系显式讲明（预检语义
+ * 诚实 + 用户可理解）。
+ * @param {number|null} maxOutputTokens 当前配置的输出上限（GET /api/settings →
+ * ui.settings.maxOutputTokens；服务端未加载/缺省 → null）。
+ * 兜底（拿不到有效值）：方向式文案，**不编造缺省数字**——假精度会把用户引向
+ * 「比假值高、比真实输出上限低」的护栏设置（恰是该症的翻版）；留「当前配置的
+ * 输出上限」占位 + 说明文字。
+ */
+export function guardLimitHint(maxOutputTokens) {
+  const n = normalizeGuardValue(maxOutputTokens);
+  if (n === null) {
+    return '提示：护栏上限需高于当前配置的输出上限——否则首个请求前即被预检截停。';
+  }
+  return `提示：护栏上限需高于当前输出上限 ${n}（否则首个请求前即被预检截停）。`;
+}

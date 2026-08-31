@@ -298,7 +298,10 @@ GET `/api/stats → {rssMb,heapMb,sessions,activeShells}`；GET `/api/tools → 
   （`devmate.ui.guardTokens.<sessionId>`，纯逻辑 `guard.js`）；发送时经 POST /api/chat
   的 `maxRunTokens`（正整数）透传——服务端校验（非法 400）、缺省关闭；不入 settings /
   config.json（每个对话所需上限不同——对话级不在设置页）。成本统计（统计行与 /cost
-  面板的 costUsd）照旧显示，不改判据。
+  面板的 costUsd）照旧显示，不改判据。弹层含**动态提示行**（开即写入
+  `#guard-output-hint`）：护栏上限须高于当前输出上限（settings 权威值
+  `maxOutputTokens`；服务端未加载 → 方向式兜底文案）——否则服务端闸门 A
+  「累计 + 本轮估算 + 输出预留」的首轮预检会先截停（「Token 护栏停机·0 步」）。
 - **停止**：POST /api/interrupt（长活流不动，终态 run-status 仍经本流到达）；
   运行中（含工具执行/审批等待）停止按钮始终可见；连接态 6 语义
   （已连接/生成中/待审批/出错/待配置/未连接）。

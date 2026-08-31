@@ -61,7 +61,13 @@ import {
   modelMarkerHint,
   friendlyWorkspacePath,
 } from './settings.js';
-import { loadGuardTokens, saveGuardTokens, guardInputError, guardPillLabel } from './guard.js';
+import {
+  loadGuardTokens,
+  saveGuardTokens,
+  guardInputError,
+  guardPillLabel,
+  guardLimitHint,
+} from './guard.js';
 import {
   PERMISSION_VALUES,
   PERMISSION_DESCRIPTIONS,
@@ -484,6 +490,7 @@ const el = {
   guardPop: document.getElementById('guard-pop'),
   guardTokensInput: document.getElementById('guard-tokens-input'),
   guardTokensErr: document.getElementById('guard-tokens-err'),
+  guardOutputHint: document.getElementById('guard-output-hint'),
   guardApply: document.getElementById('guard-apply'),
   guardClear: document.getElementById('guard-clear'),
   // 全部访问风险确认门（复用删除确认 modal 视觉）
@@ -4234,6 +4241,9 @@ function toggleGuardPop(force) {
   if (open) {
     el.guardTokensInput.value = ui.guardTokens !== null ? String(ui.guardTokens) : '';
     showFieldError(el.guardTokensErr, '');
+    // 动态提示行（评审观察 1 处置）：护栏上限 vs 当前输出上限（settings 权威值；
+    // 服务端未加载 → 方向式兜底文案——guard.js guardLimitHint 纯逻辑，开即取值）。
+    el.guardOutputHint.textContent = guardLimitHint(ui.settings.maxOutputTokens);
     const rect = el.guardPill.getBoundingClientRect();
     el.guardPop.hidden = false; // 先解除隐藏：offsetWidth/Height 实测
     const size = { width: el.guardPop.offsetWidth, height: el.guardPop.offsetHeight };
