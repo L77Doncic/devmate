@@ -5,6 +5,7 @@ import {
   DEFAULT_SUBAGENT_QUEUE_LIMIT,
   SKILL_INJECTION_LIMIT_CHARS,
   SKILL_INJECTION_TRUNCATED_MARK,
+  sanitizeToolMarkers,
   SUBAGENT_REPORT_LIMIT_CHARS,
   SUBAGENT_SYSTEM_PROMPT,
 } from '../../src/core/loop/subagent.js';
@@ -617,6 +618,58 @@ describe('subagent：子代理池', () => {
       expect(capSkill(emoji)).toBe(emoji);
       expect(capSkill(emoji + 'x')).toBe(emoji + SKILL_INJECTION_TRUNCATED_MARK);
       expect(capSkill(emoji + 'x')).not.toContain('�');
+    });
+  });
+
+  describe('k) 报告净化：sanitizeToolMarkers（p1 实证——纯推理子代理伪造工具块生肉）', () => {
+    it('剥除 <tool_calls> 生肉段：成对 XML 工具块整体移除（含嵌套 <invoke>/<parameter>），前后正文保留', () => {
+      const raw =
+        '结论：需先核查实现是否遵循既有命名。\n\n' +
+        '<tool_calls>\n' +
+        '<invoke name="Read">\n<parameter name="file_path">src/shared/strings.ts</parameter>\n</invoke>\n' +
+        '<invoke name="Read">\n<parameter name="file_path">test/shared/strings.test.ts</parameter>\n</invoke>\n' +
+        '</tool_calls>\n\n' +
+        '总体：通过。';
+      const out = sanitizeToolMarkers(raw);
+      expect(out).not.toContain('<tool_calls');
+      expect(out).not.toContain('</tool_calls>');
+      expect(out).not.toContain('<invoke');
+      expect(out).not.toContain('file_path');
+      expect(out).not.toContain('src/shared/strings.ts');
+      expect(out).toContain('结论：需先核查实现是否遵循既有命名。');
+      expect(out).toContain('总体：通过。');
+    });
+
+    it('正常正文不动：普通尖括号序列（a < b、c > d、HTML <div>、<表达式>）原样保留', () => {
+      const body =
+        '接口惯例：比较 a < b 且 c > d 时用 <表达式>；HTML 标签 <div> 仅作示例；空串归空白。';
+      expect(sanitizeToolMarkers(body)).toBe(body);
+    });
+
+    it('「<工具调用」开头未闭合的整段残迹 → 剥至文末（工具块被截断的兜底）', () => {
+      const raw = '要点：结论通过。\n<工具调用 name="Read">\n参数 src/a.ts\n（无闭合标签）';
+      expect(sanitizeToolMarkers(raw)).toBe('要点：结论通过。\n');
+    });
+
+    it('孤立/残边标记标签：<invoke name="…"> 与 </tool_calls> 单现也剥除', () => {
+      const raw = '说明：<invoke name="Read"> 出现在报告中；</tool_calls> 亦是残迹。';
+      expect(sanitizeToolMarkers(raw)).toBe('说明： 出现在报告中； 亦是残迹。');
+    });
+
+    it('池级端到端：execute 组装时净化（text 流含伪造工具块 → 报告无 <tool_calls 残迹）', async () => {
+      const llm = new FakeLlm([
+        {
+          content:
+            '核查结论：实现正确。\n<tool_calls>\n<invoke name="Read">\n<parameter name="file_path">src/x.ts</parameter>\n</invoke>\n</tool_calls>\n依据：测试 7 绿。',
+        },
+      ]);
+      const pool = makePool(llm);
+      const r = await pool.spawn({ prompt: '审查' });
+      expect(r.ok).toBe(true);
+      expect(r.report).not.toContain('<tool_calls');
+      expect(r.report).not.toContain('<invoke');
+      expect(r.report).toContain('核查结论：实现正确。');
+      expect(r.report).toContain('依据：测试 7 绿。');
     });
   });
 });

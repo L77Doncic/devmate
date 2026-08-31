@@ -3,7 +3,9 @@
  *
  * 每个子代理 = 一次独立 chat 调用（无工具、无会话文件——纯内存消息数组 + 流终止）：
  * [system: 固定角色(+技能方法论注入节), user: prompt] → 流式读取 text →
- * 报告截断 4000 字符回注
+ * 报告先经 sanitizeToolMarkers 净化（剥离模型偶发伪造回入正文的 XML 工具块生肉，
+ * 如 <tool_calls>/<invoke name=…>——纯推理契约的自愈面，绝不误伤正文），
+ * 再按 4000 字符截断回注
  * （截断复用 context/truncate 的生成期截断面板——头 2000 + 尾 2000 + elide 标记 +
  * 收窄建议；禁止手写头截断）。
  * 技能注入（B-1 借鉴①——Claude Code subagent skills 全量注入语义）：task 带
@@ -142,6 +144,31 @@ export function capSkill(content: string): string {
   return points.slice(0, SKILL_INJECTION_LIMIT_CHARS).join('') + SKILL_INJECTION_TRUNCATED_MARK;
 }
 
+/**
+ * 报告净化（p1 实证修复：纯推理子代理偶发把模型侧伪造的 XML 工具块生肉串入 text 流；
+ * 演示实录曾见 748 字符 <tool_calls>…<invoke name="Read"> 原样上屏）。逐段剥除：
+ * 1) 成对工具块整体移除：<tool_calls>…</tool_calls>、<tool_use>…</tool_use>、
+ *    <invoke name="…">…</invoke>（各自同名闭合，懒匹配——嵌套 invoke 随外层块整体剥除）；
+ * 2) 「<工具调用」开头的整段残迹：剥到闭合标签或文末（模型伪造段与正文混排的兜底）；
+ * 3) 残留的孤立标记标签（<tool_calls>/</tool_calls>/<tool_use>/</tool_use>/
+ *    <工具调用>/</工具调用>/<invoke name=…>/</invoke>——工具标记痕迹零容忍）；
+ * 4) 剥除留下的 3+ 连续换行折叠为 2（避免块移除后的空行黑洞）。
+ * 绝不误伤正文：只匹配这些显式工具标记名；`a < b`、`c > d`、`<div>` 等普通
+ * 尖括号序列不匹配（任何「方法里应写成非数字字母」的自然语言都在匹配集之外）。
+ */
+export function sanitizeToolMarkers(text: string): string {
+  return text
+    .replace(
+      /<tool_calls[^>]*>[\s\S]*?<\/tool_calls[^>]*>|<tool_use[^>]*>[\s\S]*?<\/tool_use[^>]*>|<工具调用[^>]*>[\s\S]*?(?:<\/工具调用[^>]*>|$)|<invoke\s+name=[^>]*>[\s\S]*?<\/invoke[^>]*>/gi,
+      '',
+    )
+    .replace(
+      /<\/?(?:tool_calls|tool_use|工具调用)[^>]*>|<invoke\s+name=[^>]*>|<\/invoke[^>]*>/gi,
+      '',
+    )
+    .replace(/\n{3,}/g, '\n\n');
+}
+
 // ---------------------------------------------------------------------------
 // 池实现
 // ---------------------------------------------------------------------------
@@ -276,7 +303,7 @@ export function createSubagentPool(deps: SubagentPoolDeps): SubagentPool {
     completed += 1;
     const result: SubagentResult = {
       ok: error === null,
-      report: truncateReport(content),
+      report: truncateReport(sanitizeToolMarkers(content)),
       promptTokens: payment.promptTokens,
       completionTokens: payment.completionTokens,
       totalTokens: payment.promptTokens + payment.completionTokens,
