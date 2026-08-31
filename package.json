@@ -3,6 +3,11 @@
   "version": "0.1.0",
   "description": "DevMate：零框架依赖、运行时零依赖的 TypeScript 编程智能体 CLI。A TypeScript coding agent built from scratch — no frameworks, zero runtime dependencies.",
   "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/L77Doncic/devmate.git"
+  },
+  "homepage": "https://github.com/L77Doncic/devmate",
   "type": "module",
   "engines": {
     "node": ">=20"
