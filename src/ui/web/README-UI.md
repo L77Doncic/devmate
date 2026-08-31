@@ -284,7 +284,9 @@ GET `/api/stats → {rssMb,heapMb,sessions,activeShells}`；GET `/api/tools → 
   **输入框下方窄行小字**，与 run-strip 共享同一 860px 列。内容 = 步骤数 · 耗时 ·
   入/出/总 tokens · ≈成本（estimated 标 ≈；五项全显沿用），数据源 = run-status
   （steps/durationMs）+ usage 事件双源拼行（`format.js composerStatsLine` 纯函数）；
-  无值（暂停/尚无数据）时整行隐藏。**与 dsh 的分工**：对话级统计归 composer footer；
+  空态（无任何 run 数据）= 诚实零值行「0 步 | 0ms | 入 0 tokens · 出 0 tokens ·
+  总 0 tokens | $0」（tooltip「尚未运行：暂无实际数据，运行后更新」，不整行隐藏）。
+  **与 dsh 的分工**：对话级统计归 composer footer；
   侧栏 footer 的 内存/会话/Shell 是**应用级遥测**（进程统计），非对话统计——两者不相混。
   仅展示用，服务端成本闸门才具权威。
 - **停止**：POST /api/interrupt（长活流不动，终态 run-status 仍经本流到达）；

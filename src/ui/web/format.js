@@ -254,13 +254,24 @@ export function compactionSummary(summary, cap = COMPACTION_SUMMARY_CAP) {
 }
 
 /**
+ * 空态统计行（新会话/尚无任何 run 数据）：0 值直显 —— 尚未运行 = 真实零值
+ * （0 步/0ms/0 tokens/$0），不装「未知」也不整行隐藏（与上下文环 0% 空态同诚实行）。
+ */
+export const COMPOSER_STATS_EMPTY_LINE =
+  '0 步 | 0ms | 入 0 tokens · 出 0 tokens · 总 0 tokens | $0';
+
+/** 空态统计行的悬停 tooltip（注明数据来源：实际数字运行后由 usage 事件更新）。 */
+export const COMPOSER_STATS_EMPTY_TITLE = '尚未运行：暂无实际数据，运行后更新';
+
+/**
  * composer 输入卡 footer 用量统计行（dsh InputBar footer 哲学本地形态：
  * 对话级统计属于输入框上下文，随每一步 run 汇总到同一行；**dsh StatsLine 分组重排**：
  * 组之间用 ` | ` 分隔、组内用 ` · ` 点号 —— 见 B 节 statsline 分组细节）。
  * 分组：组1 步数（turns 协议字段未提供 → 只出 {steps} 步，注明）；组2 耗时；
  *       组3 用量（入/出/总，= dsh tokenUsage 投影剔除缓存命中后可得项）；
  *       组4 ≈成本（estimated 标 ≈）。
- * 只输出存在组；runStatus 与 usage 均无值 → 返回 ''；单组时无 ` | `（自然形态）。
+ * 只输出存在组；runStatus 与 usage 均无值（空态）→ COMPOSER_STATS_EMPTY_LINE
+ * （0 值直显，不再返回 '' 让 UI 整行隐藏）；单组时无 ` | `（自然形态）。
  * runStatus 步骤/耗时只认 number（非 0 兜底）。
  */
 export function composerStatsLine(runStatus, usage) {
@@ -281,6 +292,7 @@ export function composerStatsLine(runStatus, usage) {
       groups.push([`${usage.estimated ? '≈' : ''}${formatCostUsd(usage.costUsd)}`]);
     }
   }
+  if (groups.length === 0) return COMPOSER_STATS_EMPTY_LINE; // 空态：诚实零值直显
   return groups.map((g) => g.join(' · ')).join(' | ');
 }
 

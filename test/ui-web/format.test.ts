@@ -20,6 +20,8 @@ import {
   compactionLine,
   compactionSummary,
   composerStatsLine,
+  COMPOSER_STATS_EMPTY_LINE,
+  COMPOSER_STATS_EMPTY_TITLE,
   elapsedText,
   RUN_STATUS_SEMANTICS,
   TERMINAL_STATUSES,
@@ -415,9 +417,15 @@ describe('composerStatsLine（composer 输入卡 footer 用量统计行：步骤
       ),
     ).toBe('入 1 tokens · 出 2 tokens · 总 3 tokens');
   });
-  it('无值 → 空串（UI 隐藏该行；暂停/不存在时不显示假值）', () => {
-    expect(composerStatsLine(null, null)).toBe('');
-    expect(composerStatsLine({ status: 'running', steps: null, durationMs: null }, null)).toBe('');
+  it('空态（runStatus/usage 均无值）→ 诚实零值行：0 值为真，不整行隐藏', () => {
+    expect(composerStatsLine(null, null)).toBe(COMPOSER_STATS_EMPTY_LINE);
+    expect(composerStatsLine({ status: 'running', steps: null, durationMs: null }, null)).toBe(
+      COMPOSER_STATS_EMPTY_LINE,
+    );
+    expect(composerStatsLine(null, null)).toBe(
+      '0 步 | 0ms | 入 0 tokens · 出 0 tokens · 总 0 tokens | $0',
+    );
+    expect(COMPOSER_STATS_EMPTY_TITLE).toBe('尚未运行：暂无实际数据，运行后更新');
   });
 });
 
@@ -682,7 +690,8 @@ describe('friendlySubagentError（子代理失败文案净化：无内部词、�
     const call = { name: 'spawn_subagent', arguments: '{"prompt":"请审查提交"}' };
     const view = reviewBlockText(call, {
       ok: false,
-      content: '{"ok":false,"error":{"type":"subagent-error","message":"sub-agent failed: Authentication Fails (governor)"}}',
+      content:
+        '{"ok":false,"error":{"type":"subagent-error","message":"sub-agent failed: Authentication Fails (governor)"}}',
       error: 'sub-agent failed: Authentication Fails (governor)',
     });
     expect(view.subject).not.toBe('');

@@ -191,6 +191,8 @@ import {
   compactionLine,
   compactionSummary,
   composerStatsLine,
+  COMPOSER_STATS_EMPTY_LINE,
+  COMPOSER_STATS_EMPTY_TITLE,
   elapsedText,
   shortId,
   truncate,
@@ -2746,14 +2748,16 @@ function renderHeader(snap) {
  * composer 输入卡 footer 用量统计行（dsh InputBar footer 哲学本地形态）：
  * 窄行小字 = 步骤数 · 耗时 · 入/出/总 tokens · ≈成本（五项全显；estimated 标 ≈）。
  * 数据 = run-status（steps/durationMs）+ usage 事件（覆盖式，见 messages.js）双源拼行；
- * 无值（暂停/尚无数据）时整行隐藏（不占输入区空间，也无假「—」）。
+ * 空态（runStatus/usage 均无值）→ 诚实零值行（0 步/0ms/0 tokens/$0）—— 与 0% 空态环
+ * 同诚实行，不整行隐藏；tooltip 注明「运行后更新」（format.js 常数单一来源）。
  */
 function renderComposerStats(snap) {
   const line = composerStatsLine(snap.runStatus, snap.usage);
   el.composerStats.hidden = !line;
   el.composerStatsText.textContent = line;
-  // 溢出省略 + hover tooltip 全文（dsh StatsLine 同行为）
-  el.composerStatsText.title = line;
+  // 溢出省略 + hover tooltip 全文（dsh StatsLine 同行为）；空态行 tooltip 说明数据未测
+  el.composerStatsText.title =
+    line === COMPOSER_STATS_EMPTY_LINE ? COMPOSER_STATS_EMPTY_TITLE : line;
 }
 
 /**
