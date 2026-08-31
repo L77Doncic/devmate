@@ -4,7 +4,7 @@ Status: proposed
 
 # 终止条件以成本护栏为默认、步数为辅
 
-mini-swe-agent 的默认配置「不默认步数」是被逐字核实过的样本：`step_limit=0` 与 `wall_time_limit_seconds=0`（0＝不启用），真正生效的是 `cost_limit=3.0` 加连续 3 次格式错误熔断（open-source-agent-architectures.md §1.3，AgentConfig 数据类默认值；其 CLI 覆盖路径未核对，REVIEW.md B9 已标注）。DevMate 采用同一优先级：默认启用的终止条件是成本上限（成本护栏），评测基线 USD 3.0/任务；交互模式成本上限为无穷、由用户随时中断接管，步数与墙钟上限默认禁用，仅评测/CI 给固定值（步数 200、墙钟 30 分钟，context-and-error-handling.md §8C）。原因是成本与失控的直接代价（账单）单调相关，步数不是：同样的 30 步可能完成任务也可能在兜圈子，而「钱」不依赖对模型意图的任何猜测——没有任何一家公开文档声称实现了语义级「兜圈子」检测，现有手段全是代理指标（ARCH §C.2），钱是最便宜、最普适的一个。
+mini-swe-agent 的默认配置「不默认步数」是被逐字核实过的样本：`step_limit=0` 与 `wall_time_limit_seconds=0`（0＝不启用），真正生效的是 `cost_limit=3.0` 加连续 3 次格式错误熔断（open-source-agent-architectures.md §1.3，AgentConfig 数据类默认值；其 CLI 覆盖路径未核对，REVIEW.md B9 已标注）。DevMate 采用同一优先级：默认启用的终止条件是成本上限（成本护栏），评测基线 USD 3.0/任务；交互/web 模式成本上限跟随配置（缺省引擎 DEFAULT_COST_LIMIT_USD=$3.0；可经 settings 调高，为「上限」而非「无穷」），步数与墙钟上限默认禁用，仅评测/CI 给固定值（步数 200、墙钟 30 分钟，context-and-error-handling.md §8C）。原因是成本与失控的直接代价（账单）单调相关，步数不是：同样的 30 步可能完成任务也可能在兜圈子，而「钱」不依赖对模型意图的任何猜测——没有任何一家公开文档声称实现了语义级「兜圈子」检测，现有手段全是代理指标（ARCH §C.2），钱是最便宜、最普适的一个。
 
 ## Considered Options
 
