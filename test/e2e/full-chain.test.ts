@@ -201,19 +201,30 @@ describe('E2E-A：UI 协议全链路（assembleDeps + fake llm 两轮脚本）',
     expect(detailBody.sessionId).toBe(sessionId);
     expect(detailBody.title).toBe('任务一');
     expect(detailBody.workspaceRoot).toBe(dir);
+    // run_result 落盘事件由重放派生 usage/run-status 帧（与 chat 终态直推同形）——旧会话
+    // 恢复上下文环/统计行的数据源；帧序 = 事件序（done → usage → run-status × 2）。
     expect(detailBody.events.map((f) => f.event)).toEqual([
       'session-user',
       'assistant-done',
+      'usage',
+      'run-status',
       'session-user',
       'assistant-done',
+      'usage',
+      'run-status',
     ]);
     expect(detailBody.events[0]!.data).toEqual({ text: '任务一' });
     expect(detailBody.events[1]!.data).toEqual({ content: '第一轮回答', toolCalls: [] });
-    expect(detailBody.events[2]!.data).toEqual({ text: '任务二' });
-    expect(detailBody.events[3]!.data).toEqual({ content: '第二轮回答', toolCalls: [] });
+    expect(detailBody.events[4]!.data).toEqual({ text: '任务二' });
+    expect(detailBody.events[5]!.data).toEqual({ content: '第二轮回答', toolCalls: [] });
     // 回放一致：历史 done 帧与在线流 done 帧逐字节同值（同源映射）
     expect(detailBody.events[1]).toEqual(client.frames[2] as unknown as Record<string, unknown>);
-    expect(detailBody.events[3]).toEqual(client.frames[7] as unknown as Record<string, unknown>);
+    expect(detailBody.events[5]).toEqual(client.frames[7] as unknown as Record<string, unknown>);
+    // 派生帧与在线直推帧逐值同形（usage：token 账本 + contextEstimateTokens + run-status 终态）
+    expect(detailBody.events[2]).toEqual(client.frames[3] as unknown as Record<string, unknown>);
+    expect(detailBody.events[3]).toEqual(client.frames[4] as unknown as Record<string, unknown>);
+    expect(detailBody.events[6]).toEqual(client.frames[8] as unknown as Record<string, unknown>);
+    expect(detailBody.events[7]).toEqual(client.frames[9] as unknown as Record<string, unknown>);
 
     // GET /api/stats：会话数=1；内存字段在（rss/heap 单次采样 + 守卫状态）
     const stats = (await (await fetch(new URL('/api/stats', base))).json()) as Record<
@@ -346,7 +357,8 @@ describe('E2E-B：工具+审批全链（真实 run_command echo）', () => {
       estimated: false,
     });
 
-    // 回放：assistant-done(1tc) + tool-start + tool-result 配对一致（真实链持久化）
+    // 回放：assistant-done(1tc) + tool-start + tool-result 配对一致（真实链持久化）；
+    // 尾部 run_result → 派生 usage/run-status 帧（两轮合并的总账，与在线帧同值）
     const detailBody = (await (
       await fetch(new URL(`/api/sessions/${sessionId}`, base))
     ).json()) as {
@@ -358,6 +370,8 @@ describe('E2E-B：工具+审批全链（真实 run_command echo）', () => {
       'tool-start',
       'tool-result',
       'assistant-done',
+      'usage',
+      'run-status',
     ]);
     const done = detailBody.events[1]!.data as { toolCalls: Array<{ id: string }> };
     expect(done.toolCalls).toEqual([
@@ -368,6 +382,8 @@ describe('E2E-B：工具+审批全链（真实 run_command echo）', () => {
     expect(replayed.content).toContain('[out] hello');
     // 在线 tool-result 与回放 tool-result 逐字一致（同源映射：registry 观察器/持久化映射）
     expect(detailBody.events[3]).toEqual(client.frames[5] as unknown as Record<string, unknown>);
+    expect(detailBody.events[5]).toEqual(client.frames[8] as unknown as Record<string, unknown>);
+    expect(detailBody.events[6]).toEqual(client.frames[9] as unknown as Record<string, unknown>);
   });
 
   it('B2) deny（带理由）→ tool-result 失败回执（user-denied + 拒因）→ 模型继续 → completed', async () => {

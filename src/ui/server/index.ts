@@ -668,23 +668,55 @@ function parseStoreToolOutcome(content: string): { ok: boolean; error?: string }
 }
 
 /**
- * 会话 event 事件 → 协议帧（compaction 披露；流内观察器与历史映射共用，合成规则同源）。
- * 只映射 payload.type === 'compaction'（上下文压缩记录）——其余 event 类型
- * （projection_changed / tool_truncated …）无协议帧，原样丢弃。
- * 字段规约与 src/ui/web/sessions.js 的 toProtocolEvent 一致（不崩、不误发）：
- * summary 非 string 缺失 → 空串（前端降级显示「上下文已压缩」）；tokensBefore/tokensAfter
- * 仅当为 number 时携带（映射前旧形状的字符串/缺失字段剔除）。
+ * 会话 event 事件 → 协议帧（compaction 披露 + run_result 终态派生；历史映射与流内观察器
+ * 共用同一合成规则——run_result 例外：chat 终态直推其帧（见 2080 起），观察器跳过防双发）。
+ * 映射规则：
+ * - compaction（上下文压缩记录）：summary 非 string 缺失 → 空串（前端降级显示「上下文已压缩」）；
+ *   tokensBefore/tokensAfter 仅当为 number 时携带（映射前旧形状的字符串/缺失字段剔除）。
+ * - run_result（run 终态审计事件）：派生 usage + run-status 两帧，形状与 chat 在线终态直推
+ *   同形（usage = promptTokens/completionTokens/totalTokens/costUsd/estimated/
+ *   contextEstimateTokens；run-status = status/steps/durationMs；序：usage → run-status）。
+ *   存储字段按类型收敛：缺失/畸变 → undefined（不伪造；序列化时键略去，前端 numOr 回退），
+ *   contextEstimateTokens 按 number|null 直通（C 档投影无路径不带键；null 属缺省语义）。
+ * - 其余 event 类型（projection_changed / tool_truncated …）无协议帧，原样丢弃。
  */
 function eventFrames(ev: SessionEvent): SseEventData[] {
-  if (ev.kind !== 'event' || ev.payload.type !== 'compaction') return [];
+  if (ev.kind !== 'event') return [];
   const data: Record<string, unknown> =
     typeof ev.payload.data === 'object' && ev.payload.data !== null ? ev.payload.data : {};
-  const out: { summary: string; tokensBefore?: number; tokensAfter?: number } = {
-    summary: typeof data.summary === 'string' ? data.summary : '',
-  };
-  if (typeof data.tokensBefore === 'number') out.tokensBefore = data.tokensBefore;
-  if (typeof data.tokensAfter === 'number') out.tokensAfter = data.tokensAfter;
-  return [{ event: 'compaction', data: out }];
+  if (ev.payload.type === 'compaction') {
+    const out: { summary: string; tokensBefore?: number; tokensAfter?: number } = {
+      summary: typeof data.summary === 'string' ? data.summary : '',
+    };
+    if (typeof data.tokensBefore === 'number') out.tokensBefore = data.tokensBefore;
+    if (typeof data.tokensAfter === 'number') out.tokensAfter = data.tokensAfter;
+    return [{ event: 'compaction', data: out }];
+  }
+  if (ev.payload.type === 'run_result') {
+    const n = (v: unknown): number | undefined => (typeof v === 'number' ? v : undefined);
+    const usageData = {
+      promptTokens: n(data.promptTokens),
+      completionTokens: n(data.completionTokens),
+      totalTokens: n(data.totalTokens),
+      costUsd: n(data.costUsd),
+      estimated: typeof data.estimated === 'boolean' ? data.estimated : undefined,
+      contextEstimateTokens:
+        data.contextEstimateTokens === null ? null : n(data.contextEstimateTokens),
+    };
+    // 存储侧旧/残缺数据按字段收敛（undefined 在 wire 上等价「键略去」）；SseEventData 声明
+    // 必填 number —— 收敛语义与之不等价，此处单帧断言表达「尽力携带，缺失即缺」，不伪造默认值。
+    const usage = { event: 'usage', data: usageData } as unknown as SseEventData;
+    const status = {
+      event: 'run-status',
+      data: {
+        status: typeof data.status === 'string' ? data.status : undefined,
+        steps: n(data.steps),
+        durationMs: n(data.durationMs),
+      },
+    } as unknown as SseEventData;
+    return [usage, status];
+  }
+  return [];
 }
 
 // ---------------------------------------------------------------------------
@@ -772,7 +804,12 @@ function observeStore(inner: SessionStore, ctxFor: (id: string) => SessionCtx): 
           ctx.broker.push({ event: 'reasoning', data: { text: delta } });
         }
       } else if (wide.kind === 'event') {
-        for (const frame of eventFrames(wide)) ctx.broker.push(frame);
+        // run_result 的协议帧（usage/run-status）由 chat 终态直接推送（见 2080 起）；
+        // eventFrames 同样会派生这两帧 —— 观察器跳过该型，避免与直推重复广播；
+        // compaction 及其余 event 类型仍经 eventFrames 单点合成。
+        if (wide.payload.type !== 'run_result') {
+          for (const frame of eventFrames(wide)) ctx.broker.push(frame);
+        }
       }
       return saved;
     },
@@ -1016,7 +1053,8 @@ const HISTORY_SLICE_EVENTS = 720;
  * （流式 delta 已不可再得——历史只落终态，哑式合并为 done；toolCalls 保真）+
  * 有结果的调用补 tool-start（approval 前置与 result 配对可还原）；tool → tool-result
  * （name 由 assistant 登记的 callNames 映射，缺失回退 unknown）；
- * event（type compaction）→ compaction 帧（其余 event 类型仍丢弃）；
+ * event（type compaction）→ compaction 帧；event（type run_result）→ usage + run-status
+ * 派生帧组（与 chat 在线终态同形；其余 event 类型仍丢弃）；
  * reasoning → **折叠为一条** reasoning 帧（同一 assistant 预案的连续多条推理事件拼接为
  * 完整正文；≤ REASONING_TEXT_CAP 截断注记），按事件序置于其 assistant 之前；
  * system 不入协议帧。title 规则与列表一致（首条 user 文本前 40 字符 /（空会话））。
@@ -1103,7 +1141,8 @@ async function sessionDetailFrames(
         ];
       }
       case 'event':
-        // compaction 披露帧（独立帧组：整组任一分帧，裁剪时原子；其余 event 类型无映射）
+        // compaction 披露帧 / run_result 终态派生帧组（独立帧组：整组任一分帧，裁剪时原子；
+        // 其余 event 类型无映射）
         return eventFrames(ev);
       default:
         return [];

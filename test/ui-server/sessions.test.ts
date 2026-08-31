@@ -150,6 +150,7 @@ describe('ui/server：会话详情 GET /api/sessions/:id', () => {
           };
         }
       | { kind: 'tool'; payload: { toolCallId: string; content: string } }
+      | { kind: 'event'; payload: { type: string; data?: Record<string, unknown> } }
     >,
   ) {
     const store = new MemorySessionAdapter();
@@ -435,6 +436,156 @@ describe('ui/server：会话详情 GET /api/sessions/:id', () => {
     expect(starts).toHaveLength(30); // done 在窗内 → 整组帧齐全
     expect(results).toHaveLength(30);
     expect(starts.map((f) => f.data.id)).toEqual(done.toolCalls.map((tc) => tc.id));
+  });
+
+  it('d7) run_result 事件 → 派生 usage + run-status 帧（与 chat 终态同形；compaction 仍出现、其它事件不入侵）', async () => {
+    // 存储侧（agent.ts finalize）run_result 载荷：status/steps/durationMs + usage 五（六）字段（+ 可选 error）；
+    // 此处按真实落盘形状（含 contextEstimateTokens）造数，验证重放派生与 live 直推同形。
+    const store = await seedStore([
+      { kind: 'user', payload: { content: '任务开始' } },
+      {
+        kind: 'assistant',
+        payload: { content: '完成', toolCalls: [] },
+      },
+      {
+        kind: 'event',
+        payload: {
+          type: 'run_result',
+          data: {
+            status: 'completed',
+            steps: 11,
+            durationMs: 82116,
+            promptTokens: 94051,
+            completionTokens: 4677,
+            totalTokens: 98728,
+            costUsd: 0.10808199999999998,
+            estimated: false,
+            contextEstimateTokens: 17771,
+          },
+        },
+      },
+      {
+        kind: 'event',
+        payload: { type: 'compaction', data: { summary: '摘要文本' } },
+      },
+      { kind: 'event', payload: { type: 'projection_changed', data: { x: 1 } } },
+      { kind: 'user', payload: { content: '继续' } },
+    ]);
+    const { base, server } = await startServer(depsFor({ store }));
+    servers.push(server);
+
+    const res = await fetch(new URL('/api/sessions/s-1', base));
+    expect(res.status).toBe(200);
+    const body = (await res.json()) as {
+      events: Array<{ event: string; data: Record<string, unknown> }>;
+    };
+    // 帧序 = 事件序：run_result 派生组（usage → run-status）原位；compaction 仍出现；
+    // projection_changed 无协议帧 → 不侵入
+    expect(body.events.map((f) => f.event)).toEqual([
+      'session-user',
+      'assistant-done',
+      'usage',
+      'run-status',
+      'compaction',
+      'session-user',
+    ]);
+    // usage：token 账本 + costUsd/estimated 保真（totalTokens/contextEstimateTokens 原值）
+    expect(body.events[2]!.data).toEqual({
+      promptTokens: 94051,
+      completionTokens: 4677,
+      totalTokens: 98728,
+      costUsd: 0.10808199999999998,
+      estimated: false,
+      contextEstimateTokens: 17771,
+    });
+    expect(body.events[3]!.data).toEqual({ status: 'completed', steps: 11, durationMs: 82116 });
+    expect(body.events[4]!.data).toEqual({ summary: '摘要文本' });
+  });
+
+  it('d8) run_result 残缺/旧形状不崩：缺 costUsd → usage 帧该字段 undefined；无 data / 字符串数字字段按 undefined 收敛', async () => {
+    const store = await seedStore([
+      { kind: 'user', payload: { content: 'old' } },
+      {
+        kind: 'event',
+        payload: {
+          type: 'run_result',
+          data: {
+            status: 'completed',
+            steps: 2,
+            durationMs: 10,
+            promptTokens: '94051', // 旧形状字符串 → 收敛 undefined
+            completionTokens: 4677,
+            totalTokens: 98728,
+            // costUsd/estimated/contextEstimateTokens 缺失
+          },
+        },
+      },
+      { kind: 'event', payload: { type: 'run_result' } }, // 无 data
+      { kind: 'user', payload: { content: 'later' } },
+    ]);
+    const { base, server } = await startServer(depsFor({ store }));
+    servers.push(server);
+
+    const res = await fetch(new URL('/api/sessions/s-1', base));
+    expect(res.status).toBe(200);
+    const body = (await res.json()) as {
+      events: Array<{ event: string; data: Record<string, unknown> }>;
+    };
+    expect(body.events.map((f) => f.event)).toEqual([
+      'session-user',
+      'usage',
+      'run-status',
+      'usage',
+      'run-status',
+      'session-user',
+    ]);
+    const usage = body.events[1]!.data;
+    expect(usage.promptTokens).toBeUndefined(); // 字符串字段不伪造
+    expect(usage.totalTokens).toBe(98728);
+    expect(usage.costUsd).toBeUndefined(); // 缺字段 → undefined（wire 键略去）
+    expect(usage.estimated).toBeUndefined();
+    expect(body.events[2]!.data).toEqual({ status: 'completed', steps: 2, durationMs: 10 });
+    // 无 data → 派生帧字段全 undefined（键全略去），流/详情不 500
+    expect(body.events[3]!.data).toEqual({});
+    expect(body.events[4]!.data).toEqual({});
+  });
+
+  it('d9) run_result 派生帧不干扰在线流：chat 全程恰一条 usage + 一条 run-status（观察器不双发）', async () => {
+    const store = new MemorySessionAdapter();
+    const { base, server } = await startServer(
+      depsFor({
+        store,
+        llm: new FakeLlm([
+          {
+            content: 'hi',
+            usage: { promptTokens: 10, completionTokens: 5, totalTokens: 15 },
+          },
+        ]),
+      }),
+    );
+    servers.push(server);
+
+    const res = await postJson(base, '/api/chat', { sessionId: 's-1', text: 'hello' });
+    expect(res.status).toBe(200);
+    const client = await SseClient.connect(base, 's-1');
+    clients.push(client);
+    await waitForFrames(client, 5, 10_000);
+    expect(client.frames.map((f) => f.event)).toEqual([
+      'session-user',
+      'assistant-delta',
+      'assistant-done',
+      'usage',
+      'run-status',
+    ]);
+    expect(client.frames.filter((f) => f.event === 'usage')).toHaveLength(1);
+    expect(client.frames.filter((f) => f.event === 'run-status')).toHaveLength(1);
+    // usage 帧由 chat 终态直推（非 run_result 观察器派生）：token 账本保真、estimated 非兜底
+    expect(client.frames[3]!.data).toMatchObject({
+      promptTokens: 10,
+      completionTokens: 5,
+      totalTokens: 15,
+      estimated: false,
+    });
   });
 });
 
