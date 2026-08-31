@@ -640,6 +640,19 @@ describe('subagent：子代理池', () => {
       expect(out).toContain('总体：通过。');
     });
 
+    it('invoke 等号周边空白同剥：<invoke name = "Read"> 成对块整体移除，前后正文保留', () => {
+      const raw =
+        '要点：结论通过。\n\n' +
+        '<invoke name = "Read">\n<parameter name="file_path">src/shared/strings.ts</parameter>\n</invoke>\n\n' +
+        '依据：测试 6 绿。';
+      const out = sanitizeToolMarkers(raw);
+      expect(out).not.toContain('<invoke');
+      expect(out).not.toContain('file_path');
+      expect(out).not.toContain('src/shared/strings.ts');
+      expect(out).toContain('要点：结论通过。');
+      expect(out).toContain('依据：测试 6 绿。');
+    });
+
     it('正常正文不动：普通尖括号序列（a < b、c > d、HTML <div>、<表达式>）原样保留', () => {
       const body =
         '接口惯例：比较 a < b 且 c > d 时用 <表达式>；HTML 标签 <div> 仅作示例；空串归空白。';

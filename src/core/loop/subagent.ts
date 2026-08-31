@@ -151,7 +151,8 @@ export function capSkill(content: string): string {
  *    <invoke name="…">…</invoke>（各自同名闭合，懒匹配——嵌套 invoke 随外层块整体剥除）；
  * 2) 「<工具调用」开头的整段残迹：剥到闭合标签或文末（模型伪造段与正文混排的兜底）；
  * 3) 残留的孤立标记标签（<tool_calls>/</tool_calls>/<tool_use>/</tool_use>/
- *    <工具调用>/</工具调用>/<invoke name=…>/</invoke>——工具标记痕迹零容忍）；
+ *    <工具调用>/</工具调用>/<invoke name=…>/</invoke>——工具标记痕迹零容忍；
+ *    invoke 的 `=` 周边空白放宽（`name = "Read"` 同匹配——评审复核的漏网边缘）；
  * 4) 剥除留下的 3+ 连续换行折叠为 2（避免块移除后的空行黑洞）。
  * 绝不误伤正文：只匹配这些显式工具标记名；`a < b`、`c > d`、`<div>` 等普通
  * 尖括号序列不匹配（任何「方法里应写成非数字字母」的自然语言都在匹配集之外）。
@@ -159,11 +160,11 @@ export function capSkill(content: string): string {
 export function sanitizeToolMarkers(text: string): string {
   return text
     .replace(
-      /<tool_calls[^>]*>[\s\S]*?<\/tool_calls[^>]*>|<tool_use[^>]*>[\s\S]*?<\/tool_use[^>]*>|<工具调用[^>]*>[\s\S]*?(?:<\/工具调用[^>]*>|$)|<invoke\s+name=[^>]*>[\s\S]*?<\/invoke[^>]*>/gi,
+      /<tool_calls[^>]*>[\s\S]*?<\/tool_calls[^>]*>|<tool_use[^>]*>[\s\S]*?<\/tool_use[^>]*>|<工具调用[^>]*>[\s\S]*?(?:<\/工具调用[^>]*>|$)|<invoke\s+name\s*=\s*[^>]*>[\s\S]*?<\/invoke[^>]*>/gi,
       '',
     )
     .replace(
-      /<\/?(?:tool_calls|tool_use|工具调用)[^>]*>|<invoke\s+name=[^>]*>|<\/invoke[^>]*>/gi,
+      /<\/?(?:tool_calls|tool_use|工具调用)[^>]*>|<invoke\s+name\s*=\s*[^>]*>|<\/invoke[^>]*>/gi,
       '',
     )
     .replace(/\n{3,}/g, '\n\n');
