@@ -32,4 +32,4 @@ DevMate 是本地开发工具：攻击面主要在工作区内的提示注入、
 - 把任意 GPT 供应商端点当信任边界的场景
 - 对第三方技能的依赖面（其各自许可与安全声明在 `dist/assets/skills/LICENSE-mattpocock-skills.txt`）
 
-无人值守（评测/CI）请按 ADR-0013 走隔离 + `$3` 成本保险丝，不依赖审批流。
+无人值守（评测/CI）请按 ADR-0013 走隔离 + Token 护栏上限（对话级累计 tokens；默认关闭——运行前在 composer 护栏 pill 按会话设置），不依赖审批流。

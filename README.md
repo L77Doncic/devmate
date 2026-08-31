@@ -18,14 +18,14 @@
 DevMate is the "harness" part of an agent: given a task, it drives an LLM through an autonomous loop — gather context, act (file tools, commands), re-inject results, repeat — until the task is done or a guardrail fires. Everything a harness needs is implemented in-house and documented in 16 ADRs:
 
 - **Zero dependency** — `dependencies: {}`. Native `fetch`, hand-written SSE parser, hand-written markdown renderer, zero-framework Web UI. No lockfile surprises, no supply chain surface, works anywhere Node 20 runs.
-- **Own the loop** — steps, termination conditions, circuit breakers, error re-injection, retries (equal-jitter backoff + `Retry-After`), cost fuse: it is all visible, testable code in `src/core/`.
+- **Own the loop** — steps, termination conditions, circuit breakers, error re-injection, retries (equal-jitter backoff + `Retry-After`), token guard: it is all visible, testable code in `src/core/`.
 - **An append-only session** — every event (prompt, reasoning, tool calls and results, compactions) is appended to an event stream; resume, replay and audit are all views over the same source of truth.
 - **A real UI** — the local web app ships in the package: dual themes, workspace-grouped sidebar, `/` commands, tool cards, approval modals, context meter, cost and step stats.
-- **Safe by default** — workspace jail + approval + secret redaction + cost guard, with the unattended baseline decided in [ADR-0013](docs/adr/0013-safety-baseline.md).
+- **Safe by default** — workspace jail + approval + secret redaction + token guard (per-dialogue cumulative token cap, default off, set per session in the composer guard pill), with the unattended baseline decided in [ADR-0013](docs/adr/0013-safety-baseline.md).
 
 ## Features
 
-- **Autonomous agent loop** ([`src/core/loop`](src/core/loop)) — Turn/Step model, natural end, submission markers, fuses (cost / steps / wall-clock), no-progress detection, circuit breaker for consecutive format errors, compaction debounce; the cost guard (`$3` default, the only default-on fuse) is fronted before every query.
+- **Autonomous agent loop** ([`src/core/loop`](src/core/loop)) — Turn/Step model, natural end, submission markers, fuses (tokens / steps / wall-clock), no-progress detection, circuit breaker for consecutive format errors, compaction debounce; the token guard (per-dialogue cumulative token cap; default off; set per session in the composer guard pill) is fronted before every query.
 - **Tool surface** ([`src/core/tools`](src/core/tools)) — 9 built-in tools: `read_file`, `write_file`, `edit_file` (SEARCH/REPLACE), `list_dir`, `glob`, `grep`, `run_command` (persistent shell with sentinel-line boundary detection), `use_skill` (lazy skill loader), `spawn_subagent` (parallel subagent pool); MCP server tools are appended to the same table with an `mcp_` prefix (`GET /api/tools` shows the live surface).
 - **MCP integration** ([`src/core/mcp`](src/core/mcp)) — stdio JSON-RPC client: register servers in the settings page (`name` + `command` + `args`), toggle per server, tools merged into the loop automatically.
 - **Skills inlining (18)** — the mattpocock-skills engineering set is bundled at build time into `dist/assets/skills`; the system prompt only carries a one-line index and `use_skill` lazy-loads a skill on demand (with per-skill toggles in the UI). A skill is a **directory**: `SKILL.md` plus the same directory's text assets (whitelist `*.md`/`*.txt`/`*.json`/`*.yaml`/`*.py`/`*.js`/`*.sh`, recursive, sorted by relative path, each appended under a `## <file:path>` section header; total injected payload capped at 20k chars — over-cap is cut in sorted prefix order, binaries/unknown types are skipped and announced in one note line). The loaded payload is bounded at 8k chars (same budget as the sub-agent injection). A URL-installed skill is a single `SKILL.md` file.
@@ -205,7 +205,7 @@ Always-on guards:
 
 - **Secret redaction** — every tool result is masked before re-injection (`securedRegistry`), including error messages; the storage layer also masks `tool` result content before it hits disk (`JsonlFileAdapter`, default on — this is the final word: disk, resume and replay all carry the mask, so no credential ever appears twice in model-visible context). It covers common credential shapes (AKIA…, `ghp_…`, `sk-…` ≥ 24 chars, `Bearer`/`Basic`, PEM blocks) — short mock keys and exotic shapes are outside the pattern set.
 - **Store hygiene** — `~/.devmate/config.json` and session files are written `0600` with `0700` dirs (session dir heals historical `0644`/`0755` files on startup; both POSIX semantics — Windows has no POSIX `chmod`, so the 0600/0700 mode claims apply on POSIX only); the API endpoint only ever returns a mask; the web UI never renders with `innerHTML` and enforces a `safeHref` whitelist + CSP.
-- **Cost guard** — the only default-on fuse; `$3` per run, checked before every query and streamed-down mid-response with live usage calibration.
+- **Token guard** — per-dialogue cumulative token cap (input + output), default off (no limit until set); set per session in the composer guard pill. Checked before every query and streamed-down mid-response (gates A/B/C on cumulative `totalTokens`) — the criterion is tokens, not USD; the cost stats below still display as usual.
 - **Memory guard** — idle shells are disposed past the RSS threshold, and `GET /api/stats` reports `memoryGuard` state.
 - **Lifecycle** — `SIGINT` and `SIGTERM` both run the full graceful shutdown (server close → MCP launcher dispose → shells); MCP servers are spawned in their own process group and `close()` kills the group (`npm → sh → node` tree), with a 2 s grace before `SIGKILL`.
 
@@ -218,7 +218,7 @@ npm install
 npm run dev            # tsc -w incremental
 npm run typecheck      # main tsconfig + test tsconfig
 npm run lint           # eslint flat config + typescript-eslint + prettier conflict rule
-npm test               # vitest run (130 test files, 1916 cases — 1915 passed, 1 skipped; full E2E suite runs on POSIX in CI — the Windows job gates lint + typecheck + build, and the win32 shell path (Git Bash / PowerShell probe) is exercised there by launch smoke, not by the POSIX-authored E2E semantics)
+npm test               # vitest run (133 test files, 1940 cases — 1939 passed, 1 skipped; full E2E suite runs on POSIX in CI — the Windows job gates lint + typecheck + build, and the win32 shell path (Git Bash / PowerShell probe) is exercised there by launch smoke, not by the POSIX-authored E2E semantics)
 npm run test:watch
 npm run format:check   # prettier --check . (CONTEXT.md and docs/adr/ are exempt by design)
 npm run build          # tsc + copy static web assets + bundle skills into dist/
@@ -266,7 +266,7 @@ For everything else, file an issue describing the command, the stream frames aro
 
 **How is this different from Claude Code?** Same mental model (a harness above a model, plus an event-stream session), simplified to a single local process: one binary, one server, one UI, no extensions marketplace, and any OpenAI-compatible key you already own.
 
-**Is it safe to run unattended?** The recommended baseline per [ADR-0013](docs/adr/0013-safety-baseline.md): OS-level isolation + the default `$3` cost fuse. Approval flows are for interactive use — unattended runs must be guarded by isolation and budget, not by clicks.
+**Is it safe to run unattended?** The recommended baseline per [ADR-0013](docs/adr/0013-safety-baseline.md): OS-level isolation + a **token guard** cap set per session in the composer guard pill (default off — set it before launching an unattended run). Approval flows are for interactive use — unattended runs must be guarded by isolation and budget, not by clicks.
 
 ## Docs & License
 

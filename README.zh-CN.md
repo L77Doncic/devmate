@@ -16,14 +16,14 @@ DevMate 是一个从零实现、零框架依赖的 TypeScript 编程智能体（
 DevMate 是智能体（Agent）的「壳体」（harness）：给定一个任务，它驱动 LLM 自主循环——收集上下文 → 执行动作（文件工具、命令）→ 回注结果 → 再循环——直到任务完成或护栏命中。harness 所需的每一个机制都从零实现，并有 16 篇 ADR 记录在案：
 
 - **零依赖**——`dependencies: {}`。原生 `fetch`、手写 SSE 解析器、手写安全 Markdown 渲染器、零框架 Web UI。没有锁文件意外、没有供应链暴露面，Node 20 能跑的地方它就能跑。
-- **循环是自己的**——步（Step）、终止条件、熔断、错误回注、重试（Equal Jitter 退避 + `Retry-After`）、成本保险丝：全部是 `src/core/` 里可见、可测的代码。
+- **循环是自己的**——步（Step）、终止条件、熔断、错误回注、重试（Equal Jitter 退避 + `Retry-After`）、Token 护栏：全部是 `src/core/` 里可见、可测的代码。
 - **append-only 会话**——每次事件（提示词、推理、工具调用与结果、压缩摘要）都追加进事件流；resume、回放与审计只是同一事实源的不同视图。
 - **真的有个 UI**——原生 Web 应用随包发布：双主题、按工作区分组的侧栏、`/` 命令、工具卡、审批弹窗、上下文占用环、成本与步数统计。
-- **默认安全**——工作区监狱 + 审批 + 机密脱敏 + 成本护栏；无人值守基线见 [ADR-0013](docs/adr/0013-safety-baseline.md)。
+- **默认安全**——工作区监狱 + 审批 + 机密脱敏 + Token 护栏（对话级累计 tokens 上限；默认关闭；composer 护栏 pill 按会话设置）；无人值守基线见 [ADR-0013](docs/adr/0013-safety-baseline.md)。
 
 ## 特性
 
-- **自主智能体主循环**（[`src/core/loop`](src/core/loop)）——Turn/Step 模型、自然结束、提交信号、保险丝（成本/步数/墙钟）、无进展检测、连续格式错误熔断、压缩防抖；成本护栏（默认 `$3`，唯一默认开启的保险丝）前置每次查询之前。
+- **自主智能体主循环**（[`src/core/loop`](src/core/loop)）——Turn/Step 模型、自然结束、提交信号、保险丝（Token 护栏/步数/墙钟）、无进展检测、连续格式错误熔断、压缩防抖；Token 护栏（对话级累计 tokens 上限；默认关闭；composer 护栏 pill 按会话设置）前置每次查询之前（成本统计照常显示，判据与美元无关）。
 - **工具面**（[`src/core/tools`](src/core/tools)）——9 个内置工具：`read_file`、`write_file`、`edit_file`（SEARCH/REPLACE）、`list_dir`、`glob`、`grep`、`run_command`（常驻 Shell，哨兵行界定输出）、`use_skill`（技能懒加载）、`spawn_subagent`（并行子代理池）；MCP 服务器工具以 `mcp_` 前缀追加进同一张表（`GET /api/tools` 可看实时工具面）。
 - **MCP 接入**（[`src/core/mcp`](src/core/mcp)）——stdio JSON-RPC 客户端：设置页登记服务器（`name` + `command` + `args`）、逐个开关、工具自动合并进循环。
 - **技能内化（18 个）**——构建时把 mattpocock-skills 工程技能集打包进 `dist/assets/skills`；系统提示只带一行清单，`use_skill` 按需懒加载（设置页可逐技能开关）。技能 = **目录**：`SKILL.md` + 同目录文本资产（白名单 `*.md`/`*.txt`/`*.json`/`*.yaml`/`*.py`/`*.js`/`*.sh`，递归收集、按相对路径名序，每资产节头 `## <file:路径>`；注入总载荷上限 20k 字符——超限按排序前缀截断，二进制/未知扩展名跳过并合成一行注记）。加载载荷上限 8k 字符（与子代理技能注入同值）；URL 安装的技能是单文件 `SKILL.md`。
@@ -63,7 +63,7 @@ Web 应用（深色主题）：
         │                              │                          │
 ┌───────▼───────────────┐   ┌──────────▼──────────────┐   ┌───────▼────────────────┐
 │ 供应商适配层          │   │ 工具面                  │   │ 护栏                   │
-│ src/core/llm          │   │ src/core/tools          │   │ 成本 · 步数 · 墙钟 ·   │
+│ src/core/llm          │   │ src/core/tools          │   │ Token · 步数 · 墙钟 · │
 │ buildRequest · 推理   │   │ 6 件文件工具（走监狱）   │   │ 无进展 · 压缩防抖      │
 │ 策略 · 手写 SSE 客户端│   │ run_command（常驻 Shell │   │ + 回注前机密脱敏       │
 └───────┬───────────────┘   │ · 哨兵行）             │   └────────────────────────┘
@@ -104,7 +104,7 @@ flowchart LR
     subgraph GUARDS["护栏"]
         JAIL["工作区监狱"]
         REDACT["机密脱敏"]
-        FUSE["成本/步数/墙钟/格式熔断"]
+        FUSE["Token/步数/墙钟/格式熔断"]
     end
     CHAT -->|POST /api/chat · SSE /api/stream| ROUTER
     ROUTER --> AGENT
@@ -201,7 +201,7 @@ UI 的所有动作都走这些端点（`src/ui/server/index.ts`）：
 
 - **机密脱敏**——回注前统一掩码（`securedRegistry`）＋存储层落盘前掩码（`JsonlFileAdapter` 默认开，tool 结果 content——掩码即最终口径：磁盘/resume/回放一致）；错误信息同样打码。覆盖常见凭据形态（AKIA…、`ghp_…`、`sk-…`≥24、`Bearer`/`Basic`、PEM 块），短 mock 形态不在覆盖内。
 - **存储卫生**——`~/.devmate/config.json` 与会话文件以 `0600` 写入、目录 `0700`（会话目录启动时把历史 0644/0755 存量一次性纠正；两者皆 POSIX 语义——Windows 无 POSIX `chmod`，0600/0700 主张仅 POSIX 有效）；端点只回掩码；Web UI 全文禁止 `innerHTML`、强制 `safeHref` 白名单 + CSP。
-- **成本护栏**——唯一默认开启的保险丝：`$3`/任务，每次查询前预检、流式中超阈值即中止，带真实 usage 校准账本。
+- **Token 护栏**——对话级累计 tokens（输入+输出之和）上限，默认关闭（未设置 = 不限制）；composer 护栏 pill 按会话设置（发送即透传 `maxRunTokens`）；每次查询前预检、流式中超阈值即中止；判据是 tokens 而非美元，成本统计照常显示（`/cost` 面板与统计行 costUsd 不改）。
 - **内存警戒线**——超过 RSS 阈值释放空闲 Shell，`GET /api/stats` 上报 `memoryGuard` 状态。
 - **生命周期**——SIGINT 与 SIGTERM 走同一完整优雅关闭（server close → MCP launcher dispose → 常驻 Shell）；MCP 服务器以独立进程组启动，close() 按组终止（`npm → sh → node` 整树），2s 宽限后组 SIGKILL。
 
@@ -214,7 +214,7 @@ npm install
 npm run dev            # tsc -w 增量编译
 npm run typecheck      # 主 tsconfig + 测试 tsconfig 双重检查
 npm run lint           # eslint flat config + typescript-eslint + prettier 冲突规则
-npm test               # vitest run（130 个测试文件，1916 用例：1915 通过 / 1 跳过）
+npm test               # vitest run（133 个测试文件，1940 用例：1939 通过 / 1 跳过）
 npm run test:watch
 npm run format:check   # prettier --check .（CONTEXT.md 与 docs/adr/ 按设计豁免）
 npm run build          # tsc + 复制静态 Web 资产 + 打包技能到 dist/
@@ -258,7 +258,7 @@ npm run build          # tsc + 复制静态 Web 资产 + 打包技能到 dist/
 
 **和 Claude Code 有什么不同？** 同样的心智模型（模型之上的 harness + 事件流会话），简化为单个本地进程：一个二进制、一个服务、一个 UI，没有扩展市场，用你已有的任意 OpenAI 兼容密钥。
 
-**无人值守安全吗？** 推荐基线（[ADR-0013](docs/adr/0013-safety-baseline.md)）：OS 级隔离 + 默认 `$3` 成本保险丝。审批流只适用于交互模式——无人值守靠隔离与预算，不靠点击。
+**无人值守安全吗？** 推荐基线（[ADR-0013](docs/adr/0013-safety-baseline.md)）：OS 级隔离 + 按会话设置的 Token 护栏上限（默认关闭——无人值守运行前请在 composer 护栏 pill 设好）。审批流只适用于交互模式——无人值守靠隔离与预算，不靠点击。
 
 ## 文档与许可
 
