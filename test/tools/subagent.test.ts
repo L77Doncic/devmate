@@ -156,7 +156,6 @@ describe('tools/subagent：spawn_subagent', () => {
         throw new Error('pool exploded');
       },
       stats: () => ({
-        nextCostEstimateUsd: () => 0,
         enabled: true,
         maxParallel: 2,
         active: 0,
