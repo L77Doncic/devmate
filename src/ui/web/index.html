@@ -476,7 +476,8 @@
             </section>
           </div>
           <!-- 上下文窗口占用环（dsh ContextMeter：composer 与 stats 行之间；28px 环形 +
-               百分比；数据 = usage.contextEstimateTokens / settings.window；缺窗「—」） -->
+               百分比；数据 = usage.contextEstimateTokens / settings.window；缺窗「—」；
+               无估算（新会话未运行）= 0% 灰色空态环——showMeter 维持可见） -->
           <div class="meter-row" id="meter-row" hidden>
             <span class="meter" id="meter" role="img" aria-label="上下文占用">
               <svg class="meter-ring" viewBox="0 0 28 28" aria-hidden="true">

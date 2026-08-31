@@ -1,6 +1,7 @@
 /**
- * meter.js 单测：上下文窗口占用环纯逻辑 —— 比例（夹取/缺窗）、色阶（>80% 琥珀、
- * >95% 红）、文本与 aria（「—」= 模型窗口未配置（估算模式））。
+ * meter.js 单测：上下文窗口占用环纯逻辑 —— 比例（夹取/缺窗/空态）、色阶
+ * （>80% 琥珀、>95% 红）、文本与 aria（「—」= 模型窗口未配置（估算模式）；
+ * 空态 = 估算缺失 → 0% + 「尚未运行：暂无上下文估算，运行后显示实时占用」）。
  */
 import { describe, expect, it } from 'vitest';
 import {
@@ -32,11 +33,16 @@ describe('meterRatio', () => {
     expect(meterRatio(32_000, 64_000.5)).toBeNull(); // 非整数窗口（服务端校验正整，防御）
   });
 
-  it('估算缺失/非法 → null', () => {
-    expect(meterRatio(null, 64_000)).toBeNull();
-    expect(meterRatio(undefined, 64_000)).toBeNull();
+  it('空态：估算缺失（null/undefined，尚无 usage 数据）= 0 占用（0% 空环）', () => {
+    expect(meterRatio(null, 64_000)).toBe(0);
+    expect(meterRatio(undefined, 64_000)).toBe(0);
+    expect(meterRatio(null, null)).toBe(0); // 空态优先于缺窗判定（未测量 = 未使用）
+  });
+
+  it('估算非法（NaN/负数/非 number 字符串）→ null：不伪造 0、不误判空态', () => {
     expect(meterRatio(-1, 64_000)).toBeNull();
     expect(meterRatio(NaN, 64_000)).toBeNull();
+    expect(meterRatio('100', 64_000)).toBeNull(); // 只认 number
   });
 });
 
@@ -48,6 +54,8 @@ describe('meterTier（阈值：>80% 琥珀、>95% 红；值以 1 封顶）', () 
     expect(meterTier(0.96)).toBe('danger');
     expect(meterTier(0.5)).toBe('normal');
     expect(meterTier(1)).toBe('danger');
+    expect(meterTier(0)).toBe('normal'); // 空态 0 占用 = 中性灰（不强调）
+    expect(meterTier(meterRatio(null, 64_000))).toBe('normal'); // 空态走纯函数 → 中性档
   });
   it('阈值常量与需求逐值钉死（80% / 95%）', () => {
     expect(METER_WARN_RATIO).toBe(0.8);
@@ -61,19 +69,23 @@ describe('meterTier（阈值：>80% 琥珀、>95% 红；值以 1 封顶）', () 
 });
 
 describe('展示文本 / tooltip / aria', () => {
-  it('百分比文本：四舍五入 + %；无窗 → —', () => {
+  it('百分比文本：四舍五入 + %；无窗 → —；空态（无估算）→ 0%', () => {
     expect(meterPercentText(32_000, 64_000)).toBe('50%');
     expect(meterPercentText(1, 3)).toBe('33%'); // 0.3333→33
     expect(meterPercentText(32_000, null)).toBe('—');
+    expect(meterPercentText(null, 64_000)).toBe('0%'); // 契约：新会话空态诚实读数
+    expect(meterPercentText(null, null)).toBe('0%');
   });
-  it('tooltip：有窗数值式；无窗 = 「模型窗口未配置（估算模式）」', () => {
+  it('tooltip：有窗数值式；无窗 = 「模型窗口未配置（估算模式）」；空态 = 未运行说明', () => {
     expect(meterTooltip(32_000, 64_000, fmt)).toBe('上下文占用 50%（32000 / 64000 tokens）');
     expect(meterTooltip(32_000, null, fmt)).toBe('模型窗口未配置（估算模式）');
-    expect(meterTooltip(null, 64_000, fmt)).toBe('模型窗口未配置（估算模式）');
+    expect(meterTooltip(null, 64_000, fmt)).toBe('尚未运行：暂无上下文估算，运行后显示实时占用');
+    expect(meterTooltip(null, null, fmt)).toBe('尚未运行：暂无上下文估算，运行后显示实时占用');
   });
-  it('aria 与 tooltip 同源（读屏 = 所见文本）', () => {
+  it('aria 与 tooltip 同源（读屏 = 所见文本）；空态同步', () => {
     expect(meterAriaLabel(32_000, 64_000, fmt)).toBe(meterTooltip(32_000, 64_000, fmt));
     expect(meterAriaLabel(32_000, null, fmt)).toContain('估算模式');
+    expect(meterAriaLabel(null, 64_000, fmt)).toBe('尚未运行：暂无上下文估算，运行后显示实时占用');
   });
 });
 

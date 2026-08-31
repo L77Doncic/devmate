@@ -4192,14 +4192,12 @@ async function revertReasoning() {
  * 更新随 usage 事件（render 快照驱动）：占用量 =
  * 最近 usage.contextEstimateTokens / settings.window（无窗 → 「—」+tooltip）；
  * 阈值 >80% 琥珀、>95% 红（tier 单一来源 = meter.js；token 值倒推自超窗估算）。
+ * 空态（无估算/会话未启动）= 0% 灰色空环（环保持可见，不再整行隐藏；
+ * 语义与文案见 meter.js —— ratio 0 / tier normal / fill 弧长 0）。
  */
 function renderMeter() {
   const usage = ui.lastSnap?.usage ?? null;
   const estimate = usage?.contextEstimateTokens ?? null;
-  if (estimate === null) {
-    el.meterRow.hidden = true; // 尚无投影估算：不显示（不装「—」假值）
-    return;
-  }
   el.meterRow.hidden = false;
   const windowTokens = ui.settings.windowTokens ?? null;
   const ratio = meterRatio(estimate, windowTokens);

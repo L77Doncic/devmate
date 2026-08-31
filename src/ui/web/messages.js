@@ -477,7 +477,7 @@ export function createMessageStore({ maxItems = DEFAULT_MAX_ITEMS } = {}) {
       }
       case 'usage': {
         // C 档：usage 帧可携带 contextEstimateTokens（run 内最后一次投影估算；
-        // 缺省不带键 —— 上下文中占环在无估算时隐藏）。
+        // 缺省不带键 —— 上下文环无估算时按 0% 空态显示（app.js renderMeter））。
         const contextEstimateTokens = numOr(data?.contextEstimateTokens);
         state.usage = {
           promptTokens: numOr(data?.promptTokens),

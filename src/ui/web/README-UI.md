@@ -45,7 +45,7 @@ python3 -m http.server 8123            # 在 src/ui/web 目录内
 >   ④ wsCollapsed 逐工作区持久化（dsh 为 groupExpansion 全局数组）；空态差异见下「dsh 对齐 2026-08-29」。
 >   | `extensions.js` | 设置页扩展区纯逻辑：Subagent 工作流（/api/workflow 同步 + localStorage 降级）、Skills/MCP 清单归一化（MCP 徽章按 enabled 渲染，不依赖 status）、args 解析 |
 >   | `commands.js` | 「/」命令纯逻辑：13 条命令表（id/name/label/desc/hint 单一来源）、parseCommandLine 行解析、matchCommands 前缀过滤（下拉）、commandFor 白名单匹配、commandArgValid 参数合法裁决、THEME_ARG_VALUES 白名单、CONTINUE_PROMPT（/continue 续跑指令文本） |
->   | `meter.js` | 上下文窗口占用环纯逻辑：meterRatio（contextEstimateTokens / window，夹取 [0,1]、只认 number）、meterTier（>80% 琥珀 / >95% 红 / 缺窗 unknown）、百分比文本、tooltip 与 aria（缺窗「—」= 估算模式）、周长常量 |
+>   | `meter.js` | 上下文窗口占用环纯逻辑：meterRatio（contextEstimateTokens / window，夹取 [0,1]、只认 number；空态 = 估算缺失 → 0）、meterTier（>80% 琥珀 / >95% 红 / 缺窗 unknown）、百分比文本、tooltip 与 aria（缺窗「—」= 估算模式；空态 = 「尚未运行：暂无上下文估算，运行后显示实时占用」）、周长常量 |
 >   | `permissions.js` | dsh 式权限预设纯逻辑（**三档枚举/中文标签/描述/盾形 glyph 单一来源**）：档位归一（非法 → workspace-write）、permissionConfirmedAt 归一与已确认判定、**风险门计算**（切 full-access 且无确认记录 → 一次性确认门）、风险门文案（复用删除确认视觉） |
 >   | `approval-banner.js` | 内嵌审批卡视图模型纯逻辑：headline（工具名+一句话）、命令预览提取（JSON cmd/command/path → mono 卡文本，截断 300）、**队列 → 卡视图换算（一次一个，取首个等待项）**；出现/应答收敛/拒绝语义状态机在 messages.js（approvals 队列）+ app.js（渲染首个等待项） |
 
@@ -113,7 +113,7 @@ GET `/api/stats → {rssMb,heapMb,sessions,activeShells}`；GET `/api/tools → 
 **协议变更（本轮）**：`tool-result` 增补 `content`（全量结果内容，服务端收集缓冲
 64KB 上限内完整；`contentPreview` 保留供列表/降级，展开详情渲染 `content` 不截断至 300）；
 `usage` 增补 `contextEstimateTokens?`（run 内最后一次投影的上下文估算；缺省不带键 ——
-上下文占用环在无估算时隐藏）；`sessions[]` 增补 `workspaceRoot`（分组键）。
+上下文占用环无估算时按 0% 空态显示）；`sessions[]` 增补 `workspaceRoot`（分组键）。
 
 **spawn_subagent 协议（B-1 借鉴①）**：工具参数 `{prompt, skill?}`——`skill` = 技能 id
 （与 use_skill 同 id 语义，见系统提示技能清单节）；给出时该技能全文经 capSkill
@@ -320,8 +320,10 @@ GET `/api/stats → {rssMb,heapMb,sessions,activeShells}`；GET `/api/tools → 
 5. **上下文窗口占用环**：composer 与 stats 行之间 28px 环形（dsh ContextMeter 几何：
    track = border-l3 2px、fill = label-tertiary 2px round、弧起点 12 点），右侧
    百分比文本；占用量 = usage `contextEstimateTokens` / settings `window`（无窗 →
-   「—」+ tooltip「模型窗口未配置（估算模式）」）；更新随 usage 事件；>80% 琥珀
-   （`--warn`）、>95% 红（`--danger`）；纯逻辑 = `meter.js`（ratio/tier/aria 可单测）。
+   「—」+ tooltip「模型窗口未配置（估算模式）」）；**空态（无估算/新会话未运行）=
+   0% 灰色空环 + tooltip「尚未运行：暂无上下文估算，运行后显示实时占用」**（环保持
+   可见，不再整行隐藏），纯逻辑 = `meter.js`（ratio/tier/aria 可单测）；更新随
+   usage 事件；>80% 琥珀（`--warn`）、>95% 红（`--danger`）。
    说明：`window` 缺省按供应商 preset 估算（服务端契约；前端只消费，不推荐覆盖）。
 
 ## 审批改版（2026-08-29 · dsh 式权限预设 + 内嵌审批卡）
@@ -357,7 +359,8 @@ GET `/api/stats → {rssMb,heapMb,sessions,activeShells}`；GET `/api/tools → 
 - 思考强度：`ui.settings.reasoning` 为单一权威态；`saveReasoning` 只上行 `{reasoning}`
   补丁字段（服务端其余字段保持现值）；
 - 上下文环：`ui.settings.windowTokens`（GET `window` 字段归一）+ 快照
-  `usage.contextEstimateTokens`；无估算 → 整行隐藏（不装假值）。
+  `usage.contextEstimateTokens`；无估算 → 0% 灰色空态环（0 占用诚实读数，
+  tooltip 说明未测量；统计行仍无数据即隐藏）。
 
 ## 消息区保真（2026-08-29 · Wave 2：行级 meta / Think 思考行 / ToolRow 变体）
 

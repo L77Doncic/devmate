@@ -6,6 +6,10 @@
  * tooltip「模型窗口未配置（估算模式）」）。权重只有三个：ratio / tier / aria，
  * 全部纯函数；环的几何（SVG dasharray）与配色属 DOM/CSS 层（app.js/style.css）。
  *
+ * 空态：估算缺失（null/undefined —— 尚无 usage 数据 / 会话未启动）= 0 占用，
+ * 显示 0% 灰色空环（诚实空态：未测量即未使用，不伪造数值）；tooltip 说明
+ * 「尚未运行：暂无上下文估算，运行后显示实时占用」。
+ *
  * 阈值：> 80% → warn（琥珀）、> 95% → danger（红）；dsh 同族阈值以
  * ContextMeter.css 与 style.css 的 token 为准（--warn / --danger 单一来源）。
  */
@@ -25,11 +29,14 @@ export function meterCircumference(radius = METER_RADIUS) {
 
 /**
  * 占用比：contextTokens / window，夹取到 [0, 1]（超窗 → 1 = 满环）。
- * 任一数据缺失/非法（非 number、null、非有限数、负数、非整数 window）→ null
- * （「—」= 未知）。**只认 number** —— Number(null)=0 / Number('')=0 会把
- * 「缺失」误判成「0 占用」（同 messages.js numOr 的反 0 陷阱）。
+ * 空态：估算缺失（null/undefined —— 无 usage 数据/会话未启动）= 0（0% 空环）。
+ * 数据非法（非 number、NaN、负数、非整数 window）→ null（「—」= 未知）；
+ * **只认 number** —— Number(null)=0 / Number('')=0 会把「缺失」误判成「0 占用」
+ * （同 messages.js numOr 的反 0 陷阱）；null/undefined 显式归零是空态语义，
+ * 不是 Number() 式误判 —— 与「含消息但估算非法」的 null 保持区分。
  */
 export function meterRatio(contextTokens, windowTokens) {
+  if (contextTokens === null || contextTokens === undefined) return 0; // 空态：未测量 = 0 占用
   if (typeof contextTokens !== 'number' || typeof windowTokens !== 'number') return null;
   const c = contextTokens;
   const w = windowTokens;
@@ -50,15 +57,17 @@ export function meterTier(ratio) {
   return 'normal';
 }
 
-/** 环内或旁的百分比文本：有窗 → '38%'；无窗 → '—'（tooltip 区分见 meterTooltip）。 */
+/** 环内或旁的百分比文本：有窗 → '38%'；无窗 → '—'；空态（无估算）→ '0%'（tooltip 区分见 meterTooltip）。 */
 export function meterPercentText(contextTokens, windowTokens) {
   const ratio = meterRatio(contextTokens, windowTokens);
   if (ratio === null) return '—';
   return `${Math.round(ratio * 100)}%`;
 }
 
-/** 悬停 tooltip：有窗 → 数值式；无窗 → 估算模式说明（文案单一来源，防漂移断言）。 */
+/** 悬停 tooltip：有窗 → 数值式；无窗 → 估算模式说明；空态（无估算）→ 未运行说明（文案单一来源）。 */
 export function meterTooltip(contextTokens, windowTokens, formatTokensFn) {
+  if (contextTokens === null || contextTokens === undefined)
+    return '尚未运行：暂无上下文估算，运行后显示实时占用';
   const ratio = meterRatio(contextTokens, windowTokens);
   if (ratio === null) return '模型窗口未配置（估算模式）';
   const fmt = typeof formatTokensFn === 'function' ? formatTokensFn : (n) => String(n);
