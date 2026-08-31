@@ -12,9 +12,11 @@
  *   初值经 loadStoredConfig 读取（缺失 → {}，损坏 → ConfigError）。
  *
  * 类型命名（重名修复）：本模块的生效配置类型为 **CliConfig**（CLI 侧）：三源合并结果
- * {baseUrl, model, apiKey?, maxSteps?, costLimitUsd?}——与 S12 引擎侧
+ * {baseUrl, model, apiKey?, maxSteps?}——与 S12 引擎侧
  * ui/server/deps 的 **DevmateConfig**（workspaceRoot/model/… 装配输入）**两型区分**，
  * 各自保持原名不动，避免跨层同名的路径歧义。
+ * Token 护栏（2026-08-31 定调）不入 config.json：对话级 per-session，经 POST /api/chat
+ * 的 maxRunTokens 字段透传（存量 config.json 里的死键 costLimitUsd 原样保留、不再读用）。
  */
 import { chmodSync, existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
@@ -37,7 +39,6 @@ export interface StoredConfig {
   model?: string;
   apiKey?: string;
   maxSteps?: number;
-  costLimitUsd?: number;
   /** 思考强度（C 档：settings reasoning 持久化；缺省 'medium'——服务端兜底）。 */
   reasoning?: ReasoningEffort;
   /** 上下文窗口覆盖（C 档：settings windowTokens 持久化；缺省 = 供应商 preset 估算）。 */
@@ -90,7 +91,6 @@ export interface CliConfig {
   model: string;
   apiKey?: string;
   maxSteps?: number;
-  costLimitUsd?: number;
   /** 请求侧输入/输出上限（A 档；读回自配置，未配置缺省=不发送/厂商默认）。 */
   maxInputTokens?: number;
   maxOutputTokens?: number;
@@ -123,7 +123,6 @@ export function loadConfig(configPath: string, env: Record<string, string | unde
   const apiKey = env[ENV_API_KEY] || stored.apiKey;
   if (apiKey !== undefined) cfg.apiKey = apiKey;
   if (stored.maxSteps !== undefined) cfg.maxSteps = stored.maxSteps;
-  if (stored.costLimitUsd !== undefined) cfg.costLimitUsd = stored.costLimitUsd;
   // A 档：输入/输出上限读回（未配置缺省 = 不发送（请求默认）——与引擎口径一致）
   if (stored.maxInputTokens !== undefined) cfg.maxInputTokens = stored.maxInputTokens;
   if (stored.maxOutputTokens !== undefined) cfg.maxOutputTokens = stored.maxOutputTokens;

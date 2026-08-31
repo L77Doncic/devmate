@@ -62,7 +62,6 @@ export interface ServerConfig {
   model: string;
   apiKey?: string;
   maxSteps?: number;
-  costLimitUsd?: number;
   /** 思考强度持久值（config.json settings 写路径的读回键；缺省 'medium'）。 */
   reasoning?: ReasoningEffort;
   /** 权限预设持久值（读回键；缺省 'workspace-write'）。 */
@@ -211,7 +210,6 @@ export function buildServerConfig(config: {
   model: string;
   apiKey?: string;
   maxSteps?: number;
-  costLimitUsd?: number;
   reasoning?: ReasoningEffort;
   permission?: PermissionPreset;
   windowTokens?: number;
@@ -228,7 +226,6 @@ export function buildServerConfig(config: {
   };
   if (config.apiKey !== undefined) out.apiKey = config.apiKey;
   if (config.maxSteps !== undefined) out.maxSteps = config.maxSteps;
-  if (config.costLimitUsd !== undefined) out.costLimitUsd = config.costLimitUsd;
   if (config.reasoning !== undefined) out.reasoning = config.reasoning;
   if (config.permission !== undefined) out.permission = config.permission;
   if (config.windowTokens !== undefined) out.windowTokens = config.windowTokens;
@@ -281,7 +278,6 @@ export async function runWeb(args: string[], io: RunWebIo): Promise<number> {
     model: config.model,
     ...(config.apiKey !== undefined ? { apiKey: config.apiKey } : {}),
     ...(config.maxSteps !== undefined ? { maxSteps: config.maxSteps } : {}),
-    ...(config.costLimitUsd !== undefined ? { costLimitUsd: config.costLimitUsd } : {}),
     // B 档设置读回：{permission, reasoning, windowTokens, methodFirst, reviewMode} 自 config.json
     // 同键读回（persistSettings 写出的键；缺省不写 → 缺省字段不传，assembleDeps 回落各自缺省）
     ...(stored.reasoning !== undefined ? { reasoning: stored.reasoning } : {}),
@@ -305,7 +301,8 @@ export async function runWeb(args: string[], io: RunWebIo): Promise<number> {
     return 1;
   }
   // 设置持久化：POST /api/settings 落盘（mergeConfig 单点合并写——只覆盖 settings 键，
-  // maxSteps/costLimitUsd/skills/workflow/mcp 等既有键全保留；patch 显式 apiKey:undefined
+  // maxSteps/skills/workflow/mcp 等既有键全保留（含历史死键，如旧版 costLimitUsd——
+  // 不再读用）；patch 显式 apiKey:undefined
   // = 删除该键；reasoning/windowTokens/permission/permissionConfirmedAt/methodFirst/reviewMode
   // 只在快照携带时写——服务端补丁语义本来就在触碰时才携带）。saveConfig 0600 写
   // io.configPath 由 mergeConfig 负责（目录/模式纠正）。

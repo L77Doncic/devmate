@@ -221,9 +221,7 @@ describe('ui/server：POST /api/chat + SSE 事件流', () => {
         };
       },
     };
-    const { base, server } = await startServer(
-      depsFor([], { llm, runOptions: { maxSteps: 1, costLimitUsd: 10 } }),
-    );
+    const { base, server } = await startServer(depsFor([], { llm, runOptions: { maxSteps: 1 } }));
     servers.push(server);
     const created = (await (await postJson(base, '/api/chat', { text: 'm' })).json()) as {
       sessionId: string;

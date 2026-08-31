@@ -23,7 +23,6 @@ export type { WiredLlmAdapterOptions } from './boot.js';
 export { defineRegistry } from './tools.js';
 export type { ReinjectionError, SchemaIssue, ToolCallValidation } from './tools.js';
 export {
-  DEFAULT_COST_LIMIT_USD,
   DEFAULT_MAX_FORMAT_ERRORS,
   DEFAULT_MAX_REVIEW_COST_USD,
   DEFAULT_MAX_TOKENS,

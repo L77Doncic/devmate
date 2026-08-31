@@ -2,8 +2,8 @@
  * # loop/agent：run() 主循环（接缝 S5 的核心）
  *
  * 每轮次（Turn）动作序列（CONTEXT「主循环」/「写序不变量」）：
- * 保险丝前置（成本/步数/墙钟分项，查询之前）→ project 投影（两级压缩只作用于投影；
- * 摘要后按压缩防抖计数、超容忍即熔断，CONTEXT「压缩防抖」）→ 闸门 A 请求前估算
+ * 保险丝前置（token 护栏/步数/墙钟分项，查询之前）→ project 投影（两级压缩只作用于投影；
+ * 摘要后按压缩防抖计数、超容忍即熔断，CONTEXT「压缩防抖」）→ 闸门 A 请求前 token 预判
  * → 流式查询（含传输层 retry，归 boot 的 LlmAdapter）→ assistant 事件先落盘（T1）
  * → 无 toolCalls = 自然结束 → 工具执行（并行 + 独立超时 + 审批 + 畸形回注）→
  * 结果事件落盘（T2）→ 熔断/计数 → 下一轮。
@@ -11,7 +11,9 @@
  * 分层纪律（ADR-0006）：轮次层错误（畸形参数/未知工具/schema 违例/参数缺失/执行失败/
  * 超时/用户拒绝）一律以该次调用的工具结果内容回注，绝不抛异常；传输层错误由
  * LlmAdapter（boot 接线）重试到底，本层只按终止面收尾（fatal 或 user-interrupted）。
- * 被计费的失败轮照记成本（ADR-0003：保险丝防绕过），熔断与回注成对（ADR-0006）。
+ * 被计费的失败轮照记成本（ADR-0003：保险丝防绕过），熔断与回注成对（ADR-0006）；
+ * 护栏判据（用户定调 2026-08-31）：累计 totalTokens（prompt+completion 之和）—
+ * costUsd 仅保留显示统计（stats/usage 照旧），不再参与判据；上限缺省 = 关闭。
  */
 import type {
   ChatMessage,
@@ -60,7 +62,6 @@ import type {
   ToolResult,
 } from './types.js';
 import {
-  DEFAULT_COST_LIMIT_USD,
   DEFAULT_MAX_FORMAT_ERRORS,
   DEFAULT_MAX_REVIEW_COST_USD,
   DEFAULT_MAX_TOKENS,
@@ -107,7 +108,10 @@ export function reviewBudgetSkipNote(maxUsd: number): string {
 
 export async function run(input: RunInput, opts: RunOptions): Promise<RunResult> {
   const pricing = opts.pricing ?? DEFAULT_PRICING;
-  const costLimit = opts.costLimitUsd ?? DEFAULT_COST_LIMIT_USD;
+  // Token 护栏上限（用户定调 2026-08-31：判据从 costUsd 改为累计 totalTokens——单价表
+  // 无关、供应商无关；缺省/非法 → null = 关闭（= 无限 token，不再有默认开启的保险丝，
+  // 与 subagentsEnabled 开关族一致：关 = 不拦）。
+  const runTokenLimit = normalizeRunTokenLimit(opts.maxRunTokens);
   const maxFormatErrors = opts.maxFormatErrors ?? DEFAULT_MAX_FORMAT_ERRORS;
   const toolTimeoutMs = opts.toolTimeoutMs ?? DEFAULT_TOOL_TIMEOUT_MS;
   // 闸门 A 输出侧估价（§8 A-1 输出预留）：请求带 maxTokens 用之，否则模型默认预留。
@@ -118,6 +122,9 @@ export async function run(input: RunInput, opts: RunOptions): Promise<RunResult>
   const { store } = opts;
 
   const ledger: Ledger = { promptTokens: 0, completionTokens: 0, costUsd: 0, estimated: false };
+  /** 累计 totalTokens（prompt+completion 之和；护栏判据唯一真值——服务端 usage 真实值，
+   *  无 usage 时本地估算兜底；成本统计照旧走 costUsd）。 */
+  const ledgerTotalTokens = (): number => ledger.promptTokens + ledger.completionTokens;
   /** 最近一次投影的上下文估算（C 档：usage 的 contextEstimateTokens；无投影路径缺省）。 */
   let contextEstimate: number | undefined;
   const calibrator = new TokenEstimateCalibrator(); // L0 事后校准（ADR-0012；默认系数 1）
@@ -157,13 +164,15 @@ export async function run(input: RunInput, opts: RunOptions): Promise<RunResult>
     await store.repairOrphaned(input.sessionId);
 
     while (status === null) {
-      // 保险丝前置：每轮查询之前（CONTEXT「保险丝」；优先级：成本 → 墙钟 → 步数）
+      // 保险丝前置：每轮查询之前（CONTEXT「保险丝」；优先级：token 护栏 → 墙钟 → 步数）
       if (signal?.aborted === true) {
         status = 'user-interrupted';
         break;
       }
-      if (ledger.costUsd > costLimit) {
-        // 闸门 C 校准后越限：下一轮查询前停（熔断与终止合一的成本护栏）
+      if (runTokenLimit !== null && ledgerTotalTokens() > runTokenLimit) {
+        // 闸门 C 累计越限：下一轮查询前停（熔断与终止合一的 Token 护栏）。
+        // 保守裁决（双判据）：本闸门只管「累计已超」；请求前闸门 A 按「累计 + 单轮上限」
+        // 预判该轮的预估消耗（prompt 估算 + 输出预留）——宁可早停，不再燃烧/不再发送。
         status = 'cost-guard';
         break;
       }
@@ -230,17 +239,14 @@ export async function run(input: RunInput, opts: RunOptions): Promise<RunResult>
         debouncer.reset();
       }
 
-      // 闸门 A：请求前估价（§5.3：est_prompt×prompt 价 + maxTokens×completion 价 + 累计 > 预算 ⇒ 不发请求；
-      // 单价表缺口期按「估算 token × 占位价」近似，ADR-0003）。promptEst 经 L0 校正系数（ADR-0012）。
+      // 闸门 A：请求前 token 预判（保守裁决「累计 + 单轮上限」：累计 totalTokens +
+      // 本轮 prompt 估算（经 L0 校正系数，ADR-0012）+ 输出预留 maxTokens（§8 A-1）
+      // > 上限 ⇒ 不发请求——单轮最坏开销先计入，宁可不发）。判据与单价无关：
+      // promptEst/completionEst 本来就是 token 估算（原 cost 闸门是把它们乘占位价）。
       const rawEst = projection.stats.estimatedTokens;
       contextEstimate = rawEst; // C 档：透传 usage 的 contextEstimateTokens（最后一次投影）
       const promptEst = calibrator.apply(rawEst);
-      if (
-        ledger.costUsd +
-          promptEst * pricing.promptPerToken +
-          maxTokens * pricing.completionPerToken >
-        costLimit
-      ) {
+      if (runTokenLimit !== null && ledgerTotalTokens() + promptEst + maxTokens > runTokenLimit) {
         status = 'cost-guard';
         break;
       }
@@ -266,7 +272,7 @@ export async function run(input: RunInput, opts: RunOptions): Promise<RunResult>
         ...(turnMaxTokens !== undefined ? { maxTokens: turnMaxTokens } : {}),
         ...(opts.maxInputTokens !== undefined ? { maxInputTokens: opts.maxInputTokens } : {}),
         ...(opts.reasoning !== undefined ? { reasoning: opts.reasoning } : {}),
-        budget: { pricing, costLimit, promptEst, ledger },
+        budget: { pricing, runTokenLimit, promptEst, ledger },
         calibrator,
         rawEst,
         truncationHint,
@@ -386,7 +392,7 @@ interface TurnDeps {
   maxInputTokens?: number;
   /** 思考强度（C 档：RunOptions.reasoning 逐字进 ChatRequest.reasoningEffort）。 */
   reasoning?: ReasoningEffort;
-  /** 成本护栏状态归并（Data Clumps：pricing/costLimit/promptEst/ledger 成组流转）。 */
+  /** Token 护栏与计价状态归并（Data Clumps：pricing/runTokenLimit/promptEst/ledger 成组流转）。 */
   budget: BudgetState;
   /** L0 事后校准器（真实 usage 到位后 update；ADR-0012）。 */
   calibrator: TokenEstimateCalibrator;
@@ -400,10 +406,12 @@ interface TurnDeps {
   truncationHint: { hinted: boolean };
 }
 
-/** 成本护栏计价状态（ADR-0003：计价表 + 上限 + 本轮请求前估算 + 累计账本）。 */
+/** Token 护栏与计价状态（累计 totalTokens 上限 + 本轮请求前估算 + 累计账本；costUsd 只留统计
+ *  —— 护栏判据已从 costUsd 改为 token，ADR-0003 演进；pricing 仅供成本显示计价）。 */
 interface BudgetState {
   pricing: Pricing;
-  costLimit: number;
+  /** Token 护栏上限；null = 关闭（不限制）。 */
+  runTokenLimit: number | null;
   /** 本轮请求前投影估算（已乘 L0 校正系数）。 */
   promptEst: number;
   ledger: Ledger;
@@ -447,7 +455,7 @@ async function runTurn(deps: TurnDeps): Promise<TurnOutcome> {
   let reasoning = '';
   let snapshot: StreamSnapshot | null = null;
   let streamError: LlmError | null = null;
-  let costAborted = false;
+  let limitAborted = false;
   const completionEst = { tokens: 0 };
 
   streamLoop: for await (const ev of deps.llm.chat(request, deps.signal)) {
@@ -459,16 +467,20 @@ async function runTurn(deps: TurnDeps): Promise<TurnOutcome> {
     if (ev.type === 'text') content += ev.text;
     else if (ev.type === 'reasoning') reasoning += ev.text;
     completionEst.tokens = estimateTextTokens(content + reasoning, TEXT_TOKENS_PER_ASCII_PROSE);
-    // 闸门 B：流式中值超阈值 → 中止（尽力保留已生成部分）。
+    // 闸门 B：流式中累计 totalTokens（已生成部分估算）触顶 → 中止（尽力保留已生成部分）。
+    // 保守裁决同闸门 A：已记账 + 本轮 prompt 估算 + 已生成 completion 估算
+    // > 上限即中止（不做「等结算后再说」——流越长烧越多）。
     // 用户中止由 LlmAdapter 观测 signal（传输层 abort → error{kind:'abort'} 事件）
     // 与轮/工具边界检查实现；流内不轮询信号，避免事件次序竞态。
     if (
-      deps.budget.ledger.costUsd +
-        deps.budget.promptEst * deps.budget.pricing.promptPerToken +
-        completionEst.tokens * deps.budget.pricing.completionPerToken >
-      deps.budget.costLimit
+      deps.budget.runTokenLimit !== null &&
+      deps.budget.ledger.promptTokens +
+        deps.budget.ledger.completionTokens +
+        deps.budget.promptEst +
+        completionEst.tokens >
+        deps.budget.runTokenLimit
     ) {
-      costAborted = true;
+      limitAborted = true;
       break streamLoop;
     }
   }
@@ -479,8 +491,9 @@ async function runTurn(deps: TurnDeps): Promise<TurnOutcome> {
     arguments: tc.arguments,
   }));
 
-  if (costAborted) {
-    // 流式中超预算：尽力保留已生成部分（text/reasoning），usage 记账（估算标记）。
+  if (limitAborted) {
+    // 流式中触顶 Token 护栏：尽力保留已生成部分（text/reasoning），usage 记账（估算标记
+    // ——prompt/completion 均为本地估算；下轮 loop-top 闸门 C 以累计值复核）。
     // 中止先于 end/error：snapshot 必为 null，calls 恒空（无任何 toolCalls 可保留）。
     await persistPartial(deps, content, reasoning, calls);
     addEstimateUsage(deps.budget, completionEst.tokens);
@@ -944,6 +957,17 @@ function minTokenBudget(a: number | undefined, b: number | undefined): number | 
   if (a === undefined) return b;
   if (b === undefined) return a;
   return Math.min(a, b);
+}
+
+/**
+ * Token 护栏上限归一（防御门槛）：正整数 number → 原样；undefined/null/非有限/非正整数
+ * → null（= 关闭，不拦）。服务端已在 POST /api/chat 校验（非法 400），此处双保险——
+ * 护栏是保险丝，坏值按「关」处理不放大为行为故障（护栏故障不放大原则）。
+ */
+function normalizeRunTokenLimit(value: number | null | undefined): number | null {
+  if (typeof value !== 'number') return null;
+  if (!Number.isFinite(value) || !Number.isInteger(value) || value < 1) return null;
+  return value;
 }
 
 class ToolTimeoutError extends Error {

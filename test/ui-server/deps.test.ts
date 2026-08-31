@@ -37,7 +37,6 @@ describe('ui/server/deps：assembleDeps 一次组装', () => {
       sessionsDir: join(dir, 'sessions'),
       model: 'deepseek-v4-flash',
       apiKey: 'sk-0123456789abcdef',
-      costLimitUsd: 0.5,
       maxSteps: 50,
       windowTokens: 128_000,
       systemPrompt: 'rules…',
@@ -59,11 +58,13 @@ describe('ui/server/deps：assembleDeps 一次组装', () => {
     expect(deps.llm).toBeTypeOf('object');
     expect(deps.settings?.model).toBe('deepseek-v4-flash');
     expect(deps.settings?.apiKey).toBe('sk-0123456789abcdef');
+    // Token 护栏（2026-08-31 定调）不在装配层：对话级经 POST /api/chat 的 maxRunTokens
+    // 注入——runOptions 恒不含护栏键（缺省关闭）
     expect(deps.runOptions).toMatchObject({
-      costLimitUsd: 0.5,
       maxSteps: 50,
       windowTokens: 128_000,
     });
+    expect(Object.hasOwn(deps.runOptions ?? {}, 'costLimitUsd')).toBe(false);
     // 会话工具工厂：同一会话恒同一 registry（shell/工具缓存），不同会话各自实例；
     // close 路径经 deps.dispose 清理（有 dispose 回调）
     expect(deps.createSessionTools).toBeTypeOf('function');

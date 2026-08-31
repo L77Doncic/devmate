@@ -61,6 +61,7 @@ import {
   modelMarkerHint,
   friendlyWorkspacePath,
 } from './settings.js';
+import { loadGuardTokens, saveGuardTokens, guardInputError, guardPillLabel } from './guard.js';
 import {
   PERMISSION_VALUES,
   PERMISSION_DESCRIPTIONS,
@@ -232,6 +233,8 @@ import {
   friendlyProviderError,
   // R2-S2 评审静默（P2-10）：未启用子代理时 run 后至多一次提示的裁决与文案
   reviewSkippedHint,
+  // 流式绘制切分（无换行时稳定段为空、全文走尾段单份渲染——双行重影防回归）
+  assistantPaintSplit,
 } from './format.js';
 
 // ============================================================== 常量
@@ -255,6 +258,10 @@ const replayGuard = createReplayGuard();
 const streamGate = createStreamGate({ onFinished: () => store.endStream() });
 const ui = {
   settingsReady: false,
+  // Token 护栏（对话级 · 2026-08-31）：当前会话的累计 totalTokens 上限；
+  // null = 关闭（不限制，缺省）；按 sessionId 记忆于 localStorage（guard.js）。
+  guardTokens: null,
+  guardPopOpen: false,
   settings: {
     baseUrl: DEFAULT_SETTINGS.baseUrl,
     model: DEFAULT_SETTINGS.model,
@@ -471,6 +478,14 @@ const el = {
   mmModel: document.getElementById('mm-model'),
   mmModelValue: document.getElementById('mm-model-value'),
   modelMenuOpts: document.getElementById('model-menu-opts'),
+  // Token 护栏 pill + 弹层（2026-08-31：对话级护栏控件；纯逻辑 = guard.js）
+  guardPill: document.getElementById('guard-pill'),
+  guardLabel: document.getElementById('gp-label'),
+  guardPop: document.getElementById('guard-pop'),
+  guardTokensInput: document.getElementById('guard-tokens-input'),
+  guardTokensErr: document.getElementById('guard-tokens-err'),
+  guardApply: document.getElementById('guard-apply'),
+  guardClear: document.getElementById('guard-clear'),
   // 全部访问风险确认门（复用删除确认 modal 视觉）
   riskConfirm: document.getElementById('risk-confirm'),
   riskScrim: document.getElementById('risk-scrim'),
@@ -1679,6 +1694,7 @@ async function restoreSession(id) {
   saveWorkspaceChoice(localStorage, true);
   store.reset();
   store.setSessionId(id);
+  syncGuardPill(); // Token 护栏（对话级）：会话指针切走即重载该会话的记忆值
 
   // 2) 回放历史（协议形状事件；失败降级为系统提示 + 空视图，流仍然照常接）
   let restored = null;
@@ -1764,6 +1780,7 @@ async function newSession(workspaceRoot = null) {
   store.reset();
   store.setSessionId(id);
   replayGuard.clear(); // 新会话无 GET 回放覆盖序 —— 守卫拆除（重放窗即时序本体）
+  syncGuardPill(); // Token 护栏（对话级）：新会话缺省关闭（无记忆→关，不吃旧会话值）
 
   await backswitch(previousSessionId, previousRunActive);
 
@@ -1848,6 +1865,7 @@ async function confirmDeleteSession() {
       saveWorkspaceChoice(localStorage, true); // P1-2：选择不因删除撤销 → 持久化
       store.reset();
       store.setSessionId(null);
+      syncGuardPill(); // Token 护栏：当前会话已删 → 回「护栏 关」（下一条消息建新会话）
     }
     toast('会话已删除');
   } catch (err) {
@@ -1885,17 +1903,9 @@ function paintAssistant(id) {
   const body = node._body;
   const text = view.text;
 
-  let stable = text;
-  let tail = '';
-  if (!view.done) {
-    const idx = text.lastIndexOf('\n');
-    if (idx >= 0) {
-      stable = text.slice(0, idx);
-      tail = text.slice(idx + 1);
-    } else {
-      tail = text;
-    }
-  }
+  // 稳定段 / 尾段切分（纯函数；不变式「两段永不重叠」——无换行时稳定段为空，全文只走
+  // 尾段单份渲染，杜绝「正文与流式尾段同时渲染同一段文本」的双行重影）。
+  const { stable, tail } = assistantPaintSplit(text, view.done);
   markdownToDOM(body, stable);
   if (tail) {
     const tailEl = document.createElement('span');
@@ -3343,6 +3353,7 @@ function ensureSessionId() {
   if (!ui.sessionId) {
     ui.sessionId = `s-${crypto.randomUUID()}`;
     store.setSessionId(ui.sessionId);
+    syncGuardPill(); // Token 护栏（对话级）：新指针（新会话）→ 无记忆 = 关
   }
   return ui.sessionId;
 }
@@ -3562,10 +3573,16 @@ async function postChat(text, images) {
       body: {
         sessionId: ui.sessionId,
         text,
+        // Token 护栏（对话级 · 2026-08-31）：仅当本会话设置了上限才上行（缺省不携带
+        // = 服务端护栏关闭——默认关闭语义；服务端校验正整数，非法 400）。
+        ...(ui.guardTokens !== null && ui.guardTokens !== undefined
+          ? { maxRunTokens: ui.guardTokens }
+          : {}),
         ...(carryImages.length > 0 ? { images: carryImages } : {}),
       },
     });
     ui.sessionId = res?.sessionId ?? ui.sessionId;
+    syncGuardPill(); // 会话指针确定（服务端回执/客户端已生成）：守卫记忆键与指针对齐
     // P1-2：会话创建/恢复即视为已选工作区 → 持久化（刷新不回锁态）
     if (ui.sessionId) saveWorkspaceChoice(localStorage, true);
     store.setSessionId(ui.sessionId);
@@ -4188,6 +4205,84 @@ async function revertReasoning() {
   } catch {
     // 服务端不可达：保持当前值（下次点击再试）
   }
+}
+
+// ============================================================== Token 护栏 pill（对话级 · guard.js 纯逻辑）
+
+/**
+ * 会话级护栏记忆回显（会话指针变化即调用）：从 localStorage 读当前会话的值
+ * （缺省 null = 关闭）→ ui.guardTokens + pill 标签回显。README：按键 = 会话，
+ * 新会话无记忆 = 关（默认关闭语义）。
+ */
+function syncGuardPill() {
+  ui.guardTokens = loadGuardTokens(localStorage, ui.sessionId);
+  renderGuardPill();
+  return ui.guardTokens;
+}
+
+/** pill 标签回显（「护栏 关」/「护栏 500k」；label 单一来源 = guard.js guardPillLabel）。 */
+function renderGuardPill() {
+  el.guardLabel.textContent = guardPillLabel(ui.guardTokens);
+  el.guardPill.title = ui.guardTokens
+    ? `Token 护栏：本对话累计 ${ui.guardTokens} tokens 超限即停（点击修改）`
+    : 'Token 护栏：本轮对话累计 tokens 超过上限即停止（留空/关闭 = 不限制）';
+}
+
+/** 弹层开关（与 toggleModelMenu 同纪律：menuPosition 锚定——浮层在视口内不溢出）。 */
+function toggleGuardPop(force) {
+  const open = force !== undefined ? force : !ui.guardPopOpen;
+  if (open) {
+    el.guardTokensInput.value = ui.guardTokens !== null ? String(ui.guardTokens) : '';
+    showFieldError(el.guardTokensErr, '');
+    const rect = el.guardPill.getBoundingClientRect();
+    el.guardPop.hidden = false; // 先解除隐藏：offsetWidth/Height 实测
+    const size = { width: el.guardPop.offsetWidth, height: el.guardPop.offsetHeight };
+    const pos = menuPosition(
+      { left: rect.left, top: rect.top, width: rect.width, height: rect.height },
+      size,
+      { width: window.innerWidth, height: window.innerHeight },
+    );
+    el.guardPop.style.left = `${pos.left}px`;
+    el.guardPop.style.top = `${pos.top}px`;
+    ui.guardPopOpen = true;
+    el.guardPill.setAttribute('aria-expanded', 'true');
+    el.guardTokensInput.focus();
+  } else {
+    el.guardPop.hidden = true;
+    ui.guardPopOpen = false;
+    el.guardPill.setAttribute('aria-expanded', 'false');
+  }
+}
+
+/** 应用（本地校验先拦——与服务端 400 同口径；保存于当前会话指针的记忆键）。
+ *  无会话指针（全新视图待首条消息）→ ensureSessionId 先生成（服务端接受调用方 id）。 */
+function applyGuardTokens() {
+  const err = guardInputError(el.guardTokensInput.value);
+  if (err !== '') {
+    showFieldError(el.guardTokensErr, err);
+    return;
+  }
+  const raw = String(el.guardTokensInput.value ?? '').trim();
+  const value = raw === '' ? null : Number(raw);
+  if (value === null) {
+    // 清空 = 关闭（删当前会话的记忆键；无会话指针 → 无键可删，行为等价）
+    saveGuardTokens(localStorage, ui.sessionId, null);
+  } else {
+    // 无会话指针（全新视图待首条消息）→ 先生成：服务端接受调用方 id（首条 /api/chat 用之）
+    const sessionId = ensureSessionId();
+    saveGuardTokens(localStorage, sessionId, value);
+  }
+  ui.guardTokens = value;
+  renderGuardPill();
+  toggleGuardPop(false);
+}
+
+/** 清除（关闭）：删当前会话护栏记忆键 + pill 回「护栏 关」。 */
+function clearGuardTokens() {
+  saveGuardTokens(localStorage, ui.sessionId, null);
+  ui.guardTokens = null;
+  renderGuardPill();
+  toggleGuardPop(false);
 }
 
 // ============================================================== 上下文窗口占用环（meter.js 纯逻辑）
@@ -5170,6 +5265,23 @@ function wireEvents() {
     toggleModelMenu(false);
     openSettings();
   });
+  // Token 护栏 pill（对话级）：点击开弹层；应用/清除 + 输入即校验（Enter/Escape 便捷）
+  el.guardPill.addEventListener('click', () => {
+    toggleGuardPop();
+  });
+  el.guardApply.addEventListener('click', applyGuardTokens);
+  el.guardClear.addEventListener('click', clearGuardTokens);
+  el.guardTokensInput.addEventListener('input', () => {
+    showFieldError(el.guardTokensErr, guardInputError(el.guardTokensInput.value));
+  });
+  el.guardTokensInput.addEventListener('keydown', (event) => {
+    if (event.key === 'Enter') {
+      event.preventDefault();
+      applyGuardTokens();
+    } else if (event.key === 'Escape') {
+      toggleGuardPop(false);
+    }
+  });
   // 命令面板关闭（X 外点）
   el.cmdPanelClose.addEventListener('click', closeCmdPanel);
   document.addEventListener('click', (event) => {
@@ -5191,8 +5303,12 @@ function wireEvents() {
       if (event.target instanceof Element && event.target.closest('#model-combo')) return;
       toggleModelMenu(false);
     }
+    if (ui.guardPopOpen || !el.guardPop.hidden) {
+      if (event.target instanceof Node && el.guardPop.contains(event.target)) return;
+      if (event.target instanceof Element && event.target.closest('#guard-pill')) return;
+      toggleGuardPop(false);
+    }
   });
-  // 输入离开即收起命令下拉（贴外层关闭不覆盖输入区的点击）
   el.input.addEventListener('blur', () => {
     window.setTimeout(hideCommandMenu, 120);
   });

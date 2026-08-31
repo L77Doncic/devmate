@@ -136,6 +136,12 @@ describe('ui/server/deps-prompt：base 定稿（锚定词/单源/节序）', () 
     expect(DEV_BASE_SYSTEM_PROMPT).toContain('无理由拒绝');
     expect(DEV_BASE_SYSTEM_PROMPT).toContain('不带工具调用');
   });
+
+  it('P4b) 语言锚定：默认中文（思考与回复），用户其他语言时随用户——防「不回复中文」漂移', () => {
+    expect(DEV_BASE_SYSTEM_PROMPT).toContain('语言规则');
+    expect(DEV_BASE_SYSTEM_PROMPT).toContain('默认使用中文思考与回复');
+    expect(DEV_BASE_SYSTEM_PROMPT).toContain('用户使用其他语言时，以用户语言回复');
+  });
 });
 
 describe('ui/server/deps-prompt：预算估算（base 锚 + 裁剪链覆盖）', () => {

@@ -374,6 +374,23 @@
                    模型·思考强度 combo（dsh 右下同款：「DeepSeek-V4-Flash · 中 ▾」；
                    点击展开两段：模型名（跳设置）+ 强度四档）邻接发送钮。 -->
               <div class="composer-actions">
+                <!-- Token 护栏 pill（2026-08-31 定调：对话级护栏，per-session——每个对话
+                     独立设置；与模型·思考强度 combo 同族：pill 表面 + 点击展开弹层）。
+                     默认「护栏 关」= 不限制；点击展开输入 token 上限（正整数），
+                     保存后 pill 显示如「护栏 500k」；清空 = 关闭。 -->
+                <button
+                  type="button"
+                  class="guard-pill"
+                  id="guard-pill"
+                  aria-haspopup="dialog"
+                  aria-expanded="false"
+                  title="Token 护栏：本轮对话累计 tokens 超过上限即停止（留空/关闭 = 不限制）"
+                >
+                  <span class="gp-label" id="gp-label">护栏 关</span>
+                  <svg class="gp-chevron" viewBox="0 0 14 14" aria-hidden="true">
+                    <path fill="currentColor" d="M5.4 3.3l5 4.7-5 4.7z" />
+                  </svg>
+                </button>
                 <button
                   class="btn-stop-circ"
                   id="btn-stop"
@@ -441,6 +458,38 @@
               <div class="model-menu-sep" aria-hidden="true"></div>
               <div class="model-menu-sec">思考强度</div>
               <div class="model-menu-opts" id="model-menu-opts" role="radiogroup"></div>
+            </div>
+            <!-- Token 护栏弹层（与 model-menu 同表面：浮层、r8、阴影；锚于 guard-pill；
+                 数值输入 + 应用/清除 —— 输入校验与记忆逻辑 = guard.js，装配 = app.js） -->
+            <div class="guard-pop" id="guard-pop" hidden role="dialog" aria-label="Token 护栏">
+              <div class="guard-pop-head">
+                <span class="guard-pop-title">Token 护栏</span>
+                <span class="guard-pop-sub">本对话优先级</span>
+              </div>
+              <p class="field-help guard-pop-help">
+                本轮对话累计 tokens（输入+输出之和）超过上限即停止（「Token 护栏停机」）；
+                留空或清除 = 关闭（不限制）。
+              </p>
+              <div class="guard-pop-row">
+                <input
+                  class="input input-num"
+                  id="guard-tokens-input"
+                  type="number"
+                  min="1"
+                  step="1"
+                  placeholder="如 500000"
+                  autocomplete="off"
+                  aria-label="Token 上限（正整数）"
+                />
+              </div>
+              <p class="field-help err" id="guard-tokens-err" hidden></p>
+              <p class="field-help dim guard-pop-meta">
+                仅对当前对话生效（按会话记忆）；新对话默认为关。
+              </p>
+              <div class="guard-pop-actions">
+                <button class="btn btn-outline" id="guard-clear" type="button">清除（关闭）</button>
+                <button class="btn btn-primary" id="guard-apply" type="button">应用</button>
+              </div>
             </div>
             <!-- 命令下拉（输入区首个字符 / 触发、防抖 150ms；纯逻辑 = commands.js，
                  DOM 装配 = app.js；dsh Menu 表面：浮层、r8、阴影；锚于输入卡上缘） -->

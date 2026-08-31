@@ -21,7 +21,6 @@ function opts(over: Partial<RunOptions> = {}): RunOptions {
     tools: makeRegistry().registry,
     llm: new FakeLlm([{ content: 'done' }]),
     model: 'm',
-    costLimitUsd: 100,
     ...over,
   };
 }

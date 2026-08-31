@@ -92,7 +92,9 @@ export function formatTime(ts) {
  */
 export const RUN_STATUS_SEMANTICS = Object.freeze({
   completed: { label: '已完成', tone: 'ok' },
-  'cost-guard': { label: '成本护栏停机', tone: 'stop' },
+  // 2026-08-31 定调：护栏判据从 costUsd 改为累计 totalTokens（对话级 maxRunTokens）——
+  // status 值 'cost-guard' 保留兼容（测试/UI/历史），文案改为「Token 护栏停机」。
+  'cost-guard': { label: 'Token 护栏停机', tone: 'stop' },
   'max-steps': { label: '步数上限停机', tone: 'stop' },
   'wall-time': { label: '墙钟超时', tone: 'stop' },
   'circuit-break': { label: '熔断停机', tone: 'err' },
@@ -374,6 +376,21 @@ export const TOAST_COPIED_TEXT = '已复制';
 export function messageCopyText(item) {
   if (!item || typeof item !== 'object') return '';
   return String(item.text ?? '');
+}
+
+/**
+ * 助手气泡流式绘制的「稳定段 / 尾段」切分（app.js paintAssistant 消费；纯函数单测锚）。
+ * 语义：未定稿时最后一个换行之前为稳定段（走 markdown 渲染），其后为尾段（pre-wrap 纯文本
+ * 单份渲染 + 流式光标）；定稿后全文都是稳定段。
+ * **不变式：稳定段与尾段永不重叠**——无换行（idx=-1）时稳定段必须是空串、全文归尾段；
+ * 否则同一段文本会被 markdown 与尾段各渲染一次（正文与流式光标互不重复的防回归锚）。
+ */
+export function assistantPaintSplit(text, done) {
+  const s = String(text ?? '');
+  if (done === true) return { stable: s, tail: '' };
+  const idx = s.lastIndexOf('\n');
+  if (idx >= 0) return { stable: s.slice(0, idx), tail: s.slice(idx + 1) };
+  return { stable: '', tail: s };
 }
 
 /** 思考折叠行全文的安全护栏（与 compactionSummary 同类）：展开时懒写入上限。 */

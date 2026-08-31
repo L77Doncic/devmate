@@ -32,13 +32,13 @@ export interface RunInput {
 }
 
 /**
- * 终止原因（CONTEXT「终止条件」）：自然结束 / 保险丝三件（成本、步数、墙钟）/
+ * 终止原因（CONTEXT「终止条件」）：自然结束 / 保险丝三件（token 护栏、步数、墙钟）/
  * 熔断（连续格式错误、压缩防抖） / 用户中断 / 致命（传输层重试耗尽或 harness 异常）。
- * 成本超限同时是熔断与终止（ADR-0003），与"熔断"合并为本状态。
+ * token 超限同时是熔断与终止（ADR-0003 成本护栏演进为 token 护栏——状态值保留兼容）。
  */
 export type RunStatus =
   | 'completed' // 自然结束：本轮无工具调用
-  | 'cost-guard' // 成本护栏（闸门 A/B/C）
+  | 'cost-guard' // Token 护栏（累计 totalTokens 超限；闸门 A/B/C；状态值兼容历史）
   | 'max-steps'
   | 'wall-time'
   | 'circuit-break' // 连续格式错误达阈值（ADR-0006）
@@ -298,10 +298,17 @@ export interface RunOptions {
    * deepseek-vision.md §8）。不参与窗口预算结算——「最小：仅请求字段与文案，不重构预算」。
    */
   maxInputTokens?: number;
-  /** 成本计价表；缺省=占位价（单价表补齐前，ADR-0003）。 */
+  /** 成本计价表；缺省=占位价（单价表补齐前，ADR-0003——只用于成本显示统计）。 */
   pricing?: Pricing;
-  /** 成本上限（USD）；缺省 DEFAULT_COST_LIMIT_USD（ADR-0003：默认唯一开启）。 */
-  costLimitUsd?: number;
+  /**
+   * Token 护栏上限（本轮 run 的累计 totalTokens 上限；单价表无关的判据）。
+   * 缺省/undefined/null = **关闭**（= 无限 token——与 subagentsEnabled 开关族一致：关=不拦）。
+   * 判据（保守裁决，agent.ts 有注释）：闸门 C 累计超限即停；
+   * 闸门 A/B 按「累计 + 单轮上限」（本轮 prompt 估算 + 输出预留）预判超限即停/流中即中止。
+   * 服务端经 POST /api/chat 的 maxRunTokens 字段透传（对话级 per-session；正整数校验，
+   * 非法 400——本层再防御：非正整数按关闭处理）。
+   */
+  maxRunTokens?: number | null;
   /** 步数上限；缺省禁用（评测/CI 给固定值，§8C）。 */
   maxSteps?: number;
   /** 墙钟上限；缺省禁用。 */
@@ -357,8 +364,6 @@ export interface RunOptions {
 // 默认常量（单一来源：ADRs/research 一手默认）
 // ---------------------------------------------------------------------------
 
-/** 成本上限默认（USD/任务；ADR-0003：评测基线 3.0，默认唯一开启的终止条件）。 */
-export const DEFAULT_COST_LIMIT_USD = 3.0;
 /** 连续格式错误熔断阈值（mini-swe-agent 一手默认 max_consecutive_format_errors=3）。 */
 export const DEFAULT_MAX_FORMAT_ERRORS = 3;
 /** 单工具默认执行超时（ms；ADR-0010 单命令默认 120s）。 */

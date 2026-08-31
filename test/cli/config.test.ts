@@ -66,22 +66,24 @@ describe('loadConfig：三源合并（env > 文件 > preset 默认）', () => {
     expect(cfg.apiKey).toBeUndefined();
   });
 
-  it('文件字段全部生效（含可缺省的 maxSteps/costLimitUsd）', () => {
+  it('文件字段全部生效（含可缺省的 maxSteps）；护栏键不入 config.json', () => {
     const configPath = join(tmpHome, '.devmate', 'config.json');
     saveConfig(configPath, {
       baseUrl: 'https://file.example/v1',
       model: 'file-model',
       apiKey: 'sk-file-123',
       maxSteps: 5,
-      costLimitUsd: 0.5,
     });
     expect(loadConfig(configPath, {})).toEqual({
       baseUrl: 'https://file.example/v1',
       model: 'file-model',
       apiKey: 'sk-file-123',
       maxSteps: 5,
-      costLimitUsd: 0.5,
     });
+    // 存量死键（历史 costLimitUsd）原样保留、不再读用（护栏已改 token 判据且默认关闭）
+    saveConfig(configPath, { ...JSON.parse(readFileSync(configPath, 'utf8')), costLimitUsd: 3 });
+    const cfg = loadConfig(configPath, {});
+    expect(cfg).not.toHaveProperty('costLimitUsd');
   });
 
   it('env 覆盖文件（baseUrl/model/apiKey 三项；文件其余字段保留）', () => {

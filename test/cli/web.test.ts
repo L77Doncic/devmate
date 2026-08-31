@@ -336,14 +336,13 @@ describe('runWeb：启动冒烟（注入假 ServerModule，不真监听）', () 
 });
 
 describe('buildServerConfig：任务书 config 形状（交付给 assembleDeps）', () => {
-  it('workspaceRoot/baseUrl/model/apiKey + 可选 maxSteps/costLimitUsd', () => {
+  it('workspaceRoot/baseUrl/model/apiKey + 可选 maxSteps（护栏键不入 ServerConfig）', () => {
     const cfg = buildServerConfig({
       workspaceRoot: '/ws',
       baseUrl: 'https://api.deepseek.com',
       model: 'deepseek-v4-flash',
       apiKey: 'sk-x',
       maxSteps: 4,
-      costLimitUsd: 1.2,
     });
     expect(cfg).toEqual({
       workspaceRoot: '/ws',
@@ -351,8 +350,8 @@ describe('buildServerConfig：任务书 config 形状（交付给 assembleDeps�
       model: 'deepseek-v4-flash',
       apiKey: 'sk-x',
       maxSteps: 4,
-      costLimitUsd: 1.2,
     });
+    expect(cfg).not.toHaveProperty('costLimitUsd');
   });
 
   it('无 apiKey 时属性缺省（exactOptionalPropertyTypes：不输出 undefined）', () => {

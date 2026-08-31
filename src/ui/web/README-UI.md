@@ -288,7 +288,17 @@ GET `/api/stats → {rssMb,heapMb,sessions,activeShells}`；GET `/api/tools → 
   总 0 tokens | $0」（tooltip「尚未运行：暂无实际数据，运行后更新」，不整行隐藏）。
   **与 dsh 的分工**：对话级统计归 composer footer；
   侧栏 footer 的 内存/会话/Shell 是**应用级遥测**（进程统计），非对话统计——两者不相混。
-  仅展示用，服务端成本闸门才具权威。
+  仅展示用；停机判据（2026-08-31 定调）为服务端 **Token 护栏**（对话级累计 totalTokens，
+  非成本）——见「Token 护栏 pill」。
+- **Token 护栏 pill（composer 底部栏 · 对话级）**：模型·思考强度 combo 旁的同族控件
+  （`guard-pill` + 展开弹层）；默认「护栏 关」= 不限制；输入正整数上限（如 500000）
+  → 保存后显示「护栏 500k」；清空/清除 = 关闭。含义：**当前对话**本轮 run 的累计
+  tokens（输入+输出之和）超过上限即停机——run-status 终态仍为 **cost-guard**（值兼容
+  历史），文案「Token 护栏停机」。按会话记忆于 localStorage
+  （`devmate.ui.guardTokens.<sessionId>`，纯逻辑 `guard.js`）；发送时经 POST /api/chat
+  的 `maxRunTokens`（正整数）透传——服务端校验（非法 400）、缺省关闭；不入 settings /
+  config.json（每个对话所需上限不同——对话级不在设置页）。成本统计（统计行与 /cost
+  面板的 costUsd）照旧显示，不改判据。
 - **停止**：POST /api/interrupt（长活流不动，终态 run-status 仍经本流到达）；
   运行中（含工具执行/审批等待）停止按钮始终可见；连接态 6 语义
   （已连接/生成中/待审批/出错/待配置/未连接）。

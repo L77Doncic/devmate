@@ -114,7 +114,6 @@ export interface DevmateConfig {
   /** 读取层标记：config.model 原始值带 `[N]m/k` 尾标（CLI loadConfig 已净化——原样在
    *  stored 里仍可见）。服务端据此在 GET 挂 modelSanitized=true（前端提示一次）。 */
   modelWasSanitized?: boolean | undefined;
-  costLimitUsd?: number | undefined;
   maxSteps?: number | undefined;
   windowTokens?: number | undefined;
   /** 请求侧输入上限初值（A 档；缺省不发送/厂商默认；settings 可改）。 */
@@ -753,12 +752,15 @@ export function createMethodologyGate(options: {
  * - 「小步闭环」＝每一步 查证 → 执行 → 回注 → 验证，完成判据可检查（重读/diff/针对性测试）。
  * - 「失败是普通消息」＝错误回注自愈：失败与拒绝都是信息而非事故（与熔断成对，CONTEXT 规则）。
  * - 「报告口径」＝终止条件由环境裁定并报告（报告口径），模型只负责自然结束。
+ * - 「语言规则」＝默认中文（思考与回复皆然），用户使用其他语言时以用户语言回复——
+ *   语言锚定（用户报告「agent 不回复中文」：无锚定时模型语言行为随模型漂移；
+ *   正文与注释重复使用锚点词，防漂移）。
  * 单一真源纪律：不列工具清单（工具面与错误回注的可用清单由环境注入）、不抄参数默认值
  * （超时/截断/预算数值归工具说明与 composeSystemPrompt 的预算裁剪），本基座只讲使用策略。
  * 预算：base 估算 ≤ 1800 tokens（裁剪链只裁技能清单，base 永不裁——安全与行为规则优先，
  * 见 composeSystemPrompt；上限 4096 归那里的预算常量）。
  */
-export const DEV_BASE_SYSTEM_PROMPT = `你是 DevMate，一个运行在用户本机工作区里的编程智能体：用户给出一个编程任务，你自主读写文件、执行命令并反复思考，直至完成或就关键决策向用户提问。工作方式三个锚：界内动、小步闭环、失败是普通消息。
+export const DEV_BASE_SYSTEM_PROMPT = `你是 DevMate，一个运行在用户本机工作区里的编程智能体：用户给出一个编程任务，你自主读写文件、执行命令并反复思考，直至完成或就关键决策向用户提问。工作方式三个锚：界内动、小步闭环、失败是普通消息。语言规则：默认使用中文思考与回复；用户使用其他语言时，以用户语言回复。
 
 ## 如何工作
 每轮一个小步闭环：查证 → 执行 → 回注 → 验证。
@@ -1152,7 +1154,8 @@ export async function assembleDeps(config: DevmateConfig): Promise<DevmateServer
   const runOptions: Partial<RunOptions> = {
     summarizer: makeSummarizer(initialLlm, startupModel),
   };
-  if (config.costLimitUsd !== undefined) runOptions.costLimitUsd = config.costLimitUsd;
+  // Token 护栏（对话级）不在此装配：由服务端按 POST /api/chat 的 maxRunTokens 字段
+  // 每 run 注入（缺省不注入 = 关闭——护栏默认关闭；config.json 无该键）。
   if (config.maxSteps !== undefined) runOptions.maxSteps = config.maxSteps;
   if (config.windowTokens !== undefined) runOptions.windowTokens = config.windowTokens;
   // A 档：输出上限播进 runOptions.maxTokens（缺省 = undefined：闸门 A 按 DEFAULT_MAX_TOKENS

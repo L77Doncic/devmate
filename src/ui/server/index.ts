@@ -1966,7 +1966,12 @@ export function createDevmateServer(deps: DevmateServerDeps): DevmateServer {
     };
   }
 
-  function startRun(sessionId: string, text: string, images?: UserImage[]): void {
+  function startRun(
+    sessionId: string,
+    text: string,
+    images?: UserImage[],
+    maxRunTokens?: number,
+  ): void {
     const runToken = ++runSequence; // run 身份（learned 槽归属：run-scoped，VT2-1）
     const ctx = ctxFor(sessionId);
     const controller = new AbortController();
@@ -2020,6 +2025,14 @@ export function createDevmateServer(deps: DevmateServerDeps): DevmateServer {
           runOptions.maxInputTokens = current.maxInputTokens;
         } else {
           delete runOptions.maxInputTokens;
+        }
+        // Token 护栏（对话级 · 2026-08-31 定调）：maxRunTokens 随 POST /api/chat 每轮可选
+        // 透传（前端按会话记忆）；服务端已校验正整数（非法 400——见 handleChat），
+        // 缺失 → 删除 = 本 run 护栏关闭（缺省关闭语义；不落 config.json）。
+        if (maxRunTokens !== undefined) {
+          runOptions.maxRunTokens = maxRunTokens;
+        } else {
+          delete runOptions.maxRunTokens;
         }
         // E7 自愈链学习回调（L2）：核心循环从 400 message 免费学到上限 →
         // 记入 learnedLimitCaps（windowDetail「由错误学习」/ 后续轮钳制）；记录归属
@@ -2251,6 +2264,22 @@ export function createDevmateServer(deps: DevmateServerDeps): DevmateServer {
     if (rawRoot !== undefined && typeof rawRoot !== 'string') {
       throw new HttpError(400, 'workspaceRoot must be a string');
     }
+    // Token 护栏（对话级 · 2026-08-31 定调）：maxRunTokens = 本轮 run 的累计 totalTokens
+    // 上限（正整数）；**非法值拒收**（400——复用 settings 校验风格：类型不符/非正整数/
+    // 非整数/0/负 → 400 {error}；非法输入不静默忽略——值域错误暴露客户端缺陷）；
+    // 缺失 = 护栏关闭（默认关闭语义，不覆盖不落盘）。
+    const rawMaxRunTokens = (body as Record<string, unknown>).maxRunTokens;
+    let maxRunTokens: number | undefined;
+    if (rawMaxRunTokens !== undefined) {
+      if (
+        typeof rawMaxRunTokens !== 'number' ||
+        !Number.isInteger(rawMaxRunTokens) ||
+        rawMaxRunTokens < 1
+      ) {
+        throw new HttpError(400, 'maxRunTokens must be a positive integer');
+      }
+      maxRunTokens = rawMaxRunTokens;
+    }
 
     const ctx = ctxFor(sessionId);
     if (ctx.active) {
@@ -2297,7 +2326,7 @@ export function createDevmateServer(deps: DevmateServerDeps): DevmateServer {
         throw err;
       }
     });
-    startRun(sessionId, text ?? '', images);
+    startRun(sessionId, text ?? '', images, maxRunTokens);
     sendJson(res, 200, { sessionId });
   }
 

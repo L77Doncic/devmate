@@ -4106,6 +4106,88 @@ pre {
     display: none;
   }
 }
+/* ---------- Token 护栏 pill（2026-08-31：对话级护栏控件；与 model-combo 同族：
+   pill 表面 + 点击展开弹层 —— dsh 右下 combo 同款纪律） ---------- */
+.guard-pill {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  height: 26px;
+  max-width: 160px;
+  padding: 0 10px;
+  border: 1px solid var(--dsw-alias-border-l2-darkmode-thin);
+  border-radius: 999px;
+  background: var(--dsw-alias-interactive-bg-hover);
+  color: var(--dsw-alias-label-secondary);
+  font-size: var(--dsw-font-size-xs);
+  line-height: 20px;
+  cursor: pointer;
+}
+.guard-pill:hover {
+  color: var(--dsw-alias-label-primary);
+}
+.gp-label {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.gp-chevron {
+  flex: none;
+  width: 12px;
+  height: 12px;
+  color: var(--dsw-alias-label-tertiary);
+  transition: transform 120ms ease-out;
+}
+.guard-pill[aria-expanded='true'] .gp-chevron {
+  transform: rotate(90deg);
+}
+/* Token 护栏弹层（dsh Menu 表面：浮层、r8、阴影；锚于 guard-pill —— 同 model-menu 族） */
+.guard-pop {
+  position: fixed;
+  z-index: 46;
+  width: 280px;
+  max-width: calc(100vw - 16px);
+  padding: 10px;
+  border: 1px solid var(--dsw-alias-border-l1);
+  border-radius: 8px;
+  background: var(--dsw-specific-menu);
+  box-shadow: var(--dsw-shadow-lv2);
+  animation: row-menu-in 120ms ease-out;
+}
+.guard-pop-head {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  margin-bottom: 6px;
+}
+.guard-pop-title {
+  color: var(--dsw-alias-label-primary);
+  font-size: var(--dsw-font-size-m);
+  font-weight: 500;
+}
+.guard-pop-sub {
+  color: var(--dsw-alias-label-tertiary);
+  font-size: var(--dsw-font-size-xs);
+}
+.guard-pop-help {
+  margin-bottom: 8px;
+}
+.guard-pop-meta {
+  margin-top: 6px;
+}
+.guard-pop-row {
+  display: flex;
+}
+.guard-pop-row .input {
+  flex: 1;
+}
+.guard-pop-actions {
+  display: flex;
+  justify-content: space-between;
+  gap: 8px;
+  margin-top: 10px;
+}
 /* 模型·强度菜单（dsh Menu 表面：浮层、r8、阴影；锚于 combo —— 同 perm-menu 族） */
 .model-menu {
   position: fixed;

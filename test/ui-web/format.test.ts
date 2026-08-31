@@ -230,7 +230,8 @@ describe('TOOL_STATE_LABEL 与 RUN_STATUS_SEMANTICS —— 双表互斥（同词
 describe('statusLabel / runStatusLine', () => {
   it('8 个终态全部映射中文（S12 RunStatus 权威值）', () => {
     expect(statusLabel('completed')).toBe('已完成');
-    expect(statusLabel('cost-guard')).toBe('成本护栏停机');
+    // 2026-08-31 定调：护栏判据改为累计 totalTokens（status 值保留），文案 =「Token 护栏停机」
+    expect(statusLabel('cost-guard')).toBe('Token 护栏停机');
     expect(statusLabel('max-steps')).toBe('步数上限停机');
     expect(statusLabel('wall-time')).toBe('墙钟超时');
     expect(statusLabel('circuit-break')).toBe('熔断停机');
