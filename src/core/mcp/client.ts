@@ -106,7 +106,7 @@ export async function connectMcpServer(
       {
         protocolVersion: MCP_PROTOCOL_VERSION,
         capabilities: {},
-        clientInfo: { name: 'devmate', version: '0.1.0' },
+        clientInfo: { name: 'devmate', version: '0.1.1' },
       },
       handshakeTimeoutMs,
     );

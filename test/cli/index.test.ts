@@ -23,7 +23,7 @@ function makeIo(overrides: Partial<CliIo> = {}) {
       err.push(s);
     },
     runWeb,
-    version: '0.1.0',
+    version: '0.1.1',
     ...overrides,
   };
   // 返回运行时实际生效的 runWeb（overrides 可能替换它），供断言。
@@ -35,7 +35,7 @@ describe('main：命令分发', () => {
     const { io, out } = makeIo();
     const code = await main(['--version'], io);
     expect(code).toBe(0);
-    expect(out.join('')).toContain('0.1.0');
+    expect(out.join('')).toContain('0.1.1');
   });
 
   it('--help → 帮助文本含 web/--port 说明，退出 0', async () => {

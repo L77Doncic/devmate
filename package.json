@@ -1,6 +1,6 @@
 {
   "name": "@teresal/devmate-cli",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "DevMate：零框架依赖、运行时零依赖的 TypeScript 编程智能体 CLI。A TypeScript coding agent built from scratch — no frameworks, zero runtime dependencies.",
   "license": "MIT",
   "repository": {

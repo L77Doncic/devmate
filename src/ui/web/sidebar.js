@@ -28,7 +28,7 @@ export const SIDEBAR_NARROW_MAX_WIDTH = 899;
  * 本地构建版本徽章（dsh SidebarRoot localBuildVersion 语义）。
  * 单一来源 = 根 package.json version（防漂移断言见 test/ui-web/sidebar.test.ts）。
  */
-export const BUILD_VERSION = '0.1.0';
+export const BUILD_VERSION = '0.1.1';
 
 /**
  * 折叠状态归一：仅字面量 'true' 服从；损坏/未定义/其他一切 → 展开（默认安全态）。
