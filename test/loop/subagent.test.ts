@@ -742,10 +742,11 @@ describe('subagent：子代理池', () => {
       expect(recorder.executeCount).toBe(0); // 无工具调用：工具集只注入，不执行
     });
 
-    it('l2) 多步循环：工具调用→结果入 messages→总结；report = 最后 assistant 文本；usage 分步合计', async () => {
+    it('l2) 多步循环：工具调用→结果入 messages→总结；report = 最后 assistant 文本；usage 分步合计（F1：密钥输出已掩码，普通结果零损）', async () => {
       const tools = [
         readOnlyTool('read_file', 'FILE-BODY'),
-        readOnlyTool('list_dir', 'DIR: a.txt'),
+        // F1 改造：工作区原文含假密钥 → 回注前同源 redactSecrets（[REDACTED:openai-key]）
+        readOnlyTool('list_dir', 'DIR: a.txt\nsk-0123456789abcdef0123456789abcdef'),
       ];
       const llm = new FakeLlm([
         {
@@ -788,7 +789,7 @@ describe('subagent：子代理池', () => {
             },
           ],
         },
-        { role: 'tool', toolCallId: 'tc-1', content: 'DIR: a.txt' },
+        { role: 'tool', toolCallId: 'tc-1', content: 'DIR: a.txt\n[REDACTED:openai-key]' },
         { role: 'tool', toolCallId: 'tc-2', content: 'FILE-BODY' },
       ]);
       // usage 分步合计（真实 usage 路径）
@@ -942,6 +943,84 @@ describe('subagent：子代理池', () => {
       await pool.spawn({ prompt: '无 sessionId' }); // 任务没带 sessionId → 无法解析工作区
 
       expect(llm.requests[0]?.tools).toBeUndefined();
+    });
+  });
+
+  describe('m) 工具结果脱敏（评审 F1：回注前过主循环同源 redactSecrets）', () => {
+    it('m1) 工具结果含假密钥串 → role:"tool" 内容已被掩码（不含原串）；成功与失败结果一视同仁', async () => {
+      const secret = 'sk-0123456789abcdef0123456789abcdef'; // 经 openai-key 形态打码
+      const leaking: Tool = {
+        name: 'list_dir',
+        description: 'fake leaking list_dir',
+        parameters: { type: 'object', properties: {}, required: [] },
+        async execute() {
+          return { ok: true, content: `DIR: a.txt\n${secret}` };
+        },
+      };
+      const failing: Tool = {
+        name: 'grep',
+        description: 'fake failing grep',
+        parameters: { type: 'object', properties: {}, required: [] },
+        async execute() {
+          return {
+            ok: false,
+            content: '',
+            error: { type: 'boom', message: `grep failed: ${secret}` },
+          };
+        },
+      };
+      const llm = new FakeLlm([
+        {
+          content: '查看并搜索',
+          toolCalls: [
+            { id: 'm-1', name: 'list_dir', arguments: '{"path":"."}' },
+            { id: 'm-2', name: 'grep', arguments: '{"pattern":"x","paths":["."]}' },
+          ],
+        },
+        { content: '结论：脱敏后继续。' },
+      ]);
+      const pool = makePool(llm, { workspaceTools: async () => [leaking, failing] });
+
+      const r = await pool.spawn({ prompt: 'p', sessionId: 's-redact' });
+
+      expect(r.ok).toBe(true);
+      expect(r.report).toBe('结论：脱敏后继续。'); // 报告路径不受影响（模型只见过掩码后文本）
+      const second = llm.requests[1]?.messages;
+      // 成功结果：掩码后的明文已进入子代理上下文，原密钥串不存在
+      const toolMsg1 = second?.[3] as { role: 'tool'; content: string } | undefined;
+      expect(toolMsg1).toMatchObject({ role: 'tool', toolCallId: 'm-1' });
+      expect(toolMsg1!.content).toBe('DIR: a.txt\n[REDACTED:openai-key]');
+      expect(toolMsg1!.content).not.toContain(secret);
+      // 失败结果（error.message 含密钥）同源掩码：JSON 结构不变，仅秘密 span 替换
+      const toolMsg2 = second?.[4] as { role: 'tool'; content: string } | undefined;
+      expect(toolMsg2).toMatchObject({ role: 'tool', toolCallId: 'm-2' });
+      expect(toolMsg2!.content).not.toContain(secret);
+      expect(toolMsg2!.content).toContain('[REDACTED:openai-key]');
+      expect(JSON.parse(toolMsg2!.content)).toMatchObject({
+        ok: false,
+        error: { type: 'boom' },
+      });
+    });
+
+    it('m2) 无密钥的普通文本结果零损：回注内容与工具原样逐字一致（幂等不改写）', async () => {
+      // 含近似密钥形态（sk-abc 不足 24 字符）与普通尖括号/等号文本——均不命中默认集
+      const plain = 'DIR: a.txt\nindex.ts:1:export const c = 1；a < b；note: sk-abc(not a real key)';
+      const tools = [readOnlyTool('list_dir', plain)];
+      const llm = new FakeLlm([
+        {
+          content: '查看目录',
+          toolCalls: [{ id: 'p-1', name: 'list_dir', arguments: '{"path":"."}' }],
+        },
+        { content: '结论：普通结果无损耗。' },
+      ]);
+      const pool = makePool(llm, { workspaceTools: async () => tools });
+
+      const r = await pool.spawn({ prompt: 'p', sessionId: 's-zero' });
+
+      expect(r.ok).toBe(true);
+      expect(r.report).toBe('结论：普通结果无损耗。');
+      const toolMsg = llm.requests[1]?.messages[3] as { role: 'tool'; content: string } | undefined;
+      expect(toolMsg).toEqual({ role: 'tool', toolCallId: 'p-1', content: plain });
     });
   });
 });

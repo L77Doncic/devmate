@@ -57,6 +57,10 @@ import { TEXT_TOKENS_PER_ASCII_PROSE } from '../context/constants.js';
 import { estimateTextTokens, estimateTokens } from '../context/estimator.js';
 // 生成期截断面板单一来源（头尾保留 + elide 标记 + 收窄建议）；子代理报告只传阈值
 import { truncateToolOutput } from '../context/truncate.js';
+// 脱敏单点（评审 F1）：与主循环 securedRegistry 装饰器 / 存储层 jsonl-file 同一
+// redactSecrets——子代理工具结果经 executeTool 直执行（不经 registry 装饰器），
+// 回注子代理上下文前统一掩码（复用既有函数，不新造）
+import { redactSecrets } from '../tools/redact.js';
 import type { WorkflowConfig } from '../../shared/workflow.js';
 // 工具轮判型与回注复用主循环同族设施（validateToolCall/unknown/invalid 载荷——
 // 熔断判据与主循环同值：连续格式错误阈值、工具执行超时）
@@ -435,10 +439,16 @@ export function createSubagentPool(deps: SubagentPoolDeps): SubagentPool {
             result = await executeTool(def, call, entry.task.sessionId);
           }
         }
+        // 评审 F1（中等安全）：工具结果回注前过同源 redactSecrets——子代理工具
+        // 在 executeTool 直执行（不经 securedRegistry 装饰器），工作区原文（可能含
+        // 明文密钥/凭据）会原样进入子代理模型上下文。成功与失败一视同仁（error 的
+        // message 可能含路径/密钥字样）；幂等且无密钥内容零损（redactSecrets 原样返回）。
+        // 只脱敏「进入子代理上下文」的工具结果文本——system/用户/助手文本无工具原文，不重脱敏。
+        const toolContent = redactSecrets(result.ok ? result.content : errorResultContent(result));
         messages.push({
           role: 'tool',
           toolCallId: call.id,
-          content: result.ok ? result.content : errorResultContent(result),
+          content: toolContent,
         });
       }
       // 熔断与主循环同族（连续格式错误阈值；一次干净的步清零）
