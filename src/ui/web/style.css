@@ -3038,7 +3038,11 @@ pre {
 /* ---------- 删除确认 modal（dsh Modal：r24、layer-2 面、right-lower Capsule 对） ---------- */
 .confirm {
   position: fixed;
-  z-index: 61;
+  /* 层级（只改层级，不改行为）：设置抽屉开启时点「移除」，确认 modal 与
+     .settings-modal 同为 61 且 DOM 在前 → 被抽屉盖住不可见（点击盲区）。
+     抬至 79：高于所有 61 层面（settings/ws-picker/ws-error/lock 门）与
+     scrim(60)，低于 toast(80)——通知仍顶格，drop-overlay(120)/lightbox(200) 不变。 */
+  z-index: 79;
   left: 50%;
   top: 50%;
   transform: translate(-50%, -50%);
