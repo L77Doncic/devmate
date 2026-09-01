@@ -148,7 +148,7 @@ import {
   meterCircumference,
 } from './meter.js';
 import { fetchJson, isStatus, backswitch } from './api.js';
-import { createStreamGate } from './streams.js';
+import { createStreamGate, recoverTerminalAfterStreamBreak } from './streams.js';
 import {
   normalizeSessionList,
   sortSessionList,
@@ -3646,6 +3646,10 @@ async function ensureStream(sessionId) {
   streamGate.current()?.ctrl.abort(); // 换会话：关闭旧流（静默，长活流唯一关闭点）
   const ctrl = new AbortController();
   streamGate.open(sessionId, ctrl);
+  // 断流兜底标记：流异常收流/断开且 run 仍挂起（终态 run-status 未到达）→ 收尾裁决
+  // 成功后拉会话回放恢复终态（attemptBreakRecovery；用户实测「生成中」挂 49min）。
+  // 仅在「run 真挂起」时置位；终态已到 / 从未 run / 主动 abort（切会话）都不兜底。
+  let recoveryNeeded = false;
   try {
     await consumeSSE({
       url: `/api/stream?sessionId=${encodeURIComponent(sessionId)}`,
@@ -3665,6 +3669,8 @@ async function ensureStream(sessionId) {
         }
       },
     });
+    // 长活流本不该收流（服务端心跳保活，仅切会话/出错才闭）：run 仍挂起 = 终态帧没送达
+    recoveryNeeded = store.snapshot().runActive === true;
   } catch (err) {
     if (err?.name !== 'AbortError') {
       // 语义判断（isStatus，替代 message.includes('404')）：状态码以 err.status 为权威
@@ -3680,13 +3686,50 @@ async function ensureStream(sessionId) {
         // P2-8 报错本地化：供应商裸英文 → 中文 + 指引（未命中模式保留原文）
         const raw = err instanceof Error ? err.message : String(err);
         store.addSystem(`连接中断：${friendlyProviderError(raw) ?? raw}`);
+        // 网络/服务端断流：终态帧可能已在服务端落盘（run_result）但不再经本流送达 ——
+        // run 挂起点位兜底（best-effort，见 attemptBreakRecovery）
+        recoveryNeeded = store.snapshot().runActive === true;
       }
     }
   } finally {
     // 收尾裁决：仅本流仍为当前流才解绑 + endStream（新流已接管则静默 ——
     // 旧流 finally 不清新流状态；见 streams.js 与 api.test / streams.test 的竞态用例）。
-    streamGate.retire(ctrl);
+    // 只有「本流收尾成功（未被新流接管）」才有资格做断流恢复 —— 接管即静默放弃，
+    // 终态由新流/会话回放提供（绝不重复恢复）。
+    if (streamGate.retire(ctrl) && recoveryNeeded) {
+      attemptBreakRecovery(sessionId);
+    }
   }
+}
+
+/**
+ * 断流兜底（产品缺陷修复：SSE 长活中途断开 → UI「生成中」挂死，用户实测 49min）。
+ * 守卫在 streams.js recoverTerminalAfterStreamBreak（本流仍为当前流——引用相等语义 +
+ * 最新一轮确有终态 run-status），此处只接编排：run 真挂起时才调用；恢复成功后与
+ * onEvent 终态 run-status 的同口径收口（统计/列表刷新、评审静默至多一次）；
+ * 服务端仍 run（无终态）→ 系统行补「可点击停止」指引，不伪造「已完成」。
+ * best-effort：回放拉取失败（服务端仍不可达）静默 —— 保留「连接中断」提示。
+ */
+function attemptBreakRecovery(sessionId) {
+  void recoverTerminalAfterStreamBreak({
+    sessionId,
+    // 收尾裁决已过（retire 成功）：本流之后无人接管 —— 拉取期间被新流接管 / 会话指针
+    // 已挪走（切到别的会话）则放弃，终态由接管方提供（绝不重复恢复、不串会话）。
+    isStillCurrent: () => streamGate.current() === null && ui.sessionId === sessionId,
+    dispatch: (ev) => store.dispatch(ev),
+    onDone: () => {
+      void refreshStats();
+      void refreshSessionList(true);
+      // P2-10 评审静默：回落终态 = run 落幕（与流内终态 run-status 同口径）
+      maybeHintReviewSkipped();
+    },
+    onMissing: () => {
+      store.addSystem(
+        '该任务在服务端尚无终态（可能仍在运行）：若长时间未停止，可点击「停止」',
+        'info',
+      );
+    },
+  });
 }
 
 /**
@@ -3710,12 +3753,15 @@ function maybeHintReviewSkipped() {
   store.addSystem(hint, 'info');
 }
 
-/** 停止：只 POST /api/interrupt，不动长活流 —— 终态 run-status 仍经本流到达。 */
+/** 停止：只 POST /api/interrupt，不动长活流 —— 终态 run-status 仍经本流到达。
+ *  断流后（本流已死）点停止：终态到不了本流，且服务端马上就会落 run_result ——
+ *  停止成功后顺手拉一次回放兜底（best-effort；落盘若未完成仍走「无终态」提示，不伪造）。 */
 async function stopStream() {
   if (!store.snapshot().runActive) return;
   if (ui.sessionId) {
     try {
       await fetchJson('/api/interrupt', { method: 'POST', body: { sessionId: ui.sessionId } });
+      if (streamGate.current() === null) attemptBreakRecovery(ui.sessionId);
     } catch (err) {
       toast(`停止失败：${err instanceof Error ? err.message : String(err)}`, 'warn');
     }
