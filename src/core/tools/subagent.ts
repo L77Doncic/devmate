@@ -19,12 +19,16 @@
  * - 参数形状：{prompt} + 可选 {skill}（title 已移除——投机泛化：池只用 prompt，无消费者）。
  *   skill（B-1 借鉴①）：技能 id，给出时该技能全文经 skillContent 解析器机械注入子代理
  *   system（池侧 capSkill ≤8000 字符）；未知/未接线/解析器故障 → 零注入普通模式。
+ * - 会话绑定（子代理工具化 2026-09-01）：本工具执行时把 ToolExecutionContext 的
+ *   sessionId 透传进任务（SubagentTask.sessionId）——池经 workspaceTools 解析器按该
+ *   sessionId 构造只读工具面（read_file/grep/glob/list_dir，绑定宿主会话 workspaceRoot；
+ *   与主循环同 jail/路径锚定语义）。无会话态单例语义不变（池级单例注入）。
  * - 防线：pool.spawn 契约不 throw（池内收敛），本层仍兜底 try/catch → 'subagent-error'
  *   （防御池实现违规：错误仍是普通消息，绝不外抛）。
  */
 import type { ToolCall } from '../../shared/session-types.js';
 import { errorContentJson } from '../loop/tools.js';
-import type { JsonSchema, Tool, ToolResult } from '../loop/types.js';
+import type { JsonSchema, Tool, ToolExecutionContext, ToolResult } from '../loop/types.js';
 import { SKILL_INJECTION_LIMIT_CHARS } from '../loop/subagent.js';
 import type { SubagentPool, SubagentResult, SubagentTask } from '../loop/subagent.js';
 
@@ -49,8 +53,9 @@ const SCHEMA: JsonSchema = {
     prompt: {
       type: 'string',
       description:
-        'The independent subtask the sub-agent should complete. The sub-agent has no tools ' +
-        'and no session memory (a single read-only step); keep the input self-contained.',
+        'The independent subtask the sub-agent should complete. The sub-agent has read-only ' +
+        'workspace tools (read_file / glob / grep / list_dir; it cannot write or run commands) ' +
+        'and no session memory; it runs at most 6 steps. Keep the input self-contained.',
     },
     skill: {
       type: 'string',
@@ -71,15 +76,19 @@ export function createSubagentTool(options: SubagentToolOptions): Tool {
   return {
     name: 'spawn_subagent',
     description:
-      'Spawn a sub-agent that handles an independent subtask in an isolated context. ' +
-      'The sub-agent has no tools and no memory: give it a self-contained prompt. ' +
-      'The report (bounded at 4000 chars) is returned as the tool result.',
+      'Spawn a sub-agent for an independent subtask (isolated context, no memory). ' +
+      'It has read-only workspace tools (read_file/grep/glob/list_dir) and at most 6 steps; ' +
+      'the final report (bounded at 4000 chars) is returned.',
     parameters: SCHEMA,
-    execute: (call) => executeSubagent(call, options),
+    execute: (call, ctx) => executeSubagent(call, ctx, options),
   };
 }
 
-async function executeSubagent(call: ToolCall, options: SubagentToolOptions): Promise<ToolResult> {
+async function executeSubagent(
+  call: ToolCall,
+  ctx: ToolExecutionContext | undefined,
+  options: SubagentToolOptions,
+): Promise<ToolResult> {
   // 主循环已做 schema 校验（loop/tools.ts）；此处仍是防线（与 fs.ts parseArgs 同口径）。
   let prompt = '';
   let skillId = '';
@@ -102,10 +111,14 @@ async function executeSubagent(call: ToolCall, options: SubagentToolOptions): Pr
     );
   }
 
-  // 任务形状 {prompt} + 可选 {skillId, skillContent}（B-1 借鉴① skill 注入）：
-  // 池级信号量/FIFO/护栏不消费 skill，其余键一律宽进。
+  // 任务形状 {prompt} + 可选 {skillId, skillContent, sessionId}（B-1 借鉴① skill 注入）：
+  // 池级信号量/FIFO/护栏不消费 skill/sessionId，其余键一律宽进。
   // skill 给出 → 经 skillContent 解析器取全文；null/未接线/抛错 → 跳过注入（不硬失败）。
+  // sessionId 透传（只读工具的工作区绑定：池经 workspaceTools 按它解析宿主会话工作区）。
   const task: SubagentTask = { prompt, ...(skillId !== '' ? { skillId } : {}) };
+  if (ctx !== undefined && ctx.sessionId !== undefined && ctx.sessionId !== '') {
+    task.sessionId = ctx.sessionId;
+  }
   if (skillId !== '' && options.skillContent !== undefined) {
     let content: string | null = null;
     try {

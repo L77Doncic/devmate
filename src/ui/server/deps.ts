@@ -64,7 +64,7 @@ import { JsonlFileAdapter } from '../../core/session/index.js';
 import type { SessionStore } from '../../core/session/index.js';
 import { assertValidSessionId } from '../../core/session/base.js';
 import type { ChatMessage } from '../../shared/llm-types.js';
-import { createFsTools } from '../../core/tools/index.js';
+import { createFsTools, createReadOnlyFsTools } from '../../core/tools/index.js';
 import { createPersistentShell } from '../../core/tools/shell.js';
 import type { PersistentShell } from '../../core/tools/shell.js';
 import { securedRegistry } from '../../core/tools/registry.js';
@@ -162,6 +162,12 @@ export interface SessionToolsFactory {
    *  多工作区（注入 workspaceRootOf）时按会话解析根——jail 与 shell 同源（per 会话，
    *  S2 的 canonicalWorkspaceRoot 逻辑平移到会话级）；异步（根解析/监狱构造）。 */
   createSessionTools(sessionId: string): Promise<ToolRegistry>;
+  /**
+   * 该会话的**只读工具子集**（子代理工具面：read_file/grep/glob/list_dir——不消费
+   * 会话 shell/常驻状态，纯 fs 构造绑定会话 jail（与主循环同 workspaceRoot/同锚定语义）；
+   * 子代理池经它给 spawn_subagent 装配只读工具（read-only 由工具集选择保证）。
+   */
+  createReadOnlyTools(sessionId: string): Promise<Tool[]>;
   /** 杀掉全部会话 shell（幂等）；serve close 路径经 deps.dispose 调用。 */
   dispose(): Promise<void>;
   /** 释放单个会话的 shell 与注册表缓存（幂等）；DELETE /api/sessions/:id 联动。 */
@@ -325,6 +331,17 @@ export function createSessionToolsFactory(options: {
     return built;
   };
 
+  // 子代理只读工具面：按会话解析根（同 forId 的根解析/监狱构造），只挂只读 fs 子集——
+  // 不消费 shell/常驻状态；解析/构造异常由调用方（池）按「无工具」收敛（护栏故障不放大）。
+  const forReadOnly = async (sessionId: string): Promise<Tool[]> => {
+    const rootLiteral =
+      options.workspaceRootOf !== undefined
+        ? await options.workspaceRootOf(sessionId)
+        : options.workspaceRoot;
+    const { jail } = await buildForRoot(rootLiteral);
+    return createReadOnlyFsTools({ sessionId, jail });
+  };
+
   const disposeSession = async (sessionId: string): Promise<void> => {
     lastUsedAt.delete(sessionId);
     sessionBuilds.delete(sessionId);
@@ -346,6 +363,7 @@ export function createSessionToolsFactory(options: {
       return fallbackRegistry;
     },
     createSessionTools: forId,
+    createReadOnlyTools: forReadOnly,
     async dispose(): Promise<void> {
       const all = [...shells.values()];
       shells.clear();
@@ -935,7 +953,9 @@ function assembleSystemPrompt(
   const routeSection = methodologyRouteSection(routeLines);
   if (routeSection !== '') sections.push(routeSection);
   if (workflow.subagentsEnabled) {
-    // maxParallel=0 = 无上限：显示「无上限」而非误导性的 0（maxParallelCapText 单一来源）
+    // maxParallel=0 = 无上限：显示「无上限」而非误导性的 0（maxParallelCapText 单一来源）。
+    // 子代理新语义（只读工具 + ≤6 步）经 spawn_subagent 工具描述与 SUBAGENT_SYSTEM_PROMPT
+    // 说明——本节保持原样（窗口预算耦合的权限测试按估算阈值定格，加字即翻转）。
     sections.push(
       `## 子代理\n对于可独立处理的子任务，可调用 spawn_subagent（并行上限 ${maxParallelCapText(workflow.maxParallel)}）` +
         `以隔离上下文；报告最多 4k 字符。`,
@@ -1098,10 +1118,14 @@ export async function assembleDeps(config: DevmateConfig): Promise<DevmateServer
 
   // 子代理池：池级单例；config 闭包现读 workflowRef（服务端 attach 后 = 实时配置，
   // 未 attach 回退配置初值）——改 /api/workflow 后后续 spawn 即时生效（动态读取语义）。
+  // 只读工具面（子代理工具化 2026-09-01）：workspaceTools 按宿主会话 sessionId 经
+  // sessionTools 工厂解析会话 jail 构造只读子集（read_file/grep/glob/list_dir——
+  // 与主循环同 workspaceRoot/同路径锚定语义；read-only 由工具集选择保证）。
   const subagentPool = createSubagentPool({
     llm: initialLlm,
     model: startupModel,
     config: () => (workflowRef.get !== null ? workflowRef.get() : initialWorkflow),
+    workspaceTools: (sessionId) => sessionTools.createReadOnlyTools(sessionId),
   });
 
   // 会话根解析（多工作区 per-session）：读会话 meta 的 workspaceRoot（session-workspace

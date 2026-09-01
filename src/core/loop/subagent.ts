@@ -1,19 +1,33 @@
 /**
  * # loop/subagent：子代理池（Workflow 功能点②；池级接缝）
  *
- * 每个子代理 = 一次独立 chat 调用（无工具、无会话文件——纯内存消息数组 + 流终止）：
- * [system: 固定角色(+技能方法论注入节), user: prompt] → 流式读取 text →
- * 报告先经 sanitizeToolMarkers 净化（剥离模型偶发伪造回入正文的 XML 工具块生肉，
- * 如 <tool_calls>/<invoke name=…>——纯推理契约的自愈面，绝不误伤正文），
- * 再按 4000 字符截断回注
- * （截断复用 context/truncate 的生成期截断面板——头 2000 + 尾 2000 + elide 标记 +
- * 收窄建议；禁止手写头截断）。
+ * 子代理 run = ≤ MAX_SUBAGENT_STEPS 步只读工具循环（用户拍板 2026-09-01：对标
+ * Claude Code subagent 语义——子代理有工具集、多步执行、背景并行）：
+ * [system: 固定角色(+技能方法论注入节), user: prompt] → 每步一次流式 chat：
+ * - 工具面是**只读子集**（read_file / grep / glob / list_dir——不含 write/edit/
+ *   run_command/use_skill/spawn_subagent/MCP：子代理只读、不执行命令、不再派子代理），
+ *   由 SubagentPoolDeps.workspaceTools 解析器按**宿主会话 sessionId** 构造——绑定宿主
+ *   会话的 workspaceRoot（与主循环同 jail/路径锚定语义：复用 createReadOnlyFsTools
+ *   的既定 fs 工具框架），read-only 由工具集选择保证（不另造权限系统）；
+ * - 每步 assistant（含 toolCalls）+ 工具结果（role:'tool'）按调用 ID 配对入纯内存
+ *   messages（无会话文件/无记忆——只与本池任务同生命周期），下一轮请求携带全部历史；
+ * - 步骤收敛：模型不再发起工具调用 = 自然结束，**report = 最后一条 assistant 文本**；
+ *   达到步数上限 → 正常收尾（report 带「已达步数上限」说明，**不算错误** ok:true）；
+ *   连续格式错误（未知工具/非法参数）达 DEFAULT_MAX_FORMAT_ERRORS → 提前收尾（同注记，
+ *   与主循环熔断同族——复用 loop/tools 的 validateToolCall/unknownToolResult 判型，
+ *   不另造终止系统）；流错误 → 收敛 {ok:false, error}；
+ * - 报告先经 sanitizeToolMarkers 净化（剥离模型偶发伪造回入正文的 XML 工具块生肉，
+ *   如 <tool_calls>/<invoke name=…>——工具块只经 toolCalls 协议真实配对，工具标记
+ *   生肉零容忍；绝不误伤正文），再按 4000 字符截断回注
+ *   （截断复用 context/truncate 的生成期截断面板——头 2000 + 尾 2000 + elide 标记 +
+ *   收窄建议；禁止手写头截断）。
  * 技能注入（B-1 借鉴①——Claude Code subagent skills 全量注入语义）：task 带
  * skillId/skillContent（可选）时，execute 把技能全文经 capSkill 机械拼进 system
  * （「## 方法论（注入）」节；capSkill 按码点 ≤8000 字符，超出头截 + 「…（截断）」标记，
  * 截断时仍注入头截版——不是零注入），审查/执行子代理与主代理同方法论；
  * 内容随 task 走（池不反向依赖技能索引），缺省/空白/空串 → 零注入普通模式。
- * 任务形状：prompt + 可选 {skillId, skillContent}（title 已移除——投机泛化）。
+ * 任务形状：prompt + 可选 {skillId, skillContent, sessionId}（title 已移除——
+ * 投机泛化；sessionId 供只读工具的工作区绑定——宿主会话的 workspaceRoot）。
  * 池级职责（CTO 定型）：
  * - 开关：enabled=false → spawn 立即 {ok:false, error:'subagents-disabled'}（不排队不调用）；
  * - 信号量 FIFO：maxParallel>0 时超过上限排队，活跃完成释放；maxParallel===0 = **无上限**——
@@ -29,18 +43,35 @@
  * - dispose：拒绝新任务 + 取消队列（'disposed'）；在跑任务完成后池关闭。
  * 传输层重试归 LlmAdapter（boot 已接线）：本层只见 end/error 终态事件。
  */
-import type { ChatMessage, ChatRequest, LlmUsage, StreamSnapshot } from '../../shared/llm-types.js';
+import type {
+  ChatMessage,
+  ChatRequest,
+  ChatTool,
+  ChatToolCall,
+  LlmUsage,
+  StreamSnapshot,
+} from '../../shared/llm-types.js';
 import { LlmError } from '../../shared/llm-types.js';
+import type { ToolCall } from '../../shared/session-types.js';
 import { TEXT_TOKENS_PER_ASCII_PROSE } from '../context/constants.js';
 import { estimateTextTokens, estimateTokens } from '../context/estimator.js';
 // 生成期截断面板单一来源（头尾保留 + elide 标记 + 收窄建议）；子代理报告只传阈值
 import { truncateToolOutput } from '../context/truncate.js';
 import type { WorkflowConfig } from '../../shared/workflow.js';
-import type { LlmAdapter, Pricing } from './types.js';
-import { DEFAULT_PRICING } from './types.js';
+// 工具轮判型与回注复用主循环同族设施（validateToolCall/unknown/invalid 载荷——
+// 熔断判据与主循环同值：连续格式错误阈值、工具执行超时）
+import {
+  errorResultContent,
+  invalidArgumentsResult,
+  invalidToolArgumentsResult,
+  unknownToolResult,
+  validateToolCall,
+} from './tools.js';
+import type { LlmAdapter, Pricing, Tool, ToolDef, ToolResult } from './types.js';
+import { DEFAULT_MAX_FORMAT_ERRORS, DEFAULT_PRICING, DEFAULT_TOOL_TIMEOUT_MS } from './types.js';
 
 // ---------------------------------------------------------------------------
-// 契约（CTO 定型；subagent 不用投影器：纯推理短会话，直接用 messages+llm）
+// 契约（CTO 定型；subagent 不用投影器：≤6 步只读工具短循环，直接用 messages+llm）
 // ---------------------------------------------------------------------------
 
 /** 工作流配置（单一来源在 shared/workflow；池读取源；缺省 true/2 由调用方配置）。 */
@@ -53,6 +84,8 @@ export interface SubagentTask {
   skillId?: string;
   /** 技能全文（经机械注入组装；execute 时以 capSkill 注入 system 方法论节）。 */
   skillContent?: string;
+  /** 宿主会话 id（可选；子代理只读工具的工作区绑定——解析到宿主会话的 workspaceRoot）。 */
+  sessionId?: string;
 }
 
 /** 一次子代理的归一结果：失败也是普通值（error 为机器码/传输层消息），绝不 throw。 */
@@ -102,6 +135,14 @@ export interface SubagentPoolDeps {
   config: () => WorkflowConfig;
   /** 请求侧模型名（ChatRequest 必填维度）。 */
   model: string;
+  /**
+   * 只读工具面解析器（sessionId → 只读工具集；Claude Code subagent 语义的工具集注入）。
+   * 绑定宿主会话工作区：实现侧按 sessionId 解析该会话的 jail 后构造
+   * createReadOnlyFsTools 的子集（read_file/grep/glob/list_dir——与主循环同
+   * jail/路径锚定语义，read-only 由工具集选择保证，不另造权限系统）。
+   * 缺省/解析故障 → 子代理无工具（纯推理契约回退——护栏故障不放大为行为故障）。
+   */
+  workspaceTools?: (sessionId: string) => Promise<readonly Tool[]>;
   /** 成本计价表；缺省 DEFAULT_PRICING（占位价）。 */
   pricing?: Pricing;
   /** 池级总成本上限（USD）；缺省 DEFAULT_SUBAGENT_COST_LIMIT_USD。 */
@@ -122,9 +163,18 @@ export const DEFAULT_SUBAGENT_COST_LIMIT_USD = 1.0;
 export const DEFAULT_SUBAGENT_QUEUE_LIMIT = 512;
 /** 报告截断阈值（字符；传入 context/truncate 的截断面板——头尾各 2000）。 */
 export const SUBAGENT_REPORT_LIMIT_CHARS = 4000;
-/** 子代理固定 system prompt（结构化中文报告；输入过长需精简）。 */
+/** 子代理 run 步数上限（每步 = 一次模型调用；对标 Claude Code subagent 多步循环）。 */
+export const MAX_SUBAGENT_STEPS = 6;
+/** 已达步数上限时报告追加的收尾说明（正常收尾——不算错误）。 */
+export const SUBAGENT_STEP_LIMIT_NOTE = '（已达步数上限，结论以当前进展为准）';
+/** 连续无效工具调用提前收尾时报告追加的说明（与主循环熔断同族）。 */
+export const SUBAGENT_CIRCUIT_BREAK_NOTE = '（连续工具调用无效，已提前收尾）';
+/** 子代理固定 system prompt（只读工具面 + ≤6 步多步循环 + 结构化中文报告）。 */
 export const SUBAGENT_SYSTEM_PROMPT =
-  '你是 DevMate 派出的子代理。独立完成任务，返回结构化中文报告（结论/关键发现/依据）。输入过长需精简。';
+  '你是 DevMate 派出的子代理。独立完成任务，最后用中文给出结构化报告（结论/关键发现/依据）；输入过长需精简。\n' +
+  '你可以用只读工具查看工作区文件（read_file / grep / glob / list_dir）：你只能读取——不能写、不能执行命令。\n' +
+  '最多执行 6 步：每一步可调用只读工具，工具结果会回传给你，用于后续判断；无需再读文件时给出最终中文结论并收尾。\n' +
+  '如有方法论文档（见「## 方法论（注入）」），按方法论执行。';
 /** 技能注入正文上限（字符；与 use_skill 的 8k 截断同值——注入面按「正文+资产」总载荷口径）。 */
 export const SKILL_INJECTION_LIMIT_CHARS = 8000;
 /** capSkill 截断标记（与 reasoning 显示层「…（截断）」同规）。 */
@@ -246,7 +296,7 @@ export function createSubagentPool(deps: SubagentPoolDeps): SubagentPool {
     });
   }
 
-  /** 单次子代理执行：一次独立 chat 调用（无工具、无会话文件）。 */
+  /** 单次子代理执行：≤ MAX_SUBAGENT_STEPS 步只读工具循环（无会话文件——纯内存 messages）。 */
   async function execute(entry: QueueEntry): Promise<void> {
     const startedAt = now();
     // 技能注入（B-1 借鉴：Claude Code subagent skills——全文机械注入，非仅描述）；
@@ -260,61 +310,190 @@ export function createSubagentPool(deps: SubagentPoolDeps): SubagentPool {
       { role: 'system', content: system },
       { role: 'user', content: entry.task.prompt },
     ];
-    const request: ChatRequest = { model: deps.model, messages };
 
-    let content = '';
-    let snapshot: StreamSnapshot | null = null;
-    let error: LlmError | null = null;
-    try {
-      for await (const ev of deps.llm.chat(request)) {
-        if (ev.type === 'text') content += ev.text;
-        else if (ev.type === 'reasoning') {
-          // 推理内容不进报告（与主循环「reasoning 不进请求」口径一致）
-        } else {
-          // end / error：终态（toolCalls 非本池契约——无工具请求，忽略）
-          snapshot = ev.snapshot;
-          if (ev.type === 'error') error = ev.error;
-          break;
-        }
+    // 只读工具面（Claude Code subagent 语义）：按宿主会话 sessionId 解析会话工作区的
+    // 只读工具集（read_file/grep/glob/list_dir）；缺省解析器/解析故障 → 无工具
+    // （纯推理契约回退——护栏故障不放大为行为故障，绝不让 spawn 因此失败）。
+    let tools: readonly Tool[] = [];
+    if (deps.workspaceTools !== undefined && entry.task.sessionId !== undefined) {
+      try {
+        tools = await deps.workspaceTools(entry.task.sessionId);
+      } catch {
+        tools = [];
       }
-    } catch (err) {
-      // chat() 同步/异步抛错（协议异常）：收敛为 error 结果，绝不外抛
-      error =
-        err instanceof LlmError
-          ? err
-          : new LlmError({
-              kind: 'transport',
-              status: 0,
-              retryable: false,
-              message: err instanceof Error ? err.message : String(err),
-            });
+    }
+    const chatTools = tools.map(toChatTool);
+
+    // 多步循环：每步一次模型调用（工具调用→结果回注→下一步；自然结束 = 无工具调用）。
+    let lastText = '';
+    let streamError: LlmError | null = null;
+    let anyEstimated = false;
+    let formatErrors = 0;
+    // 步循环的收敛判型（step/error/circuit/natural 四种终态；limit = 步数耗尽且模型还在调工具）
+    let stop: 'limit' | 'error' | 'circuit' | 'natural' = 'limit';
+    const paymentSum: Payment = { promptTokens: 0, completionTokens: 0, costUsd: 0 };
+
+    for (let step = 0; step < MAX_SUBAGENT_STEPS; step += 1) {
+      const request: ChatRequest = {
+        model: deps.model,
+        messages,
+        ...(chatTools.length > 0 ? { tools: chatTools } : {}),
+      };
+      let content = '';
+      let snapshot: StreamSnapshot | null = null;
+      let error: LlmError | null = null;
+      try {
+        for await (const ev of deps.llm.chat(request)) {
+          if (ev.type === 'text') content += ev.text;
+          else if (ev.type === 'reasoning') {
+            // 推理内容不进消息/报告（与主循环「reasoning 不进请求」口径一致）
+          } else {
+            // end / error：终态（toolCalls 组装在 snapshot）
+            snapshot = ev.snapshot;
+            if (ev.type === 'error') error = ev.error;
+            break;
+          }
+        }
+      } catch (err) {
+        // chat() 同步/异步抛错（协议异常）：收敛为 error 结果，绝不外抛
+        error =
+          err instanceof LlmError
+            ? err
+            : new LlmError({
+                kind: 'transport',
+                status: 0,
+                retryable: false,
+                message: err instanceof Error ? err.message : String(err),
+              });
+      }
+
+      // 记账（每步）——真实 usage 优先；缺失/错误流 → 本地估算兜底（estimated=true）。
+      // 失败轮照记（与主循环「被计费的失败轮照记」语义一致；ADR-0003 防绕过）。
+      const real = snapshot?.usage ?? null;
+      const payment =
+        real !== null
+          ? paymentFromUsage(real, pricing)
+          : estimatedPayment(messages, content, pricing);
+      paymentSum.promptTokens += payment.promptTokens;
+      paymentSum.completionTokens += payment.completionTokens;
+      paymentSum.costUsd += payment.costUsd;
+      if (real === null) anyEstimated = true;
+      // 池级账本：累计 + 最近一次实际成本（下一次 spawn 预判的自相似锚——逐步骤推进，
+      // 与主循环「每次有审计值的轮次都进成本账本」同口径）
+      ledgerCostUsd += payment.costUsd;
+      lastCostUsd = payment.costUsd;
+
+      if (error !== null) {
+        stop = 'error';
+        streamError = error;
+        break;
+      }
+
+      const calls: ToolCall[] = (snapshot?.toolCalls ?? []).map((tc) => ({
+        id: tc.id,
+        name: tc.name,
+        arguments: tc.arguments,
+      }));
+      // assistant 先入 messages（文本 + toolCalls，按调用 ID 配对）；文本只在
+      // 「无 toolCalls 的最终步」成为 report（最后 assistant 文本）。
+      messages.push({
+        role: 'assistant',
+        content: content === '' ? null : content,
+        ...(calls.length > 0 ? { toolCalls: calls.map((c) => toChatToolCall(c)) } : {}),
+      });
+      // report = 最近一条**非空** assistant 文本（纯工具步不覆盖——未产文本的步
+      // 不该把报告冲成空；最终步无文本时沿用前文本）
+      if (content !== '') lastText = content;
+
+      if (calls.length === 0) {
+        stop = 'natural'; // 自然结束：report = 本条 assistant 文本
+        break;
+      }
+
+      // 工具轮：按调用序执行（与主循环同族——失败/超时是普通结果，绝不 throw）；
+      // 每一步 + 每个结果入 messages（role:'tool' 按 toolCallId 配对），下一轮一并发送。
+      let stepMalformed = false;
+      for (const call of calls) {
+        const def = tools.find((t) => t.name === call.name);
+        let result: ToolResult;
+        if (def === undefined) {
+          // 未知工具：判型与回注载荷复用主循环工具（available_tools 收敛抓手）
+          result = unknownToolResult(
+            call.name,
+            tools.map((t) => t.name),
+          );
+          stepMalformed = true;
+        } else {
+          const validation = validateToolCall(def, call.arguments);
+          if (!validation.ok) {
+            result =
+              validation.type === 'invalid_tool_arguments'
+                ? invalidToolArgumentsResult(validation.message, validation.arguments_head ?? '')
+                : invalidArgumentsResult(def.name, validation.issues ?? []);
+            stepMalformed = true;
+          } else {
+            result = await executeTool(def, call, entry.task.sessionId);
+          }
+        }
+        messages.push({
+          role: 'tool',
+          toolCallId: call.id,
+          content: result.ok ? result.content : errorResultContent(result),
+        });
+      }
+      // 熔断与主循环同族（连续格式错误阈值；一次干净的步清零）
+      formatErrors = stepMalformed ? formatErrors + 1 : 0;
+      if (formatErrors >= DEFAULT_MAX_FORMAT_ERRORS) {
+        stop = 'circuit';
+        break;
+      }
     }
 
-    // 记账：真实 usage 优先；缺失/错误流 → 本地估算兜底（estimated=true）。
-    // 失败也记成本（与主循环「被计费的失败轮照记」语义一致；ADR-0003 防绕过）。
-    const real = snapshot?.usage ?? null;
-    const payment =
-      real !== null
-        ? paymentFromUsage(real, pricing)
-        : estimatedPayment(messages, content, pricing);
-    ledgerCostUsd += payment.costUsd;
-    lastCostUsd = payment.costUsd;
+    // report = 最后 assistant 文本（净化后截断）；limit/circuit 为正常收尾：
+    // 追加收尾说明（不算错误——ok 仍 true），错误流才 ok:false。
+    let report = sanitizeToolMarkers(lastText);
+    if (stop === 'limit') report += SUBAGENT_STEP_LIMIT_NOTE;
+    else if (stop === 'circuit') report += SUBAGENT_CIRCUIT_BREAK_NOTE;
 
     active -= 1;
     completed += 1;
     const result: SubagentResult = {
-      ok: error === null,
-      report: truncateReport(sanitizeToolMarkers(content)),
-      promptTokens: payment.promptTokens,
-      completionTokens: payment.completionTokens,
-      totalTokens: payment.promptTokens + payment.completionTokens,
-      costUsd: payment.costUsd,
-      estimated: real === null,
+      ok: streamError === null,
+      report: truncateReport(report),
+      promptTokens: paymentSum.promptTokens,
+      completionTokens: paymentSum.completionTokens,
+      totalTokens: paymentSum.promptTokens + paymentSum.completionTokens,
+      costUsd: paymentSum.costUsd,
+      estimated: anyEstimated,
       durationMs: now() - startedAt,
     };
-    if (error !== null) result.error = error.message;
+    if (streamError !== null) result.error = streamError.message;
     entry.resolve(result);
     pump();
+  }
+
+  /** 工具执行（带超时）：失败/超时 → 普通结果绝不外抛（与主循环 evaluateCall 同族）。
+   *  执行上下文只带 sessionId（fs 工具只用构造期 jail，忽略注入 ctx——见 fs.ts 协调契约）。 */
+  async function executeTool(
+    tool: Tool,
+    call: ToolCall,
+    sessionId: string | undefined,
+  ): Promise<ToolResult> {
+    try {
+      return await withTimeout(
+        tool.execute(call, { sessionId: sessionId ?? '' }),
+        DEFAULT_TOOL_TIMEOUT_MS,
+      );
+    } catch (err) {
+      return {
+        ok: false,
+        content: '',
+        error: {
+          type: 'tool-timeout',
+          message: err instanceof Error ? err.message : String(err),
+        },
+      };
+    }
   }
 
   return {
@@ -384,4 +563,44 @@ function estimatedPayment(
  */
 export function truncateReport(report: string): string {
   return truncateToolOutput(report, SUBAGENT_REPORT_LIMIT_CHARS);
+}
+
+// ---------------------------------------------------------------------------
+// 工具面装配辅组（多步循环）
+// ---------------------------------------------------------------------------
+
+/** ToolDef → 请求侧 ChatTool（与主循环 toChatTool 同形状；本文件最小面自持）。 */
+function toChatTool(def: ToolDef): ChatTool {
+  return {
+    type: 'function',
+    function: {
+      name: def.name,
+      description: def.description,
+      parameters: def.parameters,
+    },
+  };
+}
+
+/** 会话侧 ToolCall → 请求侧 ChatToolCall（name/arguments 逐字，不 parse/不 stringify）。 */
+function toChatToolCall(call: ToolCall): ChatToolCall {
+  return {
+    id: call.id,
+    type: 'function',
+    function: { name: call.name, arguments: call.arguments },
+  };
+}
+
+/** 工具执行超时（与主循环 withTimeout 同构；超时 → 普通失败结果，不中止 run）。 */
+async function withTimeout<T>(promise: Promise<T>, ms: number): Promise<T> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  try {
+    return await Promise.race([
+      promise,
+      new Promise<never>((_resolve, reject) => {
+        timer = setTimeout(() => reject(new Error(`tool timed out after ${ms}ms`)), ms);
+      }),
+    ]);
+  } finally {
+    if (timer !== undefined) clearTimeout(timer);
+  }
 }

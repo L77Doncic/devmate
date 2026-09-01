@@ -648,11 +648,14 @@ describe('E2E-C：subagent 与技能（假池经 createSessionToolsFactory 注�
     expect(pool.spawned).toEqual(['独立子任务A']); // 池收证（假池零网络）
     // skill 注入抽样（全链：真技能索引 → 工具 skillContent 解析 → 池任务形状；
     // 服务端索引对 alpha 的 content 与 use_skill 同源——见上方 skill.content 断言）
+    // 会话绑定（子代理工具化 2026-09-01）：执行上下文 sessionId 透传进任务——池照它为
+    // 子代理装配只读工作区工具（绑定宿主会话 workspaceRoot）
     expect(pool.tasks[0]).toEqual({
       prompt: '独立子任务A',
       skillId: 'alpha',
       skillContent:
         '---\nname: Alpha asset\ndescription: An alpha asset for tests.\n---\nALPHA BODY\nline2',
+      sessionId,
     });
   });
 

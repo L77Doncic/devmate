@@ -7,6 +7,8 @@
  * 'subagents-disabled'|'cost-guard'|'queue-full' 透传，其余（disposed/传输层）→
  * 'subagent-error'；成本/队列数字不进工具内容（message 无数字——subagent-error 例外
  * 见其单测：上游差错详情（数字）允许透传，属模块注释明确记录的放宽）。
+ * 会话绑定（子代理工具化 2026-09-01）：执行上下文的 sessionId 逐字透传进
+ * SubagentTask.sessionId（池照它为子代理装配只读工作区工具）；ctx 缺省/空 → 不带键。
  */
 import { describe, expect, it } from 'vitest';
 import { createSubagentTool } from '../../src/core/tools/subagent.js';
@@ -67,7 +69,7 @@ async function run(pool: SubagentPool, argumentsRaw: string) {
 }
 
 describe('tools/subagent：spawn_subagent', () => {
-  it('成功：{ok:true, content = 池报告}（已截断，内容原样不加工）；池只收到 {prompt}', async () => {
+  it('成功：{ok:true, content = 池报告}（已截断，内容原样不加工）；池收到 {prompt, sessionId(执行上下文透传)}', async () => {
     const { pool, spawned } = fakePool({
       ok: true,
       report: OK_REPORT,
@@ -81,10 +83,10 @@ describe('tools/subagent：spawn_subagent', () => {
     const r = await run(pool, JSON.stringify({ prompt: 'ls 并总结' }));
     expect(r).toEqual({ ok: true, content: OK_REPORT });
     expect(spawned).toHaveLength(1);
-    expect(spawned[0]).toEqual({ prompt: 'ls 并总结' });
+    expect(spawned[0]).toEqual({ prompt: 'ls 并总结', sessionId: 's1' });
   });
 
-  it('title 参数已移除：即使传入也被忽略，池只收到 {prompt};schema 无 title 属性', async () => {
+  it('title 参数已移除：即使传入也被忽略，池只收到 {prompt, sessionId};schema 无 title 属性', async () => {
     const { pool, spawned } = fakePool({
       ok: true,
       report: 'ok',
@@ -97,7 +99,7 @@ describe('tools/subagent：spawn_subagent', () => {
     });
     const r = await run(pool, JSON.stringify({ prompt: 'p', title: 'legacy' }));
     expect(r.ok).toBe(true);
-    expect(spawned[0]).toEqual({ prompt: 'p' });
+    expect(spawned[0]).toEqual({ prompt: 'p', sessionId: 's1' });
     // schema 契约：只声明 prompt（无 title——投机泛化移除）
     const tool = createSubagentTool({ pool });
     expect(tool.parameters?.properties?.prompt).toMatchObject({ type: 'string' });
@@ -205,6 +207,7 @@ describe('tools/subagent：spawn_subagent', () => {
       prompt: 'p',
       skillId: 'code-review',
       skillContent: '审查双轴方法论',
+      sessionId: 's1',
     });
   });
 
@@ -229,7 +232,7 @@ describe('tools/subagent：spawn_subagent', () => {
       },
       { sessionId: 's1' },
     );
-    expect(a[0]).toEqual({ prompt: 'p', skillId: 'ghost' }); // skillId 记录，内容跳过
+    expect(a[0]).toEqual({ prompt: 'p', skillId: 'ghost', sessionId: 's1' }); // skillId 记录，内容跳过
 
     const { pool: poolB, spawned: b } = fakePool(ok);
     const toolB = createSubagentTool({ pool: poolB }); // 未接线解析器
@@ -241,7 +244,7 @@ describe('tools/subagent：spawn_subagent', () => {
       },
       { sessionId: 's1' },
     );
-    expect(b[0]).toEqual({ prompt: 'p', skillId: 'code-review' });
+    expect(b[0]).toEqual({ prompt: 'p', skillId: 'code-review', sessionId: 's1' });
     expect(b[0]?.skillContent).toBeUndefined();
 
     const { pool: poolC, spawned: c } = fakePool(ok);
@@ -261,16 +264,45 @@ describe('tools/subagent：spawn_subagent', () => {
     );
     // 解析器异常不硬失败：任务仍 spawn（内容跳过），结果普通成功
     expect(rc.ok).toBe(true);
-    expect(c[0]).toEqual({ prompt: 'p', skillId: 'code-review' });
+    expect(c[0]).toEqual({ prompt: 'p', skillId: 'code-review', sessionId: 's1' });
     expect(c[0]?.skillContent).toBeUndefined();
 
-    // 无 skill 参数：任务形状仍只 {prompt}（不新增空字段）
+    // 无 skill 参数：任务形状仍只 {prompt, sessionId}（不新增空字段）
     const { pool: poolD, spawned: d } = fakePool(ok);
     const toolD = createSubagentTool({ pool: poolD, skillContent: async () => 'x' });
     await toolD.execute(
       { id: 'c4', name: 'spawn_subagent', arguments: JSON.stringify({ prompt: 'p' }) },
       { sessionId: 's1' },
     );
-    expect(d[0]).toEqual({ prompt: 'p' });
+    expect(d[0]).toEqual({ prompt: 'p', sessionId: 's1' });
+  });
+
+  it('会话绑定：ctx 缺省/空 sessionId → 任务不带 sessionId 键（容错；绝不因上下文缺失失败）', async () => {
+    const ok = {
+      ok: true,
+      report: 'ok',
+      promptTokens: 0,
+      completionTokens: 0,
+      totalTokens: 0,
+      costUsd: 0,
+      estimated: false,
+      durationMs: 0,
+    };
+    // 无 ctx（执行上下文整体缺省——运行路径上主循环恒传，此处验证容错不硬失败）
+    const { pool: poolA, spawned: a } = fakePool(ok);
+    const toolA = createSubagentTool({ pool: poolA });
+    await toolA.execute(
+      { id: 'c1', name: 'spawn_subagent', arguments: JSON.stringify({ prompt: 'p' }) },
+      undefined as never,
+    );
+    expect(a[0]).toEqual({ prompt: 'p' });
+    // ctx.sessionId 为空串：同样不带键
+    const { pool: poolB, spawned: b } = fakePool(ok);
+    const toolB = createSubagentTool({ pool: poolB });
+    await toolB.execute(
+      { id: 'c2', name: 'spawn_subagent', arguments: JSON.stringify({ prompt: 'p' }) },
+      { sessionId: '' },
+    );
+    expect(b[0]).toEqual({ prompt: 'p' });
   });
 });

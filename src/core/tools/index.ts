@@ -8,5 +8,11 @@
  * registry 包装由 loop 的 defineRegistry 完成；监狱真判定（checkPath/checkRedirect）
  * 由 S9 实现（接口单一来源：src/core/jail/index.ts，经 types.ts 转导出）。
  */
-export { createFsTools, MAX_COLLECTION_BYTES, collectionElideMarker } from './fs.js';
+export {
+  createFsTools,
+  createReadOnlyFsTools,
+  READ_ONLY_TOOL_NAMES,
+  MAX_COLLECTION_BYTES,
+  collectionElideMarker,
+} from './fs.js';
 export type { FsToolContext, Jail } from './types.js';

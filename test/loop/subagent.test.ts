@@ -3,10 +3,13 @@ import {
   capSkill,
   createSubagentPool,
   DEFAULT_SUBAGENT_QUEUE_LIMIT,
+  MAX_SUBAGENT_STEPS,
   SKILL_INJECTION_LIMIT_CHARS,
   SKILL_INJECTION_TRUNCATED_MARK,
   sanitizeToolMarkers,
+  SUBAGENT_CIRCUIT_BREAK_NOTE,
   SUBAGENT_REPORT_LIMIT_CHARS,
+  SUBAGENT_STEP_LIMIT_NOTE,
   SUBAGENT_SYSTEM_PROMPT,
 } from '../../src/core/loop/subagent.js';
 import { OUTPUT_TOO_LONG_ADVICE } from '../../src/core/context/truncate.js';
@@ -15,7 +18,7 @@ import type {
   SubagentPoolDeps,
   WorkflowConfig,
 } from '../../src/core/loop/subagent.js';
-import type { LlmAdapter, Pricing } from '../../src/core/loop/index.js';
+import type { LlmAdapter, Pricing, Tool } from '../../src/core/loop/index.js';
 import { DEFAULT_PRICING } from '../../src/core/loop/types.js';
 import { LlmError } from '../../src/shared/llm-types.js';
 import type { StreamEvent } from '../../src/shared/llm-types.js';
@@ -35,6 +38,22 @@ import { FakeLlm, deferred, sleep } from './support.js';
  *   clampMaxParallel——池直接消费 config）。
  */
 
+/**
+ * 只读假工具（子代理工具面的测试注入）：参数 schema 零要求，execute 返回固定内容
+ * 并记录调用次数（recorder 按工具名收证，独立于 FakeLlm 的请求记录）。
+ */
+function readOnlyTool(name: string, content: string, recorder?: { executeCount: number }): Tool {
+  return {
+    name,
+    description: `${name} (fake read-only)`,
+    parameters: { type: 'object', properties: {}, required: [] },
+    async execute() {
+      if (recorder !== undefined) recorder.executeCount += 1;
+      return { ok: true, content };
+    },
+  };
+}
+
 /** 最简池构造（测试注入点），缺省 config = {subagentsEnabled:true, maxParallel:2}。 */
 function makePool(
   llm: LlmAdapter,
@@ -44,6 +63,7 @@ function makePool(
     pricing?: Pricing;
     costLimitUsd?: number;
     maxQueue?: number;
+    workspaceTools?: (sessionId: string) => Promise<readonly Tool[]>;
   } = {},
 ): SubagentPool {
   const deps: SubagentPoolDeps = {
@@ -55,6 +75,7 @@ function makePool(
   if (options.pricing !== undefined) deps.pricing = options.pricing;
   if (options.costLimitUsd !== undefined) deps.costLimitUsd = options.costLimitUsd;
   if (options.maxQueue !== undefined) deps.maxQueue = options.maxQueue;
+  if (options.workspaceTools !== undefined) deps.workspaceTools = options.workspaceTools;
   return createSubagentPool(deps);
 }
 
@@ -96,7 +117,7 @@ describe('subagent：子代理池', () => {
   });
 
   describe('b) 单任务：独立 chat 调用 + 报告截断 + usage 统计', () => {
-    it('消息形状：system 固定角色 + user 原样 prompt，无工具、无 maxTokens，report 透传', async () => {
+    it('消息形状：未接线 workspaceTools（无工作区解析器）→ 纯推理回退：system+user，无 tools、无 maxTokens，report 透传', async () => {
       const prompt = '检查 src/core/loop/agent.ts 是否存在死循环';
       const llm = new FakeLlm([{ content: '结论：存在风险。' }]);
       const pool = makePool(llm);
@@ -683,6 +704,244 @@ describe('subagent：子代理池', () => {
       expect(r.report).not.toContain('<invoke');
       expect(r.report).toContain('核查结论：实现正确。');
       expect(r.report).toContain('依据：测试 7 绿。');
+    });
+  });
+
+  describe('l) 多步只读工具循环（Claude Code subagent 语义：工具集 + ≤6 步 + 报告=最终文本）', () => {
+    it('l1) 只读工具集注入：workspaceTools 给出 → 请求 tools 恒为只读四件（read_file/grep/glob/list_dir），不含 write/edit', async () => {
+      const recorder = { executeCount: 0 };
+      const tools = [
+        readOnlyTool('read_file', 'BODY', recorder),
+        readOnlyTool('list_dir', 'DIR: a.txt', recorder),
+        readOnlyTool('glob', 'a.txt', recorder),
+        readOnlyTool('grep', 'a.txt:1:line', recorder),
+      ];
+      const llm = new FakeLlm([{ content: '结论：单步也带工具。' }]);
+      const pool = makePool(llm, { workspaceTools: async () => tools });
+
+      const r = await pool.spawn({ prompt: '只看不写', sessionId: 's-tools' });
+
+      expect(r.ok).toBe(true);
+      expect(llm.requests).toHaveLength(1);
+      expect(llm.requests[0]?.tools?.map((t) => t.function.name)).toEqual([
+        'read_file',
+        'list_dir',
+        'glob',
+        'grep',
+      ]);
+      // 请求消息形状：system（新提示词）+ user prompt；无 maxTokens 注入
+      expect(llm.requests[0]?.messages[0]).toEqual({
+        role: 'system',
+        content: SUBAGENT_SYSTEM_PROMPT,
+      });
+      expect(llm.requests[0]?.messages[1]).toEqual({
+        role: 'user',
+        content: '只看不写',
+      });
+      expect(llm.requests[0]?.maxTokens).toBeUndefined();
+      expect(recorder.executeCount).toBe(0); // 无工具调用：工具集只注入，不执行
+    });
+
+    it('l2) 多步循环：工具调用→结果入 messages→总结；report = 最后 assistant 文本；usage 分步合计', async () => {
+      const tools = [
+        readOnlyTool('read_file', 'FILE-BODY'),
+        readOnlyTool('list_dir', 'DIR: a.txt'),
+      ];
+      const llm = new FakeLlm([
+        {
+          content: '先看目录与文件',
+          toolCalls: [
+            { id: 'tc-1', name: 'list_dir', arguments: '{"path":"."}' },
+            { id: 'tc-2', name: 'read_file', arguments: '{"path":"README.md"}' },
+          ],
+          usage: { promptTokens: 300, completionTokens: 80, totalTokens: 380 },
+        },
+        {
+          content: '结论：README 存在。',
+          usage: { promptTokens: 500, completionTokens: 60, totalTokens: 560 },
+        },
+      ]);
+      const pool = makePool(llm, { workspaceTools: async () => tools });
+
+      const r = await pool.spawn({ prompt: '查看 README', sessionId: 's-loop' });
+
+      expect(r.ok).toBe(true);
+      expect(r.report).toBe('结论：README 存在。'); // report = 最后 assistant 文本（非中间步文本）
+      expect(llm.requests).toHaveLength(2); // 两步：每步一次模型调用
+      // 第二步请求：完整历史——system + user + assistant(toolCalls 配对) + 两个 tool 结果
+      expect(llm.requests[1]?.messages).toEqual([
+        { role: 'system', content: SUBAGENT_SYSTEM_PROMPT },
+        { role: 'user', content: '查看 README' },
+        {
+          role: 'assistant',
+          content: '先看目录与文件',
+          toolCalls: [
+            {
+              id: 'tc-1',
+              type: 'function',
+              function: { name: 'list_dir', arguments: '{"path":"."}' },
+            },
+            {
+              id: 'tc-2',
+              type: 'function',
+              function: { name: 'read_file', arguments: '{"path":"README.md"}' },
+            },
+          ],
+        },
+        { role: 'tool', toolCallId: 'tc-1', content: 'DIR: a.txt' },
+        { role: 'tool', toolCallId: 'tc-2', content: 'FILE-BODY' },
+      ]);
+      // usage 分步合计（真实 usage 路径）
+      expect(r.promptTokens).toBe(800);
+      expect(r.completionTokens).toBe(140);
+      expect(r.totalTokens).toBe(940);
+      expect(r.estimated).toBe(false);
+      expect(r.costUsd).toBeCloseTo(
+        800 * DEFAULT_PRICING.promptPerToken + 140 * DEFAULT_PRICING.completionPerToken,
+        12,
+      );
+      // 池 self-similar 锚：最近一次实际成本 = 最后一步的 costUsd（第二步单步价，非 run 合计）
+      expect(pool.nextCostEstimateUsd()).toBeCloseTo(
+        500 * DEFAULT_PRICING.promptPerToken + 60 * DEFAULT_PRICING.completionPerToken,
+        12,
+      );
+    });
+
+    it('l3) 6 步上限：模型每步都调工具 → 第 6 步后正常收尾（report 带达标说明，不算错误；不再发第 7 次请求）', async () => {
+      const tools = [readOnlyTool('list_dir', 'DIR: x')];
+      const scripts = Array.from({ length: MAX_SUBAGENT_STEPS }, (_i, i) => ({
+        content: `中间文本-${i}`,
+        toolCalls: [{ id: `t-${i}`, name: 'list_dir', arguments: '{"path":"."}' }],
+      }));
+      const llm = new FakeLlm(scripts);
+      const pool = makePool(llm, { workspaceTools: async () => tools });
+
+      const r = await pool.spawn({ prompt: '穷尽 6 步', sessionId: 's-limit' });
+
+      expect(r.ok).toBe(true); // 步数上限是正常收尾——不是错误
+      expect(llm.requests).toHaveLength(MAX_SUBAGENT_STEPS); // 恰好 6 步，无第 7 次
+      expect(r.report).toBe(`中间文本-${MAX_SUBAGENT_STEPS - 1}${SUBAGENT_STEP_LIMIT_NOTE}`);
+      expect(r.costUsd).toBeGreaterThan(0);
+      expect(pool.stats()).toMatchObject({ completed: 1 });
+    });
+
+    it('l4) 熔断收敛：连续 3 步未知工具（write_file 不在只读面）→ 提前收尾带说明，错误以普通工具结果回注', async () => {
+      const llm = new FakeLlm([
+        {
+          content: '试着写',
+          toolCalls: [{ id: 'w-1', name: 'write_file', arguments: '{"path":"a","content":"b"}' }],
+        },
+        {
+          toolCalls: [{ id: 'w-2', name: 'write_file', arguments: '{"path":"a","content":"b"}' }],
+        },
+        {
+          toolCalls: [{ id: 'w-3', name: 'write_file', arguments: '{"path":"a","content":"b"}' }],
+        },
+      ]);
+      const pool = makePool(llm, {
+        workspaceTools: async () => [readOnlyTool('list_dir', 'DIR: x')],
+      });
+
+      const r = await pool.spawn({ prompt: '只读', sessionId: 's-circuit' });
+
+      expect(r.ok).toBe(true); // 熔断收敛也是正常收尾（与步数上限同族：report 说明，不算错误）
+      expect(llm.requests).toHaveLength(3);
+      expect(r.report).toBe(`试着写${SUBAGENT_CIRCUIT_BREAK_NOTE}`);
+      // 未知工具回注：role:'tool' 消息携带 unknown_tool 判型（与主循环同族载荷）
+      const second = llm.requests[1]?.messages;
+      const toolMsg1 = second?.[3] as { role: 'tool'; content: string } | undefined;
+      expect(toolMsg1).toMatchObject({ role: 'tool', toolCallId: 'w-1' });
+      expect(JSON.parse(toolMsg1!.content)).toMatchObject({
+        ok: false,
+        error: { type: 'unknown_tool' },
+      });
+      expect(toolMsg1!.content).toContain('list_dir'); // available_tools 收敛抓手
+    });
+
+    it('l5) 工具执行失败（ok:false）也是普通结果：结果 JSON 按 toolCallId 回注，循环照常继续', async () => {
+      const failing: Tool = {
+        name: 'grep',
+        description: 'fake failing grep',
+        parameters: { type: 'object', properties: {}, required: [] },
+        async execute() {
+          return {
+            ok: false,
+            content: '',
+            error: { type: 'boom', message: 'grep failed by design' },
+          };
+        },
+      };
+      const llm = new FakeLlm([
+        {
+          content: '试着搜',
+          toolCalls: [{ id: 'g-1', name: 'grep', arguments: '{"pattern":"x","paths":["."]}' }],
+        },
+        { content: '失败也是普通结果，继续总结。' },
+      ]);
+      const pool = makePool(llm, { workspaceTools: async () => [failing] });
+
+      const r = await pool.spawn({ prompt: 'p', sessionId: 's-fail' });
+
+      expect(r.ok).toBe(true);
+      expect(r.report).toBe('失败也是普通结果，继续总结。');
+      const toolMsg = llm.requests[1]?.messages[3] as { role: 'tool'; content: string } | undefined;
+      expect(toolMsg).toMatchObject({ role: 'tool', toolCallId: 'g-1' });
+      expect(JSON.parse(toolMsg!.content)).toMatchObject({
+        ok: false,
+        error: { type: 'boom', message: 'grep failed by design' },
+      });
+    });
+
+    it('l6) 技能注入与工具循环共存：skillContent → system 带「## 方法论（注入）」节；工具面照常注入', async () => {
+      const methodology = '## 双轴审查\n- 标准轴；\n- 规格轴。';
+      const tools = [readOnlyTool('list_dir', 'DIR: x')];
+      const llm = new FakeLlm([
+        {
+          toolCalls: [{ id: 't-1', name: 'list_dir', arguments: '{"path":"."}' }],
+        },
+        { content: '按方法论审查完毕。' },
+      ]);
+      const pool = makePool(llm, { workspaceTools: async () => tools });
+
+      const r = await pool.spawn({
+        prompt: '审查',
+        skillId: 'code-review',
+        skillContent: methodology,
+        sessionId: 's-skill',
+      });
+
+      expect(r.ok).toBe(true);
+      expect(r.report).toBe('按方法论审查完毕。');
+      expect(llm.requests[0]?.messages[0]).toEqual({
+        role: 'system',
+        content: SUBAGENT_SYSTEM_PROMPT + '\n\n## 方法论（注入）\n' + methodology,
+      });
+      expect(llm.requests[0]?.tools?.map((t) => t.function.name)).toEqual(['list_dir']);
+    });
+
+    it('l7) workspaceTools 解析故障 → 无工具模式（纯推理回退；spawn 不因解析器故障失败）', async () => {
+      const llm = new FakeLlm([{ content: '结论：无工具也能干。' }]);
+      const pool = makePool(llm, {
+        workspaceTools: async () => {
+          throw new Error('root resolution fault');
+        },
+      });
+
+      const r = await pool.spawn({ prompt: '调研', sessionId: 's-broken' });
+
+      expect(r.ok).toBe(true);
+      expect(r.report).toBe('结论：无工具也能干。');
+      expect(llm.requests[0]?.tools).toBeUndefined(); // 无工具请求
+    });
+
+    it('l8) workspaceTools 未注入/任务无 sessionId → 无工具请求（与旧契约兼容的普通推理模式）', async () => {
+      const tools = [readOnlyTool('list_dir', 'DIR: x')];
+      const llm = new FakeLlm([{ content: 'ok' }]);
+      const pool = makePool(llm, { workspaceTools: async () => tools });
+
+      await pool.spawn({ prompt: '无 sessionId' }); // 任务没带 sessionId → 无法解析工作区
+
+      expect(llm.requests[0]?.tools).toBeUndefined();
     });
   });
 });

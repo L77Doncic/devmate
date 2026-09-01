@@ -913,6 +913,22 @@ async function executeWithArgs(
   return run(parsed.args);
 }
 
+/**
+ * 只读工具子集（子代理工具面——Claude Code subagent 只读语义）：
+ * read_file / grep / glob / list_dir；**不含** write_file / edit_file（子代理不得写）、
+ * 更不含 run_command / use_skill / spawn_subagent / MCP。只读性由「工具集选择」保证，
+ * 不另造权限系统（同一 jail/路径锚定语义：绑定构造期注入的会话 jail——宿主会话工作区根）。
+ */
+export const READ_ONLY_TOOL_NAMES: readonly string[] = ['read_file', 'grep', 'glob', 'list_dir'];
+
+/**
+ * 只读工具集合成：createFsTools 全集的只读切片（同构造面、同监狱、同路径锚定语义；
+ * 顺序 = createFsTools 声明序——read_file/list_dir/glob/grep）。
+ */
+export function createReadOnlyFsTools(ctx: FsToolContext): Tool[] {
+  return createFsTools(ctx).filter((tool) => READ_ONLY_TOOL_NAMES.includes(tool.name));
+}
+
 /** 六个文件工具（构造注入 ctx 闭包绑定；registry 由 loop 的 defineRegistry 包装，Phase 3/接线层负责——协调契约见 makeTool 注）。 */
 export function createFsTools(ctx: FsToolContext): Tool[] {
   return [
