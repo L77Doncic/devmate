@@ -106,7 +106,7 @@ export function guardInputError(raw) {
  * 输出预留 > 上限 ⇒ 首轮请求前即停机（0 步，「Token 护栏停机」）——护栏上限 ≤ 输出
  * 上限时按示例（如 200000）设置会「永远停」。提示行把该关系显式讲明（预检语义
  * 诚实 + 用户可理解）。
- * @param {number|null} maxOutputTokens 当前配置的输出上限（GET /api/settings →
+ * @param {unknown} maxOutputTokens 当前配置的输出上限（GET /api/settings →
  * ui.settings.maxOutputTokens；服务端未加载/缺省 → null）。
  * 兜底（拿不到有效值）：方向式文案，**不编造缺省数字**——假精度会把用户引向
  * 「比假值高、比真实输出上限低」的护栏设置（恰是该症的翻版）；留「当前配置的
