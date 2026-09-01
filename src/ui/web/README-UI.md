@@ -201,7 +201,7 @@ GET `/api/stats → {rssMb,heapMb,sessions,activeShells}`；GET `/api/tools → 
   风格表头注记中给全结构对应表）：`.sidebar-track`（AppFrame 列轨道 260px ↔ 56px rail，
   overflow 剪裁 + l1 右边线）= SidebarRoot .root（pad 6/12、fill、14px 基字号）；
   `.logoRow`（品牌按钮 = **新建会话快捷键**（dsh startSession 语义：DevMate + 版本徽章
-  `BUILD_VERSION`=package.json 0.1.1，figma I133:7632 列排）+ `.iconButton.toggle` 在右；
+  `BUILD_VERSION`=package.json 0.1.2，figma I133:7632 列排）+ `.iconButton.toggle` 在右；
   rail 态 toggle 静置 = 品牌 mark 24、悬停换 panel icon 18（dsh railMark 互换）、
   36x36/56 轨几何）；`.newSession`（38px r12 横条 icon14+label；rail 态 36 icon-only）；
   `.regionArea`（margin-left -4 / margin-right -12 抵消壳 inset、rail 态清零）；
