@@ -27,7 +27,7 @@ DevMate 是智能体（Agent）的「壳体」（harness）：给定一个任务
 - **工具面**（[`src/core/tools`](src/core/tools)）——9 个内置工具：`read_file`、`write_file`、`edit_file`（SEARCH/REPLACE）、`list_dir`、`glob`、`grep`、`run_command`（常驻 Shell，哨兵行界定输出）、`use_skill`（技能懒加载）、`spawn_subagent`（并行子代理池）；MCP 服务器工具以 `mcp_` 前缀追加进同一张表（`GET /api/tools` 可看实时工具面）。
 - **MCP 接入**（[`src/core/mcp`](src/core/mcp)）——stdio JSON-RPC 客户端：设置页登记服务器（`name` + `command` + `args`）、逐个开关、工具自动合并进循环。
 - **技能内化（18 个）**——构建时把 mattpocock-skills 工程技能集打包进 `dist/assets/skills`；系统提示只带一行清单，`use_skill` 按需懒加载（设置页可逐技能开关）。技能 = **目录**：`SKILL.md` + 同目录文本资产（白名单 `*.md`/`*.txt`/`*.json`/`*.yaml`/`*.py`/`*.js`/`*.sh`，递归收集、按相对路径名序，每资产节头 `## <file:路径>`；注入总载荷上限 20k 字符——超限按排序前缀截断，二进制/未知扩展名跳过并合成一行注记）。加载载荷上限 8k 字符（与子代理技能注入同值）；URL 安装的技能是单文件 `SKILL.md`。
-- **子代理工作流**——`spawn_subagent` 独立处理子任务，并行上限可配（`maxParallel` 0–8，缺省 2；0 = 无上限），设置页「Subagent」区开关；带 `skill:"code-review"` 创建时，该技能文本（上限 8000 码点，头截 + 标记）会注入子代理上下文（借鉴 Claude Code subagent `skills` 语义——审查员与主代理按同一方法论审查）。
+- **子代理工作流**——`spawn_subagent` 独立处理子任务，并行上限可配（`maxParallel` 0–8，缺省 2；0 = 无上限），设置页「Subagent」区开关；带 `skill:"code-review"` 创建时，该技能文本（上限 8000 码点，头截 + 标记）会注入子代理上下文（借鉴 Claude Code subagent `skills` 语义——审查员与主代理按同一方法论审查）。子代理携带只读工具面（read_file/grep/glob/list_dir）、上限 6 步，报告 ≤4000 字符回注；结果内容经与主循环同一脱敏单点处理；收尾评审哨兵可派独立代码审查子代理。
 - **OpenAI 兼容供应商**（[`src/core/llm`](src/core/llm)）——DeepSeek（默认：`https://api.deepseek.com` / `deepseek-v4-flash`）、OpenAI、阿里云百炼 DashScope/Qwen、智谱 GLM、Kimi；每家一个适配层归一化 `reasoning` 处置、采样参数白名单、strict 默认值、finish_reason 词汇与错误体形态。
 - **图像理解（DeepSeek vision，[ADR-0015](docs/adr/0015-deepseek-vision-and-token-limits.md)）**——输入框可附加图片（服务端内容寻址附件：≤20MiB/图、每条消息 ≤20 张、单会话累计 ≤200MiB——dsh 三数；图片字节存 `<sessionsDir>/attachments/`，事件与会话文件只存 sha256 ref），`deepseek-v4-flash-vision-exp` 模型直接识别（截图文字/图表分析），请求时展开为 DeepSeek 协议的 base64 dataURL；其它供应商/模型自动降级为文本 + 说明（绝不 400）；ref 缺失/超 40MiB 同理降级（诚实路径）。token 预算含图像（每图 ≤384 token，官方上限；估算公式见 ADR-0015）。
 - **请求侧 token 上限（设置页）**——**必填**「输入上限 / 输出上限」（正整数；UI 缺值即红字 + 禁存，`POST /api/settings` 缺任一即 400 `max-input-output-required`——服务端为强制口径单点）。GET 恒返回两值：存量缺失时回填缺省（输出 `8192`=DEFAULT_MAX_TOKENS；输入=供应商 preset 估算）并带 `maxOutputTokensDefault`/`maxInputTokensDefault` 标记（前端据此提示「已用默认，请修改保存」——不静默）。输出上限映射 `max_tokens`（OpenAI/Kimi 用 `max_completion_tokens`）；输入上限只发送给白名单供应商（DashScope/Qwen 走 `max_input_tokens`——DeepSeek 官方无此参数，不发送）。**钳制（ADR-0016）**——超过供应商上限的值在保存时钳制（`clampLimits`，preset 驱动：输出上限 DeepSeek `393216`——实测 valid-range、Kimi/GLM `131072`；DashScope/OpenAI 无据 → 不钳），持久化钳后值并回执 `maxOutputTokensClamped`/`maxInputTokensClamped`（UI 提示「已按 <model> 上限钳制为 N」）。输入上限同时是**预算上限**：投影窗口预算 = `min(三源窗口, maxInputTokens)`（输入上限双语义：DashScope wire 字段 + 本地预算上限）。适配层 wire 级再核（`buildRequest` 已知上限绝不 400）；运行时 400（上下文超窗 / `valid range of max_tokens`）**自愈不 fatal**：`classifyContextError` 升级压缩（forceLevel 0→1→2，每轮 ≤2 次重试、跨轮重置）后重试同轮；解析出的上限（`[1, N]`）被学习用于窗口钳制并在 `windowDetail` 报「由错误学习」（见 ADR-0016）。
@@ -214,7 +214,7 @@ npm install
 npm run dev            # tsc -w 增量编译
 npm run typecheck      # 主 tsconfig + 测试 tsconfig 双重检查
 npm run lint           # eslint flat config + typescript-eslint + prettier 冲突规则
-npm test               # vitest run（133 个测试文件，1940 用例：1939 通过 / 1 跳过）
+npm test               # vitest run（134 个测试文件，1964 用例：1963 通过 / 1 跳过）
 npm run test:watch
 npm run format:check   # prettier --check .（CONTEXT.md 与 docs/adr/ 按设计豁免）
 npm run build          # tsc + 复制静态 Web 资产 + 打包技能到 dist/
